@@ -1,0 +1,27 @@
+[project]
+name = "ztierfs"
+version = "0.2.0"
+description = "POSIX FUSE filesystem for macOS: content-addressed blocks with dedup/zstd compression, and hot/cold tiering"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "loguru>=0.7.3",
+    "macfusepy>=0.6.0",
+    "rich>=15.0.0",
+]
+classifiers = ["Operating System :: MacOS :: MacOS X"]
+
+
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
+
+[dependency-groups]
+dev = ["pytest>=9.0.3", "pytest-benchmark>=5.2.3", "pytest-cov>=7.1.0"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+markers = [
+    "benchmark: performance benchmarks that are useful for local comparison",
+    "integration: tests that require an opt-in real FUSE mount",
+]

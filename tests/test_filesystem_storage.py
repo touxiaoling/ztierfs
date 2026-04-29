@@ -1,0 +1,594 @@
+import os
+import sqlite3
+import threading
+import time
+
+from concurrent.futures import ThreadPoolExecutor
+
+from .helpers import adapted, make_fs, rows
+
+
+def _wait_until(predicate, timeout: float = 2.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.01)
+    assert predicate()
+
+
+def test_ztierfs_uses_conservative_tiering_age_defaults(tmp_path):
+    fs_impl = make_fs(tmp_path)
+    try:
+        assert fs_impl.tiering_policy.min_hot_age_ns == 24 * 60 * 60 * 1_000_000_000
+        assert fs_impl.tiering_policy.cold_copy_cleanup_age_ns == 0
+    finally:
+        fs_impl.close()
+
+
+def test_ztierfs_splits_compresses_and_reads_files(tmp_path):
+    fs_impl = make_fs(tmp_path, compression_min_bytes=0)
+    data = b"a" * 3000
+
+    with adapted(fs_impl) as fs:
+        fh = fs("create", "/note.txt", 0o644)
+        assert fs("write", "/note.txt", data, 0, fh) == len(data)
+        assert fs("read", "/note.txt", len(data), 0, fh) == data
+        assert fs("getattr", "/note.txt")["st_size"] == len(data)
+
+    assert len(rows(fs_impl, "SELECT * FROM file_chunks")) == 3
+    assert any(row["compressed"] for row in rows(fs_impl, "SELECT * FROM blocks"))
+
+
+def test_ztierfs_skips_zstd_for_known_compressed_suffixes(tmp_path):
+    fs_impl = make_fs(tmp_path)
+    data = b"\xff\xd8" * 1024
+
+    with adapted(fs_impl) as fs:
+        fh = fs("create", "/photo.jpg", 0o644)
+        fs("write", "/photo.jpg", data, 0, fh)
+
+    block_rows = rows(fs_impl, "SELECT compressed, raw_size, stored_size FROM blocks")
+    assert block_rows
+    assert {row["compressed"] for row in block_rows} == {0}
+    assert {row["raw_size"] for row in block_rows} == {1024}
+    assert {row["stored_size"] for row in block_rows} == {1024}
+
+
+def test_ztierfs_deduplicates_equal_chunks(tmp_path):
+    fs_impl = make_fs(tmp_path, inline_max_bytes=0)
+    data = b"same-block" * 100
+
+    with adapted(fs_impl) as fs:
+        first = fs("create", "/first.txt", 0o644)
+        second = fs("create", "/second.txt", 0o644)
+        fs("write", "/first.txt", data, 0, first)
+        fs("write", "/second.txt", data, 0, second)
+
+    block_rows = rows(fs_impl, "SELECT refcount FROM blocks")
+    assert len(block_rows) == 1
+    assert block_rows[0]["refcount"] == 2
+
+
+def test_ztierfs_clonefile_copies_metadata_without_reprocessing_blocks(tmp_path, monkeypatch):
+    fs_impl = make_fs(tmp_path)
+    data = b"a" * 2048
+
+    with adapted(fs_impl) as fs:
+        fh = fs("create", "/source.txt", 0o640)
+        fs("write", "/source.txt", data, 0, fh)
+        fs("setxattr", "/source.txt", "user.note", b"copied", 0, 0)
+
+        original_prepare_blocks = fs_impl.block_store.prepare_blocks
+
+        def fail_prepare_blocks(*args, **kwargs):
+            raise AssertionError("clonefile must not reprocess file blocks")
+
+        monkeypatch.setattr(fs_impl.block_store, "prepare_blocks", fail_prepare_blocks)
+        fs("clonefile", "/source.txt", "/copy.txt")
+        monkeypatch.setattr(fs_impl.block_store, "prepare_blocks", original_prepare_blocks)
+
+        copy_fh = fs("open", "/copy.txt", os.O_RDWR)
+        assert fs("read", "/copy.txt", len(data), 0, copy_fh) == data
+        assert fs("getxattr", "/copy.txt", "user.note", 0) == b"copied"
+        assert fs("getattr", "/copy.txt")["st_nlink"] == 1
+        assert fs("getattr", "/source.txt")["st_nlink"] == 1
+
+        fs("write", "/copy.txt", b"b", 0, copy_fh)
+        assert fs("read", "/source.txt", len(data), 0, fh) == data
+        assert fs("read", "/copy.txt", 1, 0, copy_fh) == b"b"
+
+    block_rows = rows(fs_impl, "SELECT raw_size, refcount FROM blocks ORDER BY refcount")
+    assert [row["refcount"] for row in block_rows] == [1, 3]
+    assert rows(fs_impl, "SELECT COUNT(*) AS total FROM file_chunks")[0]["total"] == 4
+
+
+def test_ztierfs_inlines_small_processed_blocks_in_database(tmp_path):
+    fs_impl = make_fs(tmp_path, inline_max_bytes=64, compression_min_bytes=0)
+    data = b"a" * 1024
+
+    with adapted(fs_impl) as fs:
+        fh = fs("create", "/small.txt", 0o644)
+        fs("write", "/small.txt", data, 0, fh)
+        assert fs("read", "/small.txt", len(data), 0, fh) == data
+
+    block = rows(
+        fs_impl,
+        """
+        SELECT
+            storage,
+            inline_payload,
+            compressed,
+            raw_size,
+            stored_size,
+            hot_present,
+            cold_present
+        FROM block_records
+        """,
+    )[0]
+    assert block["storage"] == "inline"
+    assert block["inline_payload"] is not None
+    assert len(rows(fs_impl, "SELECT * FROM block_payloads")) == 1
+    assert block["compressed"] == 1
+    assert block["raw_size"] == len(data)
+    assert block["stored_size"] <= 64
+    assert (block["hot_present"], block["cold_present"]) == (0, 0)
+    assert not any((tmp_path / "hot" / "blocks").glob("*/*/*"))
+    assert not any((tmp_path / "cold" / "blocks").glob("*/*/*"))
+
+
+def test_ztierfs_uses_processed_payload_size_for_inline_threshold(tmp_path):
+    fs_impl = make_fs(tmp_path, inline_max_bytes=64, compression_min_bytes=0)
+    data = bytes(range(256)) * 4
+
+    with adapted(fs_impl) as fs:
+        compressible = fs("create", "/compressible.txt", 0o644)
+        incompressible = fs("create", "/photo.jpg", 0o644)
+        fs("write", "/compressible.txt", b"a" * 1024, 0, compressible)
+        fs("write", "/photo.jpg", data, 0, incompressible)
+
+    rows_by_name = {
+        row["name"]: row
+        for row in rows(
+            fs_impl,
+            """
+            SELECT dir_entries.name, block_records.storage
+            FROM dir_entries
+            JOIN file_chunks ON file_chunks.file_id = dir_entries.inode_id
+            JOIN block_records ON block_records.hash = file_chunks.hash
+            """,
+        )
+    }
+    assert rows_by_name["compressible.txt"]["storage"] == "inline"
+    assert rows_by_name["photo.jpg"]["storage"] == "tiered"
+
+
+def test_ztierfs_stores_small_files_inline_in_payload_table_and_reopens(tmp_path):
+    fs_impl = make_fs(tmp_path)
+    data = b"tiny payload"
+
+    with adapted(fs_impl) as fs:
+        fh = fs("create", "/small.txt", 0o644)
+        fs("write", "/small.txt", data, 0, fh)
+        fs("release", "/small.txt", fh)
+
+    inode = rows(
+        fs_impl,
+        """
+        SELECT inodes.size, inode_payloads.payload, inode_payloads.stored_size
+        FROM inodes
+        JOIN inode_payloads ON inode_payloads.inode_id = inodes.id
+        WHERE inodes.kind = 'file'
+        """,
+    )[0]
+    assert inode["size"] == len(data)
+    assert bytes(inode["payload"]) == data
+    assert inode["stored_size"] == len(data)
+    assert rows(fs_impl, "SELECT * FROM file_chunks") == []
+    assert rows(fs_impl, "SELECT * FROM blocks") == []
+
+    reopened = make_fs(tmp_path)
+    with adapted(reopened) as fs:
+        fh = fs("open", "/small.txt", os.O_RDONLY)
+        assert fs("read", "/small.txt", len(data), 0, fh) == data
+
+
+def test_ztierfs_stores_small_files_in_filekv_payload_store_and_reopens(tmp_path):
+    fs_impl = make_fs(tmp_path, payload_store="filekv")
+    data = b"tiny payload"
+
+    with adapted(fs_impl) as fs:
+        fh = fs("create", "/small.txt", 0o644)
+        fs("write", "/small.txt", data, 0, fh)
+        fs("release", "/small.txt", fh)
+
+    inode = rows(
+        fs_impl,
+        """
+        SELECT payload, payload_store, payload_key, stored_size
+        FROM inode_payloads
+        """,
+    )[0]
+    assert inode["payload"] is None
+    assert inode["payload_store"] == "filekv"
+    assert inode["payload_key"].startswith("inode/")
+    assert inode["stored_size"] == len(data)
+
+    reopened = make_fs(tmp_path, payload_store="filekv")
+    with adapted(reopened) as fs:
+        fh = fs("open", "/small.txt", os.O_RDONLY)
+        assert fs("read", "/small.txt", len(data), 0, fh) == data
+
+
+def test_ztierfs_stores_inline_blocks_in_filekv_payload_store(tmp_path):
+    fs_impl = make_fs(
+        tmp_path,
+        inline_max_bytes=64,
+        compression_min_bytes=0,
+        payload_store="filekv",
+    )
+    data = b"a" * 1024
+
+    with adapted(fs_impl) as fs:
+        fh = fs("create", "/small.txt", 0o644)
+        fs("write", "/small.txt", data, 0, fh)
+        assert fs("read", "/small.txt", len(data), 0, fh) == data
+
+    block = rows(
+        fs_impl,
+        """
+        SELECT storage, inline_payload, inline_payload_store, inline_payload_key
+        FROM block_records
+        """,
+    )[0]
+    assert block["storage"] == "inline"
+    assert block["inline_payload"] is None
+    assert block["inline_payload_store"] == "filekv"
+    assert block["inline_payload_key"].startswith("block/")
+
+
+def test_ztierfs_inline_file_hardlinks_share_payload_and_xattrs(tmp_path):
+    fs_impl = make_fs(tmp_path)
+
+    with adapted(fs_impl) as fs:
+        fh = fs("create", "/file.txt", 0o644)
+        fs("write", "/file.txt", b"one", 0, fh)
+        fs("setxattr", "/file.txt", "user.note", b"shared", 0, 0)
+        fs("link", "/alias.txt", "/file.txt")
+
+        alias_fh = fs("open", "/alias.txt", os.O_RDWR)
+        fs("write", "/alias.txt", b"two", 0, alias_fh)
+
+        assert fs("read", "/file.txt", 3, 0, fh) == b"two"
+        assert fs("getxattr", "/alias.txt", "user.note", 0) == b"shared"
+        assert fs("getattr", "/file.txt")["st_nlink"] == 2
+
+    linked_inodes = rows(
+        fs_impl,
+        "SELECT DISTINCT inode_id FROM dir_entries WHERE name IN ('file.txt', 'alias.txt')",
+    )
+    assert len(linked_inodes) == 1
+    assert rows(fs_impl, "SELECT COUNT(*) AS total FROM blocks")[0]["total"] == 0
+
+
+def test_ztierfs_promotes_inline_file_when_append_crosses_threshold(tmp_path):
+    fs_impl = make_fs(tmp_path, inline_max_bytes=16)
+    expected = b"small" + b"x" * 20
+
+    with adapted(fs_impl) as fs:
+        fh = fs("create", "/grows.txt", 0o644)
+        fs("write", "/grows.txt", b"small", 0, fh)
+        fs("write", "/grows.txt", b"x" * 20, 5, fh)
+        assert fs("read", "/grows.txt", len(expected), 0, fh) == expected
+
+    assert rows(fs_impl, "SELECT * FROM inode_payloads") == []
+    assert rows(fs_impl, "SELECT COUNT(*) AS total FROM file_chunks")[0]["total"] == 1
+
+
+def test_ztierfs_promotes_inline_file_when_truncate_grows_past_threshold(tmp_path):
+    fs_impl = make_fs(tmp_path, inline_max_bytes=8)
+
+    with adapted(fs_impl) as fs:
+        fh = fs("create", "/sparse.txt", 0o644)
+        fs("write", "/sparse.txt", b"abc", 0, fh)
+        fs("truncate", "/sparse.txt", 12, fh)
+        assert fs("read", "/sparse.txt", 12, 0, fh) == b"abc" + b"\x00" * 9
+
+    assert rows(fs_impl, "SELECT * FROM inode_payloads") == []
+    assert rows(fs_impl, "SELECT COUNT(*) AS total FROM file_chunks")[0]["total"] == 1
+
+
+def test_ztierfs_clonefile_copies_inline_payload_without_reprocessing_blocks(tmp_path, monkeypatch):
+    fs_impl = make_fs(tmp_path)
+
+    with adapted(fs_impl) as fs:
+        fh = fs("create", "/source.txt", 0o644)
+        fs("write", "/source.txt", b"small", 0, fh)
+        fs("setxattr", "/source.txt", "user.note", b"copied", 0, 0)
+
+        def fail_prepare_blocks(*args, **kwargs):
+            raise AssertionError("inline clonefile must not reprocess blocks")
+
+        monkeypatch.setattr(fs_impl.block_store, "prepare_blocks", fail_prepare_blocks)
+        fs("clonefile", "/source.txt", "/copy.txt")
+
+        copy_fh = fs("open", "/copy.txt", os.O_RDONLY)
+        assert fs("read", "/copy.txt", 5, 0, copy_fh) == b"small"
+        assert fs("getxattr", "/copy.txt", "user.note", 0) == b"copied"
+
+    assert rows(fs_impl, "SELECT COUNT(*) AS total FROM file_chunks")[0]["total"] == 0
+    assert rows(fs_impl, "SELECT COUNT(*) AS total FROM blocks")[0]["total"] == 0
+
+
+def test_ztierfs_internal_write_merge_does_not_flush_read_stats(tmp_path):
+    fs_impl = make_fs(tmp_path, inline_max_bytes=0)
+    data = b"abcdef" * 200
+
+    with adapted(fs_impl) as fs:
+        fh = fs("create", "/chunked.jpg", 0o644)
+        fs("write", "/chunked.jpg", data, 0, fh)
+        fs("write", "/chunked.jpg", b"PATCH", 10, fh)
+
+    reads = rows(fs_impl, "SELECT COALESCE(SUM(read_count), 0) AS reads FROM blocks")[0]
+    assert reads["reads"] == 0
+
+
+def test_ztierfs_reuses_decoded_block_cache_for_repeated_reads(tmp_path, monkeypatch):
+    fs_impl = make_fs(tmp_path, inline_max_bytes=0)
+    data = b"cached block" * 100
+
+    with adapted(fs_impl) as fs:
+        fh = fs("create", "/cached.jpg", 0o644)
+        fs("write", "/cached.jpg", data, 0, fh)
+        assert fs("read", "/cached.jpg", len(data), 0, fh) == data
+
+        def fail_disk_read(_path):
+            raise AssertionError("second read should be served from decoded block cache")
+
+        monkeypatch.setattr("ztierfs.block_store.read_path_bytes", fail_disk_read)
+        assert fs("read", "/cached.jpg", len(data), 0, fh) == data
+
+
+def test_ztierfs_updates_refcounts_when_overwriting_and_unlinking(tmp_path):
+    fs_impl = make_fs(tmp_path, inline_max_bytes=0)
+    shared = b"same-block" * 100
+    replacement = b"different!" * 100
+
+    with adapted(fs_impl) as fs:
+        first = fs("create", "/first.txt", 0o644)
+        second = fs("create", "/second.txt", 0o644)
+        fs("write", "/first.txt", shared, 0, first)
+        fs("write", "/second.txt", shared, 0, second)
+        fs("write", "/first.txt", replacement, 0, first)
+
+        block_rows = rows(fs_impl, "SELECT refcount FROM blocks ORDER BY refcount")
+        assert [row["refcount"] for row in block_rows] == [1, 1]
+
+        fs("unlink", "/second.txt")
+        fs("release", "/second.txt", second)
+
+    block_rows = rows(fs_impl, "SELECT raw_size, refcount FROM blocks")
+    assert len(block_rows) == 1
+    assert block_rows[0]["raw_size"] == len(replacement)
+    assert block_rows[0]["refcount"] == 1
+
+
+def test_ztierfs_partial_overwrite_of_deduped_chunk_keeps_other_file_intact(tmp_path):
+    fs_impl = make_fs(tmp_path, inline_max_bytes=0)
+    shared = bytes(range(256)) * 4
+    patch = b"changed"
+    expected = shared[:100] + patch + shared[100 + len(patch) :]
+
+    with adapted(fs_impl) as fs:
+        first = fs("create", "/first.jpg", 0o644)
+        second = fs("create", "/second.jpg", 0o644)
+        fs("write", "/first.jpg", shared, 0, first)
+        fs("write", "/second.jpg", shared, 0, second)
+
+        fs("write", "/first.jpg", patch, 100, first)
+
+        assert fs("read", "/first.jpg", len(shared), 0, first) == expected
+        assert fs("read", "/second.jpg", len(shared), 0, second) == shared
+
+    block_rows = rows(fs_impl, "SELECT refcount FROM blocks ORDER BY refcount")
+    assert [row["refcount"] for row in block_rows] == [1, 1]
+
+
+def test_ztierfs_defers_read_access_stats_until_flush(tmp_path):
+    fs_impl = make_fs(tmp_path, inline_max_bytes=0)
+    data = b"read stats" * 100
+
+    with adapted(fs_impl) as fs:
+        fh = fs("create", "/stats.jpg", 0o644)
+        fs("write", "/stats.jpg", data, 0, fh)
+
+        assert fs("read", "/stats.jpg", len(data), 0, fh) == data
+        assert rows(fs_impl, "SELECT SUM(read_count) AS reads FROM blocks")[0]["reads"] == 0
+
+        fs("flush", "/stats.jpg", fh)
+        assert rows(fs_impl, "SELECT SUM(read_count) AS reads FROM blocks")[0]["reads"] == 1
+
+
+def test_ztierfs_reads_multi_chunk_plan_in_parallel(tmp_path, monkeypatch):
+    fs_impl = make_fs(tmp_path, inline_max_bytes=0)
+    data = bytes(range(256)) * 8
+    barrier = threading.Barrier(2)
+    lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    with adapted(fs_impl) as fs:
+        fh = fs("create", "/movie.jpg", 0o644)
+        fs("write", "/movie.jpg", data, 0, fh)
+        original = fs_impl.block_store.read_block_snapshot
+
+        def observed_read_block(row, expected_size):
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                barrier.wait(timeout=2)
+                return original(row, expected_size)
+            finally:
+                with lock:
+                    active -= 1
+
+        monkeypatch.setattr(
+            fs_impl.block_store, "read_block_snapshot", observed_read_block
+        )
+        assert fs("read", "/movie.jpg", len(data), 0, fh) == data
+
+    assert max_active == 2
+
+
+def test_ztierfs_cold_copy_up_does_not_block_read(tmp_path, monkeypatch):
+    fs_impl = make_fs(
+        tmp_path,
+        hot_cache_max_bytes=1500,
+        hot_cache_min_bytes=1024,
+        protected_prefix_chunks=0,
+        min_hot_age_seconds=0,
+        inline_max_bytes=0,
+    )
+    cold_data = bytes(range(256)) * 4
+    hot_data = bytes(reversed(range(256))) * 4
+    copy_started = threading.Event()
+    allow_copy = threading.Event()
+
+    with adapted(fs_impl) as fs:
+        cold_fh = fs("create", "/cold.jpg", 0o644)
+        hot_fh = fs("create", "/hot.jpg", 0o644)
+        fs("write", "/cold.jpg", cold_data, 0, cold_fh)
+        fs("write", "/hot.jpg", hot_data, 0, hot_fh)
+        assert rows(fs_impl, "SELECT COUNT(*) AS total FROM block_records WHERE cold_present = 1")[0]["total"]
+
+        original_copy_block = fs_impl.block_store.copy_block
+
+        def gated_copy_block(digest, source_tier, target_tier):
+            copy_started.set()
+            assert allow_copy.wait(timeout=2)
+            return original_copy_block(digest, source_tier, target_tier)
+
+        monkeypatch.setattr(fs_impl.block_store, "copy_block", gated_copy_block)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(fs, "read", "/cold.jpg", len(cold_data), 0, cold_fh)
+            try:
+                assert future.result(timeout=1) == cold_data
+                assert copy_started.wait(timeout=1)
+                assert rows(
+                    fs_impl,
+                    "SELECT COUNT(*) AS total FROM block_records WHERE hot_present = 1 AND cold_present = 1",
+                )[0]["total"] == 0
+            finally:
+                allow_copy.set()
+
+        fs("release", "/cold.jpg", cold_fh)
+        fs("release", "/hot.jpg", hot_fh)
+
+
+def test_ztierfs_moves_least_recently_used_blocks_to_cold_tier(tmp_path):
+    fs_impl = make_fs(
+        tmp_path,
+        hot_cache_max_bytes=1500,
+        hot_cache_min_bytes=1024,
+        protected_prefix_chunks=0,
+        min_hot_age_seconds=0,
+        inline_max_bytes=0,
+    )
+    first = bytes(range(256)) * 4
+    second = bytes(reversed(range(256))) * 4
+
+    with adapted(fs_impl) as fs:
+        first_fh = fs("create", "/first.jpg", 0o644)
+        second_fh = fs("create", "/second.jpg", 0o644)
+        fs("write", "/first.jpg", first, 0, first_fh)
+        fs("write", "/second.jpg", second, 0, second_fh)
+
+        presence = rows(fs_impl, "SELECT hot_present, cold_present FROM block_records")
+        assert sorted((row["hot_present"], row["cold_present"]) for row in presence) == [
+            (0, 1),
+            (1, 0),
+        ]
+        assert any((tmp_path / "cold" / "blocks").glob("*/*/*"))
+
+        assert fs("read", "/first.jpg", len(first), 0, first_fh) == first
+        def tier_counts_ready():
+            presence = rows(
+                fs_impl, "SELECT hot_present, cold_present FROM block_records"
+            )
+            return (
+                sum(row["hot_present"] for row in presence) == 1
+                and sum(row["cold_present"] for row in presence) == 2
+            )
+
+        _wait_until(tier_counts_ready)
+        presence = rows(fs_impl, "SELECT hot_present, cold_present FROM block_records")
+        assert sum(row["hot_present"] for row in presence) == 1
+        assert sum(row["cold_present"] for row in presence) == 2
+
+
+def test_ztierfs_keeps_file_prefix_chunks_hot_during_demote(tmp_path):
+    fs_impl = make_fs(
+        tmp_path,
+        hot_cache_max_bytes=1500,
+        hot_cache_min_bytes=1024,
+        protected_prefix_chunks=1,
+        min_hot_age_seconds=0,
+        inline_max_bytes=0,
+    )
+    data = bytes(range(256)) * 4 + bytes(reversed(range(256))) * 4
+
+    with adapted(fs_impl) as fs:
+        fh = fs("create", "/movie.jpg", 0o644)
+        fs("write", "/movie.jpg", data, 0, fh)
+
+        chunk_rows = rows(
+            fs_impl,
+            """
+            SELECT file_chunks.chunk_index, block_records.hot_present, block_records.cold_present
+            FROM file_chunks
+            JOIN block_records ON block_records.hash = file_chunks.hash
+            ORDER BY file_chunks.chunk_index
+            """,
+        )
+        assert [(row["hot_present"], row["cold_present"]) for row in chunk_rows] == [
+            (1, 0),
+            (0, 1),
+        ]
+
+
+def test_ztierfs_recovers_when_block_metadata_points_to_missing_tier(tmp_path):
+    fs_impl = make_fs(tmp_path, inline_max_bytes=0)
+    data = b"fallback block" * 80
+
+    with adapted(fs_impl) as fs:
+        fh = fs("create", "/file.bin", 0o644)
+        fs("write", "/file.bin", data, 0, fh)
+        fs("flush", "/file.bin", fh)
+
+        digest = rows(fs_impl, "SELECT hash FROM blocks")[0]["hash"]
+        with sqlite3.connect(fs_impl.database) as db:
+            db.execute(
+                """
+                UPDATE blocks SET preferred_tier = 2 WHERE hash = ?
+                """,
+                (digest,),
+            )
+            db.execute("DELETE FROM block_locations WHERE hash = ? AND tier = 1", (digest,))
+            db.execute(
+                "INSERT OR IGNORE INTO block_locations (hash, tier) VALUES (?, 2)",
+                (digest,),
+            )
+
+        assert fs("read", "/file.bin", len(data), 0, fh) == data
+        with sqlite3.connect(fs_impl.database) as db:
+            row = db.execute(
+                """
+                SELECT hot_present, cold_present, preferred_tier
+                FROM block_records
+                WHERE hash = ?
+                """,
+                (digest,),
+            ).fetchone()
+            assert row == (1, 0, 1)
