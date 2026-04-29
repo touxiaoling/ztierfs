@@ -1,3 +1,5 @@
+"""普通文件的创建、打开、读写与截断等 FUSE 路径/句柄操作。"""
+
 import errno
 import os
 
@@ -13,8 +15,12 @@ from .fs_mixins import FileSystemMixinBase
 
 
 class FileOpsMixin(FileSystemMixinBase):
+    """文件相关 FUSE 回调的高层实现（依赖元数据事务与 FileContentService）。"""
+
     def _create(self, path: str, mode: int, flags: int = os.O_RDWR) -> int:
-        logger.debug("创建或截断文件：path={}，mode={:o}，flags={:#x}", path, mode, flags)
+        logger.debug(
+            "创建或截断文件：path={}，mode={:o}，flags={:#x}", path, mode, flags
+        )
         self._ensure_trash_directory_for_caller()
         with self.metadata.transaction():
             parent, name = self.metadata.parent_and_name(path)
@@ -87,7 +93,9 @@ class FileOpsMixin(FileSystemMixinBase):
             return self.metadata.get_node(path)["id"]
 
     def _read(self, path: str, size: int, offset: int, fh) -> bytes:
-        logger.debug("读取文件：path={}，size={}，offset={}，fh={}", path, size, offset, fh)
+        logger.debug(
+            "读取文件：path={}，size={}，offset={}，fh={}", path, size, offset, fh
+        )
         self._ensure_trash_directory_for_caller()
         inode_id = self._inode_id_from_handle_or_path(path, fh)
         with self._content_lock(inode_id):
@@ -99,7 +107,9 @@ class FileOpsMixin(FileSystemMixinBase):
         if plan.chunks:
             now = time_ns()
             should_flush = self.metadata.defer_node_atime(plan.file_id, now)
-            should_flush = self.block_store.record_block_accesses(accesses, now) or should_flush
+            should_flush = (
+                self.block_store.record_block_accesses(accesses, now) or should_flush
+            )
             if should_flush:
                 with self.metadata.transaction():
                     for access in accesses:
@@ -109,7 +119,9 @@ class FileOpsMixin(FileSystemMixinBase):
             with self.metadata.transaction():
                 self.block_store.demote_cold_blocks()
         self._schedule_readahead(plan, offset, len(data), fh)
-        logger.debug("读取完成：path={}，inode={}，返回字节={}", path, plan.file_id, len(data))
+        logger.debug(
+            "读取完成：path={}，inode={}，返回字节={}", path, plan.file_id, len(data)
+        )
         return data
 
     def _schedule_readahead(self, plan, offset: int, data_len: int, fh) -> None:
@@ -143,7 +155,9 @@ class FileOpsMixin(FileSystemMixinBase):
                     self._readahead_executor = executor
             executor.submit(self._prefetch_chunk, plan.file_id, chunk_index, key)
 
-    def _prefetch_chunk(self, file_id: int, chunk_index: int, key: tuple[int, int]) -> None:
+    def _prefetch_chunk(
+        self, file_id: int, chunk_index: int, key: tuple[int, int]
+    ) -> None:
         try:
             with self.metadata.read_transaction():
                 node = self.metadata.node_by_id(file_id)
@@ -163,17 +177,23 @@ class FileOpsMixin(FileSystemMixinBase):
                 self._readahead_inflight.discard(key)
 
     def _write(self, path: str, data: bytes, offset: int, fh) -> int:
-        logger.debug("写入文件：path={}，bytes={}，offset={}，fh={}", path, len(data), offset, fh)
+        logger.debug(
+            "写入文件：path={}，bytes={}，offset={}，fh={}", path, len(data), offset, fh
+        )
         self._ensure_trash_directory_for_caller()
         inode_id = self._inode_id_from_handle_or_path(path, fh)
         with self._content_lock(inode_id):
             with self.metadata.read_transaction():
                 node = self._node_from_handle_or_path(path, fh)
                 self._require_access(node, os.W_OK)
-                prepared = self.file_content.prepare_write_file(node, path, data, offset)
+                prepared = self.file_content.prepare_write_file(
+                    node, path, data, offset
+                )
             with self.metadata.transaction():
                 written = self.file_content.commit_prepared_write(prepared)
-                logger.debug("写入完成：path={}，inode={}，bytes={}", path, node["id"], written)
+                logger.debug(
+                    "写入完成：path={}，inode={}，bytes={}", path, node["id"], written
+                )
         if self.block_store.take_demotion_request():
             logger.debug("写入触发热层降级检查：path={}", path)
             with self.metadata.transaction():
@@ -191,7 +211,9 @@ class FileOpsMixin(FileSystemMixinBase):
                     raise FuseOSError(errno.EISDIR)
                 self._require_access(node, os.W_OK)
                 self.file_content.truncate_file(node["id"], path, length)
-                logger.debug("截断完成：path={}，inode={}，length={}", path, node["id"], length)
+                logger.debug(
+                    "截断完成：path={}，inode={}，length={}", path, node["id"], length
+                )
         if self.block_store.take_demotion_request():
             logger.debug("截断触发热层降级检查：path={}", path)
             with self.metadata.transaction():
@@ -234,7 +256,11 @@ class FileOpsMixin(FileSystemMixinBase):
             node["parent_id"], node["name"], node["id"], now
         )
         if remaining > 0:
-            logger.debug("删除目录项后 inode 仍有硬链接：inode={}，remaining={}", node["id"], remaining)
+            logger.debug(
+                "删除目录项后 inode 仍有硬链接：inode={}，remaining={}",
+                node["id"],
+                remaining,
+            )
             return
         if self.handles.has_open_file(node["id"]):
             logger.debug("删除目录项后 inode 仍被打开，延迟清理：inode={}", node["id"])
@@ -250,5 +276,7 @@ class FileOpsMixin(FileSystemMixinBase):
     def _delete_inode_payload(self, node) -> None:
         if node["kind"] == "file":
             self.file_content.remove_file_chunks(node["id"])
-        logger.debug("删除 inode payload 和元数据：inode={}，kind={}", node["id"], node["kind"])
+        logger.debug(
+            "删除 inode payload 和元数据：inode={}，kind={}", node["id"], node["kind"]
+        )
         self.metadata.delete_node(node["id"])

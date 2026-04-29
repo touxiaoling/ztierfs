@@ -1,3 +1,5 @@
+"""离线维护：fsck、scrub、统计、冷层副本清理与路径解析。"""
+
 from .checker import run_fsck, run_scrub
 from .cleanup import CleanupReport, cleanup_promoted_cold_copies
 from .paths import block_path, default_database

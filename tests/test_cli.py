@@ -64,7 +64,15 @@ def test_cli_fsck_returns_nonzero_for_unrepaired_issue(tmp_path, capsys):
     orphan.write_bytes(b"orphan")
 
     with pytest.raises(SystemExit) as excinfo:
-        main(["fsck", str(fs_impl.tier1), str(fs_impl.tier2), "--database", str(fs_impl.database)])
+        main(
+            [
+                "fsck",
+                str(fs_impl.tier1),
+                str(fs_impl.tier2),
+                "--database",
+                str(fs_impl.database),
+            ]
+        )
     assert excinfo.value.code == 1
     assert "orphan_block_file" in capsys.readouterr().out
 
@@ -76,7 +84,16 @@ def test_cli_fsck_repair_exits_successfully(tmp_path, capsys):
     orphan.parent.mkdir(parents=True, exist_ok=True)
     orphan.write_bytes(b"orphan")
 
-    main(["fsck", str(fs_impl.tier1), str(fs_impl.tier2), "--database", str(fs_impl.database), "--repair"])
+    main(
+        [
+            "fsck",
+            str(fs_impl.tier1),
+            str(fs_impl.tier2),
+            "--database",
+            str(fs_impl.database),
+            "--repair",
+        ]
+    )
     assert "orphan_block_file" in capsys.readouterr().out
     assert not orphan.exists()
 
@@ -158,7 +175,9 @@ def test_cli_mount_accepts_explicit_iosize(tmp_path, monkeypatch):
     assert kwargs["iosize"] == 32 * 1024 * 1024
 
 
-def test_cli_mount_accepts_metadata_cache_and_deferred_permissions(tmp_path, monkeypatch):
+def test_cli_mount_accepts_metadata_cache_and_deferred_permissions(
+    tmp_path, monkeypatch
+):
     calls = []
 
     def fake_fuse(fs, mountpoint, **kwargs):

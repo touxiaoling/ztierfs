@@ -1,3 +1,5 @@
+"""blocks / block_locations / block_payloads 上的 refcount 与 tier 信息。"""
+
 import sqlite3
 
 from .base import MetadataMixinBase
@@ -5,9 +7,13 @@ from .schema import BLOCK_RECORD_SELECT
 
 
 class BlockMetadataMixin(MetadataMixinBase):
+    """内容寻址块在库内的存在性、引用计数与冷热位置更新。"""
+
     def block_exists(self, digest: str) -> bool:
         return (
-            self._db.execute("SELECT 1 FROM blocks WHERE hash = ?", (digest,)).fetchone()
+            self._db.execute(
+                "SELECT 1 FROM blocks WHERE hash = ?", (digest,)
+            ).fetchone()
             is not None
         )
 
@@ -177,7 +183,6 @@ class BlockMetadataMixin(MetadataMixinBase):
                 "DELETE FROM block_locations WHERE hash = ? AND tier = ?",
                 (digest, tier),
             )
-
 
     def hot_tier_stored_size(self) -> int:
         return self._db.execute(

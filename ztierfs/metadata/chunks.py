@@ -1,3 +1,5 @@
+"""file_chunks 与块记录联查：按文件区间取分块映射。"""
+
 import sqlite3
 
 from .base import MetadataMixinBase
@@ -5,6 +7,8 @@ from .schema import BLOCK_RECORD_SELECT
 
 
 class ChunkMetadataMixin(MetadataMixinBase):
+    """单个或连续 chunk_index 对应的块元数据行。"""
+
     def chunk_block(self, file_id: int, chunk_index: int) -> sqlite3.Row | None:
         return self._db.execute(
             f"""

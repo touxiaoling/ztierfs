@@ -1,3 +1,5 @@
+"""路径解析、目录项、回收站与 inode 行查询等命名空间 SQL。"""
+
 import errno
 import sqlite3
 
@@ -16,6 +18,8 @@ TRASH_USER_MODE = S_IFDIR | 0o700
 
 
 class NamespaceMixin(MetadataMixinBase):
+    """inodes/dir_entries 上的增删改查与 macOS .Trashes 等特殊目录。"""
+
     NODE_SELECT = """
         SELECT
             inodes.*,
@@ -297,7 +301,9 @@ class NamespaceMixin(MetadataMixinBase):
         ).fetchone()
         if payload_row is not None and payload_row["payload_store"] != "sqlite":
             new_key = f"inode/{inode_id}"
-            self.payload_store.put(new_key, self.payload_store.get(payload_row["payload_key"]))
+            self.payload_store.put(
+                new_key, self.payload_store.get(payload_row["payload_key"])
+            )
             self._db.execute(
                 """
                 UPDATE inode_payloads
@@ -365,7 +371,6 @@ class NamespaceMixin(MetadataMixinBase):
 
     def touch_node_atime(self, node_id: int, now: int) -> None:
         self._db.execute("UPDATE inodes SET atime_ns = ? WHERE id = ?", (now, node_id))
-
 
     def set_node_size(self, node_id: int, size: int, now: int) -> None:
         self._db.execute(

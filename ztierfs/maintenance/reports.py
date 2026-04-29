@@ -1,3 +1,5 @@
+"""fsck/stats 等命令的结构化报告与文本/JSON 输出。"""
+
 import json
 
 from dataclasses import asdict, dataclass, field
@@ -50,7 +52,6 @@ class StatsReport:
         return asdict(self)
 
 
-
 def report_to_text(report: CheckReport) -> str:
     if not report.issues:
         return f"{report.command}: ok"
@@ -59,7 +60,9 @@ def report_to_text(report: CheckReport) -> str:
         state = "repaired" if issue.repaired else "unrepaired"
         lines.append(f"- {issue.code}: {issue.message} [{state}]")
         if issue.details:
-            lines.append(f"  {json.dumps(issue.details, ensure_ascii=False, sort_keys=True)}")
+            lines.append(
+                f"  {json.dumps(issue.details, ensure_ascii=False, sort_keys=True)}"
+            )
     return "\n".join(lines)
 
 

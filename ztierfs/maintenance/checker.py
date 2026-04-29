@@ -1,3 +1,5 @@
+"""一致性检查与校验读取：对照元数据验证块文件与内联载荷。"""
+
 import sqlite3
 
 from pathlib import Path
@@ -63,6 +65,8 @@ def run_scrub(
 
 
 class Checker:
+    """打开配置与数据库，执行结构检查、可选修复与按块的 scrub。"""
+
     def __init__(
         self,
         path: str | Path,
@@ -108,7 +112,9 @@ class Checker:
                 }
                 actual_refs = {
                     row["hash"]: row["count"]
-                    for row in db.execute("SELECT hash, COUNT(*) AS count FROM file_chunks GROUP BY hash").fetchall()
+                    for row in db.execute(
+                        "SELECT hash, COUNT(*) AS count FROM file_chunks GROUP BY hash"
+                    ).fetchall()
                 }
                 disk_blocks = self._scan_disk_blocks()
                 logger.debug(
@@ -140,7 +146,12 @@ class Checker:
         )
         return CheckReport(command, self.issues)
 
-    def _check_block_records(self, db: sqlite3.Connection, blocks: dict[str, sqlite3.Row], actual_refs: dict[str, int]) -> None:
+    def _check_block_records(
+        self,
+        db: sqlite3.Connection,
+        blocks: dict[str, sqlite3.Row],
+        actual_refs: dict[str, int],
+    ) -> None:
         for digest, row in blocks.items():
             actual = actual_refs.get(digest, 0)
             hot_probe = probe_path(block_path(self.tier1, self.tier2, digest, 1))
@@ -154,7 +165,11 @@ class Checker:
                 self._issue(
                     "refcount_mismatch",
                     "block refcount does not match file_chunks references",
-                    {"hash": digest, "stored_refcount": row["refcount"], "actual_refcount": actual},
+                    {
+                        "hash": digest,
+                        "stored_refcount": row["refcount"],
+                        "actual_refcount": actual,
+                    },
                     repairable=True,
                     repair=lambda digest=digest, actual=actual: db.execute(
                         "UPDATE blocks SET refcount = ? WHERE hash = ?",
@@ -168,12 +183,21 @@ class Checker:
                     "block metadata is not referenced by any file chunk",
                     {"hash": digest, "cold_unavailable": cold_unavailable},
                     repairable=not cold_unavailable,
-                    repair=(lambda digest=digest: self._delete_block_record_and_files(db, digest))
+                    repair=(
+                        lambda digest=digest: self._delete_block_record_and_files(
+                            db, digest
+                        )
+                    )
                     if not cold_unavailable
                     else None,
                 )
             elif row["storage"] == "inline":
-                if self._inline_payload_bytes(row, issue_context={"hash": digest, "refcount": actual}) is None:
+                if (
+                    self._inline_payload_bytes(
+                        row, issue_context={"hash": digest, "refcount": actual}
+                    )
+                    is None
+                ):
                     self._issue(
                         "missing_inline_payload",
                         "referenced inline block metadata has no inline payload",
@@ -201,8 +225,8 @@ class Checker:
                             "cold_unavailable": True,
                         },
                         repairable=True,
-                        repair=lambda digest=digest, hot=hot_exists: self._repair_hot_presence(
-                            db, digest, hot
+                        repair=lambda digest=digest, hot=hot_exists: (
+                            self._repair_hot_presence(db, digest, hot)
                         ),
                     )
             elif not hot_exists and not cold_exists:
@@ -231,12 +255,16 @@ class Checker:
                             "actual_cold": cold_exists,
                         },
                         repairable=True,
-                        repair=lambda digest=digest, hot=hot_exists, cold=cold_exists, preferred=preferred: self._repair_block_presence(
-                            db, digest, hot, cold, preferred
+                        repair=lambda digest=digest, hot=hot_exists, cold=cold_exists, preferred=preferred: (
+                            self._repair_block_presence(
+                                db, digest, hot, cold, preferred
+                            )
                         ),
                     )
 
-                preferred_exists = hot_exists if row["preferred_tier"] == 1 else cold_exists
+                preferred_exists = (
+                    hot_exists if row["preferred_tier"] == 1 else cold_exists
+                )
                 if not preferred_exists:
                     actual_tier = 1 if hot_exists else 2
                     self._issue(
@@ -248,20 +276,29 @@ class Checker:
                             "actual_tier": actual_tier,
                         },
                         repairable=True,
-                        repair=lambda digest=digest, actual_tier=actual_tier: db.execute(
-                            "UPDATE blocks SET preferred_tier = ? WHERE hash = ?",
-                            (actual_tier, digest),
+                        repair=lambda digest=digest, actual_tier=actual_tier: (
+                            db.execute(
+                                "UPDATE blocks SET preferred_tier = ? WHERE hash = ?",
+                                (actual_tier, digest),
+                            )
                         ),
                     )
 
-            if actual != 0 and row["storage"] == "tiered" and not row["hot_present"] and not row["cold_present"]:
+            if (
+                actual != 0
+                and row["storage"] == "tiered"
+                and not row["hot_present"]
+                and not row["cold_present"]
+            ):
                 self._issue(
                     "missing_block_presence",
                     "referenced block metadata does not declare any storage tier",
                     {"hash": digest},
                     repairable=True,
-                    repair=lambda digest=digest, hot=hot_exists, cold=cold_exists: self._repair_block_presence(
-                        db, digest, hot, cold, 1 if hot else 2
+                    repair=lambda digest=digest, hot=hot_exists, cold=cold_exists: (
+                        self._repair_block_presence(
+                            db, digest, hot, cold, 1 if hot else 2
+                        )
                     ),
                 )
 
@@ -362,7 +399,9 @@ class Checker:
                 "block file exists on disk without block metadata",
                 {"hash": digest, "tiers": sorted(tiers)},
                 repairable=True,
-                repair=lambda digest=digest, tiers=tuple(tiers): self._delete_disk_block_files(digest, tiers),
+                repair=lambda digest=digest, tiers=tuple(tiers): (
+                    self._delete_disk_block_files(digest, tiers)
+                ),
             )
 
     def _check_chunk_metadata(self, db: sqlite3.Connection) -> None:
@@ -374,7 +413,11 @@ class Checker:
             WHERE blocks.hash IS NULL
             """
         ).fetchall():
-            self._issue("chunk_missing_block_metadata", "file chunk points to missing block metadata", dict(row))
+            self._issue(
+                "chunk_missing_block_metadata",
+                "file chunk points to missing block metadata",
+                dict(row),
+            )
 
         for row in db.execute(
             """
@@ -384,7 +427,9 @@ class Checker:
             WHERE inodes.id IS NULL
             """
         ).fetchall():
-            self._issue("chunk_missing_inode", "file chunk points to missing inode", dict(row))
+            self._issue(
+                "chunk_missing_inode", "file chunk points to missing inode", dict(row)
+            )
 
         for row in db.execute(
             """
@@ -408,7 +453,11 @@ class Checker:
             WHERE inodes.kind != 'file'
             """
         ).fetchall():
-            self._issue("chunk_for_non_file_inode", "file chunk points to a non-file inode", dict(row))
+            self._issue(
+                "chunk_for_non_file_inode",
+                "file chunk points to a non-file inode",
+                dict(row),
+            )
 
         for row in db.execute(
             """
@@ -419,7 +468,11 @@ class Checker:
             WHERE parent.id IS NULL OR child.id IS NULL OR parent.kind != 'dir'
             """
         ).fetchall():
-            self._issue("invalid_dir_entry", "directory entry points to missing or invalid inode metadata", dict(row))
+            self._issue(
+                "invalid_dir_entry",
+                "directory entry points to missing or invalid inode metadata",
+                dict(row),
+            )
 
     def _check_nlinks(self, db: sqlite3.Connection) -> None:
         rows = db.execute(
@@ -436,7 +489,12 @@ class Checker:
                 self._issue(
                     "nlink_mismatch",
                     "inode nlink does not match directory entries",
-                    {"inode": row["id"], "kind": row["kind"], "stored_nlink": row["nlink"], "actual_nlink": expected},
+                    {
+                        "inode": row["id"],
+                        "kind": row["kind"],
+                        "stored_nlink": row["nlink"],
+                        "actual_nlink": expected,
+                    },
                     repairable=True,
                     repair=lambda inode=row["id"], expected=expected: db.execute(
                         "UPDATE inodes SET nlink = ? WHERE id = ?",
@@ -444,7 +502,9 @@ class Checker:
                     ),
                 )
 
-    def _scrub_block_payloads(self, db: sqlite3.Connection, blocks: dict[str, sqlite3.Row]) -> None:
+    def _scrub_block_payloads(
+        self, db: sqlite3.Connection, blocks: dict[str, sqlite3.Row]
+    ) -> None:
         for row in db.execute(
             """
             SELECT inodes.id, inodes.size, inode_payloads.payload,
@@ -455,7 +515,9 @@ class Checker:
             JOIN inodes ON inodes.id = inode_payloads.inode_id
             """
         ).fetchall():
-            payload = self._inline_payload_bytes(row, issue_context={"inode": row["id"]})
+            payload = self._inline_payload_bytes(
+                row, issue_context={"inode": row["id"]}
+            )
             if payload is None:
                 self._issue(
                     "missing_inode_payload",
@@ -467,7 +529,11 @@ class Checker:
                 self._issue(
                     "inode_payload_stored_size_mismatch",
                     "inode inline payload size does not match metadata stored_size",
-                    {"inode": row["id"], "expected": row["stored_size"], "actual": len(payload)},
+                    {
+                        "inode": row["id"],
+                        "expected": row["stored_size"],
+                        "actual": len(payload),
+                    },
                 )
                 continue
             try:
@@ -492,7 +558,9 @@ class Checker:
 
         for digest, row in blocks.items():
             if row["storage"] == "inline":
-                payload = self._inline_payload_bytes(row, issue_context={"hash": digest})
+                payload = self._inline_payload_bytes(
+                    row, issue_context={"hash": digest}
+                )
                 if payload is None:
                     self._issue(
                         "missing_inline_payload",
@@ -546,9 +614,17 @@ class Checker:
     def _inline_payload_bytes(
         self, row: sqlite3.Row, *, issue_context: dict[str, Any]
     ) -> bytes | None:
-        store = row["payload_store"] if "payload_store" in row.keys() else row["inline_payload_store"]
+        store = (
+            row["payload_store"]
+            if "payload_store" in row.keys()
+            else row["inline_payload_store"]
+        )
         payload = row["payload"] if "payload" in row.keys() else row["inline_payload"]
-        key = row["payload_key"] if "payload_key" in row.keys() else row["inline_payload_key"]
+        key = (
+            row["payload_key"]
+            if "payload_key" in row.keys()
+            else row["inline_payload_key"]
+        )
         if store == "sqlite":
             return bytes(payload) if payload is not None else None
         if key is None:
@@ -560,7 +636,12 @@ class Checker:
             self._issue(
                 "payload_store_unavailable",
                 "external inline payload cannot be read",
-                {**issue_context, "payload_store": store, "payload_key": key, "error": str(exc)},
+                {
+                    **issue_context,
+                    "payload_store": store,
+                    "payload_key": key,
+                    "error": str(exc),
+                },
             )
             return None
 
@@ -629,7 +710,9 @@ class Checker:
                     except OSError as exc:
                         if is_temporary_unavailable_error(exc):
                             self._issue(
-                                "cold_tier_unavailable" if tier == 2 else "hot_tier_unavailable",
+                                "cold_tier_unavailable"
+                                if tier == 2
+                                else "hot_tier_unavailable",
                                 "block tier cannot be scanned completely right now",
                                 {"tier": tier, "path": str(root), "error": str(exc)},
                             )
@@ -642,7 +725,9 @@ class Checker:
             except OSError as exc:
                 if is_temporary_unavailable_error(exc):
                     self._issue(
-                        "cold_tier_unavailable" if tier == 2 else "hot_tier_unavailable",
+                        "cold_tier_unavailable"
+                        if tier == 2
+                        else "hot_tier_unavailable",
                         "block tier cannot be scanned right now",
                         {"tier": tier, "path": str(root), "error": str(exc)},
                     )
@@ -674,7 +759,9 @@ class Checker:
             )
         self.issues.append(issue)
 
-    def _delete_block_record_and_files(self, db: sqlite3.Connection, digest: str) -> None:
+    def _delete_block_record_and_files(
+        self, db: sqlite3.Connection, digest: str
+    ) -> None:
         logger.info("删除无引用块记录和块文件：hash={}", digest[:12])
         db.execute("DELETE FROM blocks WHERE hash = ?", (digest,))
         self._delete_disk_block_files(digest, (1, 2))

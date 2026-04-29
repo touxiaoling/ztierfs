@@ -1,3 +1,5 @@
+"""终端 Rich 日志与标准 logging 桥接到 loguru 的配置。"""
+
 import logging
 from contextlib import contextmanager
 from dataclasses import dataclass

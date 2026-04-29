@@ -1,3 +1,5 @@
+"""块与 inode 的访问时间、读取次数：支持延迟批量刷盘以降低写放大。"""
+
 from collections.abc import Iterator
 from dataclasses import dataclass
 
@@ -14,8 +16,9 @@ class BlockAccessStats:
     read_count: int
 
 
-
 class AccessStatsMixin(MetadataMixinBase):
+    """在写事务边界内合并 atime/read_count 的延迟队列与刷盘条件。"""
+
     def defer_node_atime(self, node_id: int, now: int) -> bool:
         with self._deferred_access_lock:
             self._start_deferred_accesses(now)

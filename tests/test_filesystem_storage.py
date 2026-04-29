@@ -70,7 +70,9 @@ def test_ztierfs_deduplicates_equal_chunks(tmp_path):
     assert block_rows[0]["refcount"] == 2
 
 
-def test_ztierfs_clonefile_copies_metadata_without_reprocessing_blocks(tmp_path, monkeypatch):
+def test_ztierfs_clonefile_copies_metadata_without_reprocessing_blocks(
+    tmp_path, monkeypatch
+):
     fs_impl = make_fs(tmp_path)
     data = b"a" * 2048
 
@@ -86,7 +88,9 @@ def test_ztierfs_clonefile_copies_metadata_without_reprocessing_blocks(tmp_path,
 
         monkeypatch.setattr(fs_impl.block_store, "prepare_blocks", fail_prepare_blocks)
         fs("clonefile", "/source.txt", "/copy.txt")
-        monkeypatch.setattr(fs_impl.block_store, "prepare_blocks", original_prepare_blocks)
+        monkeypatch.setattr(
+            fs_impl.block_store, "prepare_blocks", original_prepare_blocks
+        )
 
         copy_fh = fs("open", "/copy.txt", os.O_RDWR)
         assert fs("read", "/copy.txt", len(data), 0, copy_fh) == data
@@ -98,7 +102,9 @@ def test_ztierfs_clonefile_copies_metadata_without_reprocessing_blocks(tmp_path,
         assert fs("read", "/source.txt", len(data), 0, fh) == data
         assert fs("read", "/copy.txt", 1, 0, copy_fh) == b"b"
 
-    block_rows = rows(fs_impl, "SELECT raw_size, refcount FROM blocks ORDER BY refcount")
+    block_rows = rows(
+        fs_impl, "SELECT raw_size, refcount FROM blocks ORDER BY refcount"
+    )
     assert [row["refcount"] for row in block_rows] == [1, 3]
     assert rows(fs_impl, "SELECT COUNT(*) AS total FROM file_chunks")[0]["total"] == 4
 
@@ -298,7 +304,9 @@ def test_ztierfs_promotes_inline_file_when_truncate_grows_past_threshold(tmp_pat
     assert rows(fs_impl, "SELECT COUNT(*) AS total FROM file_chunks")[0]["total"] == 1
 
 
-def test_ztierfs_clonefile_copies_inline_payload_without_reprocessing_blocks(tmp_path, monkeypatch):
+def test_ztierfs_clonefile_copies_inline_payload_without_reprocessing_blocks(
+    tmp_path, monkeypatch
+):
     fs_impl = make_fs(tmp_path)
 
     with adapted(fs_impl) as fs:
@@ -343,7 +351,9 @@ def test_ztierfs_reuses_decoded_block_cache_for_repeated_reads(tmp_path, monkeyp
         assert fs("read", "/cached.jpg", len(data), 0, fh) == data
 
         def fail_disk_read(_path):
-            raise AssertionError("second read should be served from decoded block cache")
+            raise AssertionError(
+                "second read should be served from decoded block cache"
+            )
 
         monkeypatch.setattr("ztierfs.block_store.read_path_bytes", fail_disk_read)
         assert fs("read", "/cached.jpg", len(data), 0, fh) == data
@@ -403,10 +413,16 @@ def test_ztierfs_defers_read_access_stats_until_flush(tmp_path):
         fs("write", "/stats.jpg", data, 0, fh)
 
         assert fs("read", "/stats.jpg", len(data), 0, fh) == data
-        assert rows(fs_impl, "SELECT SUM(read_count) AS reads FROM blocks")[0]["reads"] == 0
+        assert (
+            rows(fs_impl, "SELECT SUM(read_count) AS reads FROM blocks")[0]["reads"]
+            == 0
+        )
 
         fs("flush", "/stats.jpg", fh)
-        assert rows(fs_impl, "SELECT SUM(read_count) AS reads FROM blocks")[0]["reads"] == 1
+        assert (
+            rows(fs_impl, "SELECT SUM(read_count) AS reads FROM blocks")[0]["reads"]
+            == 1
+        )
 
 
 def test_ztierfs_reads_multi_chunk_plan_in_parallel(tmp_path, monkeypatch):
@@ -461,7 +477,10 @@ def test_ztierfs_cold_copy_up_does_not_block_read(tmp_path, monkeypatch):
         hot_fh = fs("create", "/hot.jpg", 0o644)
         fs("write", "/cold.jpg", cold_data, 0, cold_fh)
         fs("write", "/hot.jpg", hot_data, 0, hot_fh)
-        assert rows(fs_impl, "SELECT COUNT(*) AS total FROM block_records WHERE cold_present = 1")[0]["total"]
+        assert rows(
+            fs_impl,
+            "SELECT COUNT(*) AS total FROM block_records WHERE cold_present = 1",
+        )[0]["total"]
 
         original_copy_block = fs_impl.block_store.copy_block
 
@@ -472,14 +491,19 @@ def test_ztierfs_cold_copy_up_does_not_block_read(tmp_path, monkeypatch):
 
         monkeypatch.setattr(fs_impl.block_store, "copy_block", gated_copy_block)
         with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(fs, "read", "/cold.jpg", len(cold_data), 0, cold_fh)
+            future = executor.submit(
+                fs, "read", "/cold.jpg", len(cold_data), 0, cold_fh
+            )
             try:
                 assert future.result(timeout=1) == cold_data
                 assert copy_started.wait(timeout=1)
-                assert rows(
-                    fs_impl,
-                    "SELECT COUNT(*) AS total FROM block_records WHERE hot_present = 1 AND cold_present = 1",
-                )[0]["total"] == 0
+                assert (
+                    rows(
+                        fs_impl,
+                        "SELECT COUNT(*) AS total FROM block_records WHERE hot_present = 1 AND cold_present = 1",
+                    )[0]["total"]
+                    == 0
+                )
             finally:
                 allow_copy.set()
 
@@ -506,13 +530,16 @@ def test_ztierfs_moves_least_recently_used_blocks_to_cold_tier(tmp_path):
         fs("write", "/second.jpg", second, 0, second_fh)
 
         presence = rows(fs_impl, "SELECT hot_present, cold_present FROM block_records")
-        assert sorted((row["hot_present"], row["cold_present"]) for row in presence) == [
+        assert sorted(
+            (row["hot_present"], row["cold_present"]) for row in presence
+        ) == [
             (0, 1),
             (1, 0),
         ]
         assert any((tmp_path / "cold" / "blocks").glob("*/*/*"))
 
         assert fs("read", "/first.jpg", len(first), 0, first_fh) == first
+
         def tier_counts_ready():
             presence = rows(
                 fs_impl, "SELECT hot_present, cold_present FROM block_records"
@@ -575,7 +602,9 @@ def test_ztierfs_recovers_when_block_metadata_points_to_missing_tier(tmp_path):
                 """,
                 (digest,),
             )
-            db.execute("DELETE FROM block_locations WHERE hash = ? AND tier = 1", (digest,))
+            db.execute(
+                "DELETE FROM block_locations WHERE hash = ? AND tier = 1", (digest,)
+            )
             db.execute(
                 "INSERT OR IGNORE INTO block_locations (hash, tier) VALUES (?, 2)",
                 (digest,),

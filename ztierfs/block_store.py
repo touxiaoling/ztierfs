@@ -1,3 +1,5 @@
+"""内容寻址块文件：压缩、冷热层放置、原子写入、降级/提升与读缓存。"""
+
 import errno
 import os
 import shutil
@@ -18,11 +20,19 @@ from macfusepy import FuseOSError
 from .block_layout import block_file_path
 from .metadata import MetadataStore
 from .perf import timed
-from .tier_access import PathMissing, PathUnavailable, probe_path, read_path_bytes, unlink_path
+from .tier_access import (
+    PathMissing,
+    PathUnavailable,
+    probe_path,
+    read_path_bytes,
+    unlink_path,
+)
 
 
 @dataclass(frozen=True)
 class TieringPolicy:
+    """热层容量上下限、文件头块保护、最小热驻留时间等冷热策略参数。"""
+
     hot_max_bytes: int
     hot_min_bytes: int
     protected_prefix_chunks: int = 4
@@ -46,6 +56,8 @@ class TieringPolicy:
 
 @dataclass(frozen=True)
 class PreparedBlock:
+    """待提交块：摘要、原始大小、（可选压缩）载荷及可内联的小块数据。"""
+
     digest: str
     raw_size: int
     payload: bytes
@@ -55,6 +67,8 @@ class PreparedBlock:
 
 @dataclass(frozen=True)
 class BlockAccess:
+    """一次块读取解析出的层级、存在性与是否触发降级等上下文。"""
+
     digest: str
     tier: int
     stored_size: int
@@ -66,6 +80,8 @@ class BlockAccess:
 
 
 class BlockStore:
+    """块文件与元数据协同：写入、读取、去重引用计数及 tier 间迁移。"""
+
     def __init__(
         self,
         metadata: MetadataStore,
@@ -115,20 +131,31 @@ class BlockStore:
         if row["storage"] == "inline":
             inline_payload = row["inline_payload"]
             if inline_payload is None and row["inline_payload_store"] != "sqlite":
-                inline_payload = self.metadata.payload_store.get(row["inline_payload_key"])
+                inline_payload = self.metadata.payload_store.get(
+                    row["inline_payload_key"]
+                )
             if inline_payload is None:
                 logger.error("内联块缺少 payload：hash={}", row["hash"])
                 raise FuseOSError(errno.EIO)
             cached = self._cache_get(row["hash"])
             if cached is not None:
-                logger.debug("读取内联块缓存命中：hash={}，raw_size={}", row["hash"][:12], len(cached))
+                logger.debug(
+                    "读取内联块缓存命中：hash={}，raw_size={}",
+                    row["hash"][:12],
+                    len(cached),
+                )
                 access = BlockAccess(
                     digest=row["hash"], tier=0, stored_size=row["stored_size"]
                 )
                 return cached[:expected_size].ljust(expected_size, b"\x00"), access
             payload = bytes(inline_payload)
             data = self.decode_payload(row, payload)
-            logger.debug("读取内联块：hash={}，raw_size={}，stored_size={}", row["hash"][:12], row["raw_size"], row["stored_size"])
+            logger.debug(
+                "读取内联块：hash={}，raw_size={}，stored_size={}",
+                row["hash"][:12],
+                row["raw_size"],
+                row["stored_size"],
+            )
             access = BlockAccess(
                 digest=row["hash"], tier=0, stored_size=row["stored_size"]
             )
@@ -138,17 +165,17 @@ class BlockStore:
         path, tier, repair = self._read_path(row, repair_metadata=False)
         cached = self._cache_get(row["hash"])
         if cached is not None:
-            logger.debug("读取块缓存命中：hash={}，raw_size={}", row["hash"][:12], len(cached))
+            logger.debug(
+                "读取块缓存命中：hash={}，raw_size={}", row["hash"][:12], len(cached)
+            )
+            hp_flag = repair.get("hot_present")
+            cp_flag = repair.get("cold_present")
             access = BlockAccess(
                 digest=row["hash"],
                 tier=tier,
                 stored_size=row["stored_size"],
-                hot_present=repair.get("hot_present")
-                if isinstance(repair.get("hot_present"), bool)
-                else None,
-                cold_present=repair.get("cold_present")
-                if isinstance(repair.get("cold_present"), bool)
-                else None,
+                hot_present=hp_flag if type(hp_flag) is bool else None,
+                cold_present=cp_flag if type(cp_flag) is bool else None,
                 preferred_tier=repair.get("preferred_tier"),
             )
             if self.should_copy_up_from_cold(row, tier):
@@ -156,26 +183,47 @@ class BlockStore:
             return cached[:expected_size].ljust(expected_size, b"\x00"), access
 
         try:
-            with timed("block_io.read", bytes_key="block_io.read_bytes", size=row["stored_size"]):
+            with timed(
+                "block_io.read",
+                bytes_key="block_io.read_bytes",
+                size=row["stored_size"],
+            ):
                 payload = read_path_bytes(path)
         except PathMissing as exc:
-            logger.error("块文件读取时消失：hash={}，tier={}，path={}", row["hash"][:12], tier, path)
+            logger.error(
+                "块文件读取时消失：hash={}，tier={}，path={}",
+                row["hash"][:12],
+                tier,
+                path,
+            )
             raise FuseOSError(errno.EIO) from exc
         except PathUnavailable as exc:
-            logger.warning("块文件临时不可用：hash={}，tier={}，path={}，error={}", row["hash"][:12], tier, path, exc)
+            logger.warning(
+                "块文件临时不可用：hash={}，tier={}，path={}，error={}",
+                row["hash"][:12],
+                tier,
+                path,
+                exc,
+            )
             raise FuseOSError(errno.EIO) from exc
         data = self.decode_payload(row, payload)
         self._cache_put(row["hash"], data)
-        logger.debug("读取块文件：hash={}，tier={}，stored_size={}，path={}", row["hash"][:12], tier, row["stored_size"], path)
+        logger.debug(
+            "读取块文件：hash={}，tier={}，stored_size={}，path={}",
+            row["hash"][:12],
+            tier,
+            row["stored_size"],
+            path,
+        )
 
-        hot_present = repair.get("hot_present")
-        cold_present = repair.get("cold_present")
+        hp_flag = repair.get("hot_present")
+        cp_flag = repair.get("cold_present")
         access = BlockAccess(
             digest=row["hash"],
             tier=tier,
             stored_size=row["stored_size"],
-            hot_present=hot_present if isinstance(hot_present, bool) else None,
-            cold_present=cold_present if isinstance(cold_present, bool) else None,
+            hot_present=hp_flag if type(hp_flag) is bool else None,
+            cold_present=cp_flag if type(cp_flag) is bool else None,
             preferred_tier=repair.get("preferred_tier"),
         )
         if self.should_copy_up_from_cold(row, tier):
@@ -209,7 +257,9 @@ class BlockStore:
             if digest in self._copy_up_inflight:
                 return
             self._copy_up_inflight.add(digest)
-        logger.debug("调度冷层块后台提升：hash={}，stored_size={}", digest[:12], stored_size)
+        logger.debug(
+            "调度冷层块后台提升：hash={}，stored_size={}", digest[:12], stored_size
+        )
         future = self._executor().submit(self._copy_up_cold_block, digest, stored_size)
         future.add_done_callback(lambda done: self._finish_cold_copy_up(digest, done))
 
@@ -228,7 +278,9 @@ class BlockStore:
                 last_promoted_ns=now,
             )
             self.demote_cold_blocks()
-        logger.info("冷层块后台提升到热层：hash={}，stored_size={}", digest[:12], stored_size)
+        logger.info(
+            "冷层块后台提升到热层：hash={}，stored_size={}", digest[:12], stored_size
+        )
 
     def _finish_cold_copy_up(self, digest: str, future: Future[None]) -> None:
         with self._copy_up_lock:
@@ -273,9 +325,8 @@ class BlockStore:
                 hot_present=access.hot_present,
                 cold_present=access.cold_present,
                 preferred_tier=access.preferred_tier,
-                last_promoted_ns=access.last_promoted_ns or (
-                    now if access.request_demotion else None
-                ),
+                last_promoted_ns=access.last_promoted_ns
+                or (now if access.request_demotion else None),
             )
         if access.request_demotion:
             self._demotion_requested = True
@@ -389,11 +440,15 @@ class BlockStore:
         return sha256(data).hexdigest()
 
     def _timed_digest_block(self, data: bytes) -> str:
-        with timed("block_prepare.hash", bytes_key="block_prepare.hash_bytes", size=len(data)):
+        with timed(
+            "block_prepare.hash", bytes_key="block_prepare.hash_bytes", size=len(data)
+        ):
             return self.digest_block(data)
 
     def _timed_encode_block(self, data: bytes, compress: bool) -> tuple[bytes, bool]:
-        with timed("block_prepare.encode", bytes_key="block_prepare.raw_bytes", size=len(data)):
+        with timed(
+            "block_prepare.encode", bytes_key="block_prepare.raw_bytes", size=len(data)
+        ):
             return self.encode_block(data, compress)
 
     def decrement_block(self, digest: str) -> None:
@@ -403,12 +458,19 @@ class BlockStore:
             return
         if row["refcount"] > 1:
             self.metadata.decrement_block_refcount(digest)
-            logger.debug("递减块引用计数：hash={}，refcount={}->{}", digest[:12], row["refcount"], row["refcount"] - 1)
+            logger.debug(
+                "递减块引用计数：hash={}，refcount={}->{}",
+                digest[:12],
+                row["refcount"],
+                row["refcount"] - 1,
+            )
             return
         self.metadata.delete_block(digest)
         if row["storage"] == "tiered":
             self.delete_block_file(digest)
-        logger.debug("删除最后一个块引用：hash={}，storage={}", digest[:12], row["storage"])
+        logger.debug(
+            "删除最后一个块引用：hash={}，storage={}", digest[:12], row["storage"]
+        )
 
     def encode_block(self, data: bytes, compress: bool) -> tuple[bytes, bool]:
         if not compress:
@@ -419,7 +481,11 @@ class BlockStore:
             return data, False
         packed = zstd.compress(data, level=self.compression_level)
         if len(packed) >= len(data):
-            logger.debug("跳过压缩块：raw_size={}，packed_size={}，原因=压缩无收益", len(data), len(packed))
+            logger.debug(
+                "跳过压缩块：raw_size={}，packed_size={}，原因=压缩无收益",
+                len(data),
+                len(packed),
+            )
             return data, False
         logger.debug("压缩块成功：raw_size={}，packed_size={}", len(data), len(packed))
         return packed, True
@@ -428,10 +494,17 @@ class BlockStore:
         try:
             data = zstd.decompress(payload) if row["compressed"] else payload
         except zstd.ZstdError as exc:
-            logger.error("块解压失败：hash={}，stored_size={}", row["hash"][:12], len(payload))
+            logger.error(
+                "块解压失败：hash={}，stored_size={}", row["hash"][:12], len(payload)
+            )
             raise FuseOSError(errno.EIO) from exc
         if len(data) != row["raw_size"]:
-            logger.error("块解码大小不匹配：hash={}，expected={}，actual={}", row["hash"][:12], row["raw_size"], len(data))
+            logger.error(
+                "块解码大小不匹配：hash={}，expected={}，actual={}",
+                row["hash"][:12],
+                row["raw_size"],
+                len(data),
+            )
             raise FuseOSError(errno.EIO)
         return data
 
@@ -484,39 +557,70 @@ class BlockStore:
             return
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-        with timed("block_io.write", bytes_key="block_io.write_bytes", size=len(payload)):
+        with timed(
+            "block_io.write", bytes_key="block_io.write_bytes", size=len(payload)
+        ):
             with open(tmp, "wb") as file:
                 file.write(payload)
                 file.flush()
                 os.fsync(file.fileno())
         os.replace(tmp, path)
         self.fsync_dir(path.parent)
-        logger.debug("写入块文件完成：hash={}，tier={}，bytes={}", digest[:12], tier, len(payload))
+        logger.debug(
+            "写入块文件完成：hash={}，tier={}，bytes={}",
+            digest[:12],
+            tier,
+            len(payload),
+        )
 
     def delete_block_file(self, digest: str) -> None:
         for candidate_tier in (1, 2):
             try:
                 if unlink_path(self.block_path(digest, candidate_tier)):
-                    logger.debug("删除块文件：hash={}，tier={}", digest[:12], candidate_tier)
+                    logger.debug(
+                        "删除块文件：hash={}，tier={}", digest[:12], candidate_tier
+                    )
             except PathUnavailable:
-                logger.warning("删除块文件跳过：块路径临时不可用，hash={}，tier={}", digest[:12], candidate_tier)
+                logger.warning(
+                    "删除块文件跳过：块路径临时不可用，hash={}，tier={}",
+                    digest[:12],
+                    candidate_tier,
+                )
 
     def copy_block(self, digest: str, source_tier: int, target_tier: int) -> None:
         source = self.block_path(digest, source_tier)
         target = self.block_path(digest, target_tier)
         source_probe = probe_path(source)
         if source_probe.unavailable:
-            logger.warning("复制块跳过：源块临时不可用，hash={}，source_tier={}，error={}", digest[:12], source_tier, source_probe.error)
+            logger.warning(
+                "复制块跳过：源块临时不可用，hash={}，source_tier={}，error={}",
+                digest[:12],
+                source_tier,
+                source_probe.error,
+            )
             return
         if source_probe.missing:
-            logger.warning("复制块失败：源块不存在，hash={}，source_tier={}", digest[:12], source_tier)
+            logger.warning(
+                "复制块失败：源块不存在，hash={}，source_tier={}",
+                digest[:12],
+                source_tier,
+            )
             return
         target_probe = probe_path(target)
         if target_probe.unavailable:
-            logger.warning("复制块跳过：目标层临时不可用，hash={}，target_tier={}，error={}", digest[:12], target_tier, target_probe.error)
+            logger.warning(
+                "复制块跳过：目标层临时不可用，hash={}，target_tier={}，error={}",
+                digest[:12],
+                target_tier,
+                target_probe.error,
+            )
             return
         if target_probe.present:
-            logger.debug("复制块跳过：目标已存在，hash={}，target_tier={}", digest[:12], target_tier)
+            logger.debug(
+                "复制块跳过：目标已存在，hash={}，target_tier={}",
+                digest[:12],
+                target_tier,
+            )
             return
         target.parent.mkdir(parents=True, exist_ok=True)
         tmp = target.with_name(
@@ -527,7 +631,9 @@ class BlockStore:
             os.fsync(file.fileno())
         os.replace(tmp, target)
         self.fsync_dir(target.parent)
-        logger.debug("复制块完成：hash={}，{} -> {}", digest[:12], source_tier, target_tier)
+        logger.debug(
+            "复制块完成：hash={}，{} -> {}", digest[:12], source_tier, target_tier
+        )
 
     def demote_cold_blocks(self) -> None:
         if self.policy.hot_max_bytes <= 0:
@@ -549,14 +655,20 @@ class BlockStore:
             now = time_ns()
             cold_probe = probe_path(self.block_path(row["hash"], 2))
             if cold_probe.unavailable:
-                logger.warning("热层降级暂停：冷层临时不可用，hash={}，error={}", row["hash"][:12], cold_probe.error)
+                logger.warning(
+                    "热层降级暂停：冷层临时不可用，hash={}，error={}",
+                    row["hash"][:12],
+                    cold_probe.error,
+                )
                 return
             if not row["cold_present"] or cold_probe.missing:
                 self.copy_block(row["hash"], 1, 2)
             try:
                 unlink_path(self.block_path(row["hash"], 1))
             except PathUnavailable:
-                logger.warning("热层降级停止：热层块临时不可用，hash={}", row["hash"][:12])
+                logger.warning(
+                    "热层降级停止：热层块临时不可用，hash={}", row["hash"][:12]
+                )
                 return
             self.metadata.set_block_presence(
                 row["hash"],
@@ -567,7 +679,12 @@ class BlockStore:
                 cold_verified_ns=now,
             )
             total -= row["stored_size"]
-            logger.debug("降级块完成：hash={}，stored_size={}，remaining_hot_bytes={}", row["hash"][:12], row["stored_size"], total)
+            logger.debug(
+                "降级块完成：hash={}，stored_size={}，remaining_hot_bytes={}",
+                row["hash"][:12],
+                row["stored_size"],
+                total,
+            )
 
     def cleanup_promoted_cold_copies(self) -> int:
         if self.policy.cold_copy_cleanup_age_ns <= 0:
@@ -578,12 +695,18 @@ class BlockStore:
             path = self.block_path(row["hash"], 2)
             probe = probe_path(path)
             if probe.unavailable:
-                logger.warning("跳过清理冷层副本：冷层临时不可用，hash={}，error={}", row["hash"][:12], probe.error)
+                logger.warning(
+                    "跳过清理冷层副本：冷层临时不可用，hash={}，error={}",
+                    row["hash"][:12],
+                    probe.error,
+                )
                 continue
             try:
                 unlink_path(path)
             except PathUnavailable:
-                logger.warning("跳过清理冷层副本：冷层临时不可用，hash={}", row["hash"][:12])
+                logger.warning(
+                    "跳过清理冷层副本：冷层临时不可用，hash={}", row["hash"][:12]
+                )
                 continue
             self.metadata.set_block_presence(row["hash"], cold_present=False)
             removed += 1
@@ -598,16 +721,27 @@ class BlockStore:
         cold_path = self.block_path(digest, 2)
         hot_probe = probe_path(hot_path) if row["hot_present"] else None
         cold_probe = probe_path(cold_path) if row["cold_present"] else None
-        hot_exists = bool(row["hot_present"]) and hot_probe is not None and hot_probe.present
+        hot_exists = (
+            bool(row["hot_present"]) and hot_probe is not None and hot_probe.present
+        )
         cold_unavailable = cold_probe is not None and cold_probe.unavailable
         if cold_unavailable:
             assert cold_probe is not None
             if not hot_exists:
-                logger.warning("冷层块临时不可用：hash={}，path={}，error={}", digest[:12], cold_path, cold_probe.error)
+                logger.warning(
+                    "冷层块临时不可用：hash={}，path={}，error={}",
+                    digest[:12],
+                    cold_path,
+                    cold_probe.error,
+                )
                 raise FuseOSError(errno.EIO)
             cold_exists = False
         else:
-            cold_exists = bool(row["cold_present"]) and cold_probe is not None and cold_probe.present
+            cold_exists = (
+                bool(row["cold_present"])
+                and cold_probe is not None
+                and cold_probe.present
+            )
         repair: dict[str, bool | int] = {}
 
         if not hot_exists and not cold_exists:
@@ -615,7 +749,12 @@ class BlockStore:
             cold_probe = probe_path(cold_path)
             hot_exists = hot_probe.present
             if cold_probe.unavailable:
-                logger.warning("冷层块临时不可用：hash={}，path={}，error={}", digest[:12], cold_path, cold_probe.error)
+                logger.warning(
+                    "冷层块临时不可用：hash={}，path={}，error={}",
+                    digest[:12],
+                    cold_path,
+                    cold_probe.error,
+                )
                 raise FuseOSError(errno.EIO)
             cold_exists = cold_probe.present
             if hot_exists or cold_exists:
@@ -625,7 +764,12 @@ class BlockStore:
                     "cold_present": cold_exists,
                     "preferred_tier": preferred,
                 }
-                logger.warning("块元数据位置缺失但磁盘存在副本，准备修复：hash={}，hot={}，cold={}", digest[:12], hot_exists, cold_exists)
+                logger.warning(
+                    "块元数据位置缺失但磁盘存在副本，准备修复：hash={}，hot={}，cold={}",
+                    digest[:12],
+                    hot_exists,
+                    cold_exists,
+                )
                 if repair_metadata:
                     self.metadata.set_block_presence(digest, **repair)
             else:
@@ -633,7 +777,9 @@ class BlockStore:
                 raise FuseOSError(errno.EIO)
 
         if cold_unavailable and hot_exists:
-            logger.warning("块首选冷层临时不可用，临时改读热层且不修复元数据：hash={}", digest[:12])
+            logger.warning(
+                "块首选冷层临时不可用，临时改读热层且不修复元数据：hash={}", digest[:12]
+            )
             return hot_path, 1, repair
         if row["preferred_tier"] == 1 and hot_exists:
             return hot_path, 1, repair

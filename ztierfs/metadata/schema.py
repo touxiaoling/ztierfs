@@ -1,3 +1,5 @@
+"""版本化 schema：建表/迁移、配置行与块记录联表查询片段。"""
+
 import os
 
 from stat import S_IFDIR
@@ -44,6 +46,8 @@ BLOCK_RECORD_SELECT = """
 
 
 class SchemaMixin(MetadataMixinBase):
+    """建表、版本检查与随版本演进的 DDL（与 SCHEMA_VERSION 对齐）。"""
+
     def _validate_schema_version(self) -> None:
         version = int(self._db.execute("PRAGMA user_version").fetchone()[0])
         if version == SCHEMA_VERSION:
@@ -180,7 +184,9 @@ class SchemaMixin(MetadataMixinBase):
             )
             """
         )
-        self._db.execute(f"CREATE VIEW IF NOT EXISTS block_records AS {BLOCK_RECORD_SELECT}")
+        self._db.execute(
+            f"CREATE VIEW IF NOT EXISTS block_records AS {BLOCK_RECORD_SELECT}"
+        )
         self._db.execute(
             """
             CREATE TABLE IF NOT EXISTS file_chunks (

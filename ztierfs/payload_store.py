@@ -1,3 +1,5 @@
+"""可选大块载荷外置存储：默认仍落在 SQLite；filekv 为原子文件 KV 后端。"""
+
 from __future__ import annotations
 
 import os
@@ -33,11 +35,7 @@ class NullPayloadStore:
 
 
 class FileKVPayloadStore:
-    """Small embedded key-value store backed by atomic files.
-
-    This is deliberately simple: it gives the prototype a non-SQLite payload
-    backend while preserving the same fsync discipline used for block files.
-    """
+    """以独立原子文件实现的简易 KV，便于试验非 SQLite 载荷后端（写盘仍 fsync）。"""
 
     name = "filekv"
 
@@ -50,8 +48,14 @@ class FileKVPayloadStore:
         path = self._path(key)
         with self._lock:
             path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-            with timed("payload_store.write", bytes_key="payload_store.write_bytes", size=len(payload)):
+            tmp = path.with_name(
+                f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+            )
+            with timed(
+                "payload_store.write",
+                bytes_key="payload_store.write_bytes",
+                size=len(payload),
+            ):
                 with open(tmp, "wb") as file:
                     file.write(payload)
                     file.flush()

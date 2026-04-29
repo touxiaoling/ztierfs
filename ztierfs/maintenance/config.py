@@ -1,3 +1,5 @@
+"""从库内 config 行解析 tier1/tier2 与可选载荷外置路径（CLI 与 checker 共用）。"""
+
 import sqlite3
 
 from dataclasses import dataclass
@@ -26,9 +28,13 @@ def resolve_maintenance_paths(
 ) -> MaintenancePaths:
     if tier2 is None:
         if database is not None:
-            raise ValueError("--database is redundant when the positional path is already the database")
+            raise ValueError(
+                "--database is redundant when the positional path is already the database"
+            )
         if allow_config_mismatch or update_config:
-            raise ValueError("--allow-config-mismatch and --update-config require explicit hot/cold tiers")
+            raise ValueError(
+                "--allow-config-mismatch and --update-config require explicit hot/cold tiers"
+            )
         db_path = Path(path).resolve()
         config = _read_required_config(db_path)
         return MaintenancePaths(

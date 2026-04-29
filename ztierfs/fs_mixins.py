@@ -1,11 +1,16 @@
+"""各 FUSE mixin 的共享类型约定；具体权限与路径逻辑由子类/兄弟 mixin 实现。"""
+
 from __future__ import annotations
 
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+
+from macfusepy import LowLevelAttr
 
 from .block_store import BlockStore
 from .file_content import FileContentService
@@ -15,7 +20,7 @@ from .metadata import MetadataStore
 
 
 class FileSystemMixinBase:
-    """Shared type contract for mixins composed into ZTierFS."""
+    """组成 ZTierFS 的 mixin 所共享的字段与抽象方法约定（非独立基类）。"""
 
     metadata: MetadataStore
     handles: HandleTable
@@ -29,6 +34,12 @@ class FileSystemMixinBase:
     _content_locks_guard: threading.Lock
     _content_locks: dict[int, threading.RLock]
     _caller_provider: Callable[[], tuple[int, int, int]]
+    readahead_blocks: int
+    readahead_workers: int
+    _read_positions: dict[int, int]
+    _readahead_inflight: set[tuple[int, int]]
+    _readahead_executor: ThreadPoolExecutor | None
+    _readahead_lock: threading.Lock
 
     def _require_open_access(self, node: Any, flags: int) -> None:
         raise NotImplementedError
@@ -88,7 +99,7 @@ class FileSystemMixinBase:
     def _flush(self) -> None:
         raise NotImplementedError
 
-    def _getattr(self, path: str, fh: Any = None) -> dict[str, int]:
+    def _getattr(self, path: str, fh: Any = None) -> LowLevelAttr:
         raise NotImplementedError
 
     def _getxattr(self, path: str, name: str) -> bytes:

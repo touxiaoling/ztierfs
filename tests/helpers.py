@@ -8,6 +8,8 @@ import time
 from contextlib import contextmanager, suppress
 from pathlib import Path
 
+from typing import Mapping, cast
+
 import pytest
 from ztierfs import ZTierFS
 from ztierfs.inode_fuse import (
@@ -28,35 +30,45 @@ class TestOperationsAdapter:
     def __call__(self, op: str, *args: object) -> object:
         fs = self.operations
         if op == "clonefile":
-            return fs._clonefile(*args)
+            return fs._clonefile(cast(str, args[0]), cast(str, args[1]))
         if op == "access":
-            return fs.access(self._ino(args[0]), args[1])
+            return fs.access(self._ino(args[0]), cast(int, args[1]))
         if op == "chmod":
             ino = self._ino(args[0])
-            return fs.setattr(ino, {"st_mode": args[1]}, FUSE_SET_ATTR_MODE)
+            return fs.setattr(
+                ino,
+                cast(Mapping[str, int], {"st_mode": cast(int, args[1])}),
+                FUSE_SET_ATTR_MODE,
+            )
         if op == "chown":
             ino = self._ino(args[0])
-            attrs = {}
+            attrs: dict[str, int] = {}
             to_set = 0
             if args[1] != -1:
-                attrs["st_uid"] = args[1]
+                attrs["st_uid"] = cast(int, args[1])
                 to_set |= FUSE_SET_ATTR_UID
             if args[2] != -1:
-                attrs["st_gid"] = args[2]
+                attrs["st_gid"] = cast(int, args[2])
                 to_set |= FUSE_SET_ATTR_GID
             return fs.setattr(ino, attrs, to_set)
         if op == "create":
             parent, name = self._parent_and_name(args[0])
-            return fs.create(parent, name, args[1], args[2] if len(args) > 2 else os.O_RDWR, None)[1]
+            flags = cast(int, args[2]) if len(args) > 2 else os.O_RDWR
+            return fs.create(parent, name, cast(int, args[1]), flags, None)[1]
         if op == "flush":
             return fs.flush(self._ino_from_path_or_fh(args[0], args[1]), args[1])
         if op == "fsync":
-            return fs.fsync(self._ino_from_path_or_fh(args[0], args[2]), args[1], args[2])
+            return fs.fsync(
+                self._ino_from_path_or_fh(args[0], args[2]),
+                cast(int, args[1]),
+                args[2],
+            )
         if op == "getattr":
             fh = args[1] if len(args) > 1 else None
             return fs.getattr(self._ino_from_path_or_fh(args[0], fh), fh)
         if op == "getxattr":
-            return fs.getxattr(self._ino(args[0]), self._encode(args[1]), args[2] if len(args) > 2 else 0)
+            pos = cast(int, args[2]) if len(args) > 2 else 0
+            return fs.getxattr(self._ino(args[0]), self._encode(args[1]), pos)
         if op == "link":
             source_ino = self._ino(args[1])
             parent, name = self._parent_and_name(args[0])
@@ -65,21 +77,27 @@ class TestOperationsAdapter:
             return fs.listxattr(self._ino(args[0]))
         if op == "lock":
             ino = self._ino_from_path_or_fh(args[0], args[1])
+            lock = cast(dict[str, int], args[3])
             return (
-                fs.getlk(ino, args[1], args[3])
+                fs.getlk(ino, args[1], lock)
                 if args[2] == fcntl.F_GETLK
-                else fs.setlk(ino, args[1], args[2], args[3])
+                else fs.setlk(ino, args[1], cast(int, args[2]), lock)
             )
         if op == "mkdir":
             parent, name = self._parent_and_name(args[0])
-            return fs.mkdir(parent, name, args[1]).attrs
+            return fs.mkdir(parent, name, cast(int, args[1])).attrs
         if op == "mknod":
             parent, name = self._parent_and_name(args[0])
-            return fs.mknod(parent, name, args[1], args[2]).attrs
+            return fs.mknod(parent, name, cast(int, args[1]), cast(int, args[2])).attrs
         if op == "open":
-            return fs.open(self._ino(args[0]), args[1])
+            return fs.open(self._ino(args[0]), cast(int, args[1]))
         if op == "read":
-            return fs.read(self._ino_from_path_or_fh(args[0], args[3]), args[1], args[2], args[3])
+            return fs.read(
+                self._ino_from_path_or_fh(args[0], args[3]),
+                cast(int, args[1]),
+                cast(int, args[2]),
+                args[3],
+            )
         if op == "readdir":
             ino = self._ino(args[0])
             fh = args[1]
@@ -88,7 +106,8 @@ class TestOperationsAdapter:
                 fh = fs.opendir(ino)
                 close_fh = True
             try:
-                entries = fs.readdir(ino, 0, 128 * 1024, fh, args[2] if len(args) > 2 else 0)
+                flags = cast(int, args[2]) if len(args) > 2 else 0
+                entries = fs.readdir(ino, 0, 128 * 1024, fh, flags)
             finally:
                 if close_fh:
                     fs.releasedir(ino, fh)
@@ -102,12 +121,19 @@ class TestOperationsAdapter:
         if op == "rename":
             parent, name = self._parent_and_name(args[0])
             newparent, newname = self._parent_and_name(args[1])
-            return fs.rename(parent, name, newparent, newname, args[2])
+            return fs.rename(parent, name, newparent, newname, cast(int, args[2]))
         if op == "rmdir":
             parent, name = self._parent_and_name(args[0])
             return fs.rmdir(parent, name)
         if op == "setxattr":
-            return fs.setxattr(self._ino(args[0]), self._encode(args[1]), args[2], args[3], args[4] if len(args) > 4 else 0)
+            pos = cast(int, args[4]) if len(args) > 4 else 0
+            return fs.setxattr(
+                self._ino(args[0]),
+                self._encode(args[1]),
+                cast(bytes, args[2]),
+                cast(int, args[3]),
+                pos,
+            )
         if op == "statfs":
             return fs.statfs(self._ino(args[0] if args else "/"))
         if op == "symlink":
@@ -116,13 +142,18 @@ class TestOperationsAdapter:
         if op == "truncate":
             fh = args[2] if len(args) > 2 else None
             ino = self._ino_from_path_or_fh(args[0], fh)
-            return fs.setattr(ino, {"st_size": args[1]}, FUSE_SET_ATTR_SIZE, fh)
+            return fs.setattr(
+                ino,
+                cast(Mapping[str, int], {"st_size": cast(int, args[1])}),
+                FUSE_SET_ATTR_SIZE,
+                fh,
+            )
         if op == "unlink":
             parent, name = self._parent_and_name(args[0])
             return fs.unlink(parent, name)
         if op == "utimens":
             ino = self._ino(args[0])
-            times = args[1]
+            times = cast(tuple[int, int], args[1])
             return fs.setattr(
                 ino,
                 {"st_atime": times[0], "st_mtime": times[1]},
@@ -130,7 +161,12 @@ class TestOperationsAdapter:
                 args[2] if len(args) > 2 else None,
             )
         if op == "write":
-            return fs.write(self._ino_from_path_or_fh(args[0], args[3]), args[1], args[2], args[3])
+            return fs.write(
+                self._ino_from_path_or_fh(args[0], args[3]),
+                cast(bytes, args[1]),
+                cast(int, args[2]),
+                args[3],
+            )
         raise KeyError(op)
 
     def _ino(self, path: object) -> int:

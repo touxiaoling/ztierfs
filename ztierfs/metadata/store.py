@@ -1,3 +1,5 @@
+"""SQLite 元数据门面：组合 schema、命名空间、分块、块表与访问统计等 mixin。"""
+
 import sqlite3
 import threading
 
@@ -29,6 +31,8 @@ class MetadataStore(
     BlockMetadataMixin,
     AccessStatsMixin,
 ):
+    """显式读/写事务与连接池上的 inode、目录项、块与 file_chunks 操作入口。"""
+
     def __init__(
         self,
         path: Path,
@@ -87,11 +91,15 @@ class MetadataStore(
         current = getattr(self._local, "db", None)
         if current is not None:
             if not readonly and getattr(self._local, "readonly", False):
-                raise RuntimeError("cannot open a write transaction inside a read transaction")
+                raise RuntimeError(
+                    "cannot open a write transaction inside a read transaction"
+                )
             yield
             return
 
-        lock_context = self._rwlock.read_lock() if readonly else self._rwlock.write_lock()
+        lock_context = (
+            self._rwlock.read_lock() if readonly else self._rwlock.write_lock()
+        )
         with lock_context, self._pool.connection() as db:
             self._local.db = db
             self._local.readonly = readonly
@@ -125,7 +133,9 @@ class MetadataStore(
         return db
 
     def setup(self) -> None:
-        logger.debug("准备 SQLite schema：path={}，schema_version={}", self.path, SCHEMA_VERSION)
+        logger.debug(
+            "准备 SQLite schema：path={}，schema_version={}", self.path, SCHEMA_VERSION
+        )
         with self._rwlock.write_lock(), self._pool.connection() as db:
             self._local.db = db
             self._local.readonly = False

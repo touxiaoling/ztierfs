@@ -1,3 +1,5 @@
+"""目录树与命名空间：mkdir、link、symlink、rename、readdir 等路径级操作。"""
+
 import errno
 import os
 
@@ -13,6 +15,8 @@ RENAME_NOREPLACE = 0x1
 
 
 class NamespaceOpsMixin(FileSystemMixinBase):
+    """路径解析后的目录项与 inode 创建/改名/删除（不含普通文件读写）。"""
+
     def _readdir(self, path: str):
         logger.debug("读取目录：path={}", path)
         self._ensure_trash_directory_for_caller()
@@ -29,7 +33,12 @@ class NamespaceOpsMixin(FileSystemMixinBase):
                 else node
             )
             self.metadata.touch_node_atime(node["id"], now)
-            logger.debug("读取目录完成：path={}，inode={}，entries={}", path, node["id"], len(children))
+            logger.debug(
+                "读取目录完成：path={}，inode={}，entries={}",
+                path,
+                node["id"],
+                len(children),
+            )
             return [
                 (".", self._attrs_from_node(node)),
                 ("..", self._attrs_from_node(parent_node)),
@@ -58,7 +67,9 @@ class NamespaceOpsMixin(FileSystemMixinBase):
             return self._attrs_from_node(node)
 
     def _mknod(self, path: str, mode: int, dev: int):
-        logger.debug("创建设备/普通节点请求：path={}，mode={:o}，dev={}", path, mode, dev)
+        logger.debug(
+            "创建设备/普通节点请求：path={}，mode={:o}，dev={}", path, mode, dev
+        )
         if not S_ISREG(mode):
             logger.warning("拒绝创建非普通文件节点：path={}，mode={:o}", path, mode)
             raise FuseOSError(errno.ENOTSUP)
@@ -78,7 +89,9 @@ class NamespaceOpsMixin(FileSystemMixinBase):
                 now,
             )
             node = self.metadata.node_by_id(inode_id)
-            logger.debug("创建普通文件节点完成：path={}，parent_inode={}", path, parent["id"])
+            logger.debug(
+                "创建普通文件节点完成：path={}，parent_inode={}", path, parent["id"]
+            )
             return self._attrs_from_node(node)
 
     def _symlink(self, target: str, source: str):
@@ -100,7 +113,9 @@ class NamespaceOpsMixin(FileSystemMixinBase):
                 symlink_target=source,
             )
             node = self.metadata.node_by_id(inode_id)
-            logger.debug("创建符号链接完成：target={}，parent_inode={}", target, parent["id"])
+            logger.debug(
+                "创建符号链接完成：target={}，parent_inode={}", target, parent["id"]
+            )
             return self._attrs_from_node(node)
 
     def _readlink(self, path: str) -> str:
@@ -126,7 +141,9 @@ class NamespaceOpsMixin(FileSystemMixinBase):
                 raise FuseOSError(errno.EEXIST)
             now = time_ns()
             self.metadata.link_node(parent["id"], name, source_node["id"], now)
-            logger.debug("创建硬链接完成：source_inode={}，target={}", source_node["id"], target)
+            logger.debug(
+                "创建硬链接完成：source_inode={}，target={}", source_node["id"], target
+            )
 
     def _clonefile(self, source: str, target: str) -> None:
         logger.debug("clonefile：source={}，target={}", source, target)
@@ -156,7 +173,9 @@ class NamespaceOpsMixin(FileSystemMixinBase):
                 size=source_node["size"],
                 now=now,
             )
-            logger.debug("clonefile 完成：source_inode={}，target={}", source_node["id"], target)
+            logger.debug(
+                "clonefile 完成：source_inode={}，target={}", source_node["id"], target
+            )
 
     def _unlink(self, path: str) -> None:
         logger.debug("删除文件目录项：path={}", path)
@@ -189,7 +208,9 @@ class NamespaceOpsMixin(FileSystemMixinBase):
     def _rename(self, old: str, new: str, flags: int) -> None:
         logger.debug("重命名：old={}，new={}，flags={:#x}", old, new, flags)
         if flags & ~RENAME_NOREPLACE:
-            logger.warning("拒绝未知 rename flag：old={}，new={}，flags={:#x}", old, new, flags)
+            logger.warning(
+                "拒绝未知 rename flag：old={}，new={}，flags={:#x}", old, new, flags
+            )
             raise FuseOSError(errno.EINVAL)
         self._ensure_trash_directory_for_caller()
         with self.metadata.transaction():
@@ -207,7 +228,12 @@ class NamespaceOpsMixin(FileSystemMixinBase):
                 if flags & RENAME_NOREPLACE:
                     raise FuseOSError(errno.EEXIST)
                 if target["id"] == source["id"]:
-                    logger.debug("重命名目标与源相同，跳过：old={}，new={}，inode={}", old, new, source["id"])
+                    logger.debug(
+                        "重命名目标与源相同，跳过：old={}，new={}，inode={}",
+                        old,
+                        new,
+                        source["id"],
+                    )
                     return
                 if target["kind"] == "dir" and source["kind"] != "dir":
                     raise FuseOSError(errno.EISDIR)
@@ -216,7 +242,11 @@ class NamespaceOpsMixin(FileSystemMixinBase):
                 if target["kind"] == "dir" and self.metadata.has_children(target["id"]):
                     raise FuseOSError(errno.ENOTEMPTY)
                 self._remove_entry_node(target)
-                logger.debug("重命名覆盖目标：target_inode={}，target_kind={}", target["id"], target["kind"])
+                logger.debug(
+                    "重命名覆盖目标：target_inode={}，target_kind={}",
+                    target["id"],
+                    target["kind"],
+                )
 
             now = time_ns()
             self.metadata.move_entry(

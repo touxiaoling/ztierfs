@@ -1,3 +1,5 @@
+"""冷热层路径探测与读取：区分缺失、暂时不可用（网盘 I/O）与可读。"""
+
 import errno
 
 from dataclasses import dataclass
@@ -41,10 +43,12 @@ class PathProbe:
 
 
 class PathMissing(FileNotFoundError):
-    pass
+    """预期存在的块文件路径在盘上不存在（与暂时性 I/O 错误区分）。"""
 
 
 class PathUnavailable(OSError):
+    """冷层路径存在但当前无法读取（例如 rclone 暂时错误），携带底层 OSError。"""
+
     def __init__(self, path: Path, exc: OSError):
         super().__init__(exc.errno, str(exc), str(path))
         self.path = path

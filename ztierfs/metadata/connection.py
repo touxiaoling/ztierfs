@@ -1,3 +1,5 @@
+"""SQLite 连接池、TimedConnection 与 busy/pragma 等打开参数。"""
+
 import sqlite3
 import threading
 
@@ -113,7 +115,9 @@ class ConnectionPool:
 
         if create:
             try:
-                logger.debug("连接池创建新连接：path={}，created={}", self.path, self._created)
+                logger.debug(
+                    "连接池创建新连接：path={}，created={}", self.path, self._created
+                )
                 return open_database(self.path, pragmas=self.pragmas)
             except Exception:
                 with self._condition:

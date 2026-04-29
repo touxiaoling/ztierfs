@@ -1,3 +1,5 @@
+"""从元数据库汇总空间、块与 inode 用量等统计。"""
+
 from pathlib import Path
 
 from loguru import logger
@@ -27,15 +29,24 @@ def collect_stats(
         update_config=update_config,
     )
     db_path = paths.database
-    logger.info("收集统计信息：database={}，tier1={}，tier2={}", db_path, paths.tier1, paths.tier2)
+    logger.info(
+        "收集统计信息：database={}，tier1={}，tier2={}",
+        db_path,
+        paths.tier1,
+        paths.tier2,
+    )
     with open_database(db_path) as db:
         inode_counts = {
             row["kind"]: row["count"]
-            for row in db.execute("SELECT kind, COUNT(*) AS count FROM inodes GROUP BY kind").fetchall()
+            for row in db.execute(
+                "SELECT kind, COUNT(*) AS count FROM inodes GROUP BY kind"
+            ).fetchall()
         }
         block_counts = {
             "total": scalar(db, "SELECT COUNT(*) FROM blocks"),
-            "inline": scalar(db, "SELECT COUNT(*) FROM blocks WHERE storage_kind = 'inline'"),
+            "inline": scalar(
+                db, "SELECT COUNT(*) FROM blocks WHERE storage_kind = 'inline'"
+            ),
             "inode_inline": scalar(
                 db,
                 "SELECT COUNT(*) FROM inode_payloads",
@@ -70,17 +81,27 @@ def collect_stats(
                 WHERE blocks.storage_kind = 'tiered'
                 """,
             ),
-            "compressed": scalar(db, "SELECT COUNT(*) FROM blocks WHERE compressed = 1"),
+            "compressed": scalar(
+                db, "SELECT COUNT(*) FROM blocks WHERE compressed = 1"
+            ),
         }
         storage = {
-            "logical_file_bytes": scalar(db, "SELECT COALESCE(SUM(size), 0) FROM inodes WHERE kind = 'file'"),
-            "referenced_chunk_bytes": scalar(db, "SELECT COALESCE(SUM(size), 0) FROM file_chunks"),
-            "unique_raw_bytes": scalar(db, "SELECT COALESCE(SUM(raw_size), 0) FROM blocks")
+            "logical_file_bytes": scalar(
+                db, "SELECT COALESCE(SUM(size), 0) FROM inodes WHERE kind = 'file'"
+            ),
+            "referenced_chunk_bytes": scalar(
+                db, "SELECT COALESCE(SUM(size), 0) FROM file_chunks"
+            ),
+            "unique_raw_bytes": scalar(
+                db, "SELECT COALESCE(SUM(raw_size), 0) FROM blocks"
+            )
             + scalar(
                 db,
                 "SELECT COALESCE(SUM(raw_size), 0) FROM inode_payloads",
             ),
-            "stored_bytes": scalar(db, "SELECT COALESCE(SUM(stored_size), 0) FROM blocks")
+            "stored_bytes": scalar(
+                db, "SELECT COALESCE(SUM(stored_size), 0) FROM blocks"
+            )
             + scalar(
                 db,
                 "SELECT COALESCE(SUM(stored_size), 0) FROM inode_payloads",
@@ -89,7 +110,10 @@ def collect_stats(
                 db,
                 "SELECT COALESCE(SUM(stored_size), 0) FROM inode_payloads",
             ),
-            "inline_stored_bytes": scalar(db, "SELECT COALESCE(SUM(stored_size), 0) FROM blocks WHERE storage_kind = 'inline'"),
+            "inline_stored_bytes": scalar(
+                db,
+                "SELECT COALESCE(SUM(stored_size), 0) FROM blocks WHERE storage_kind = 'inline'",
+            ),
             "hot_stored_bytes": scalar(
                 db,
                 """

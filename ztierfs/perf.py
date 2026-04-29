@@ -1,3 +1,5 @@
+"""轻量性能计数：上下文变量中的计时/字节量，供块层与 SQLite 包装使用。"""
+
 from __future__ import annotations
 
 import contextvars

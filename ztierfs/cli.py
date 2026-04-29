@@ -1,3 +1,5 @@
+"""命令行：挂载、fsck/scrub/stats/cleanup 等维护子命令与参数解析。"""
+
 import argparse
 import json
 import sys
@@ -405,7 +407,15 @@ def _run_cleanup_command(args: argparse.Namespace) -> None:
         update_config=args.update_config,
     )
     if args.json:
-        _emit_stdout(json.dumps({"removed_cold_copies": report.removed, "skipped_cold_copies": report.skipped}, sort_keys=True))
+        _emit_stdout(
+            json.dumps(
+                {
+                    "removed_cold_copies": report.removed,
+                    "skipped_cold_copies": report.skipped,
+                },
+                sort_keys=True,
+            )
+        )
     else:
         _emit_stdout(
             f"cleanup: removed {report.removed} promoted cold copy/copies, skipped {report.skipped}"

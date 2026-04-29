@@ -1,3 +1,5 @@
+"""macfusepy inode 优先接口：lookup、readdir、read/write、xattr 等低层回调。"""
+
 import errno
 import fcntl
 import os
@@ -7,7 +9,7 @@ from stat import S_IFDIR, S_IFLNK, S_IFREG, S_ISREG
 from time import perf_counter_ns, time_ns
 
 from loguru import logger
-from macfusepy import FuseOSError, InodeOperations, LowLevelEntry
+from macfusepy import FuseOSError, InodeOperations, LowLevelAttr, LowLevelEntry
 from .fs_mixins import FileSystemMixinBase
 from .metadata_ops import ENOATTR, XATTR_CREATE, XATTR_REPLACE
 from .namespace_ops import RENAME_NOREPLACE
@@ -90,8 +92,11 @@ class InodeFuseMixin(InodeOperations, FileSystemMixinBase):
 
     def _run_fuse_op(self, func, /, *args):
         op = func.__name__.removesuffix("_inode").removeprefix("_")
-        logged_args = lambda: tuple(self._log_value(arg) for arg in args)
-        logger.opt(lazy=True).debug("FUSE inode {}{}", lambda: op, logged_args)
+
+        def _logged_args():
+            return tuple(self._log_value(arg) for arg in args)
+
+        logger.opt(lazy=True).debug("FUSE inode {}{}", lambda: op, _logged_args)
         profiler = getattr(self, "_operation_profiler", None)
         try:
             if profiler is None:
@@ -105,17 +110,18 @@ class InodeFuseMixin(InodeOperations, FileSystemMixinBase):
                         counters.add_time(f"fuse.{op}", perf_counter_ns() - started)
                         profiler.record(counters)
         except OSError as exc:
+            errno_ = exc.errno
             logger.opt(lazy=True).debug(
                 "FUSE inode {}{} -> OSError({})",
                 lambda: op,
-                logged_args,
-                lambda: exc.errno,
+                _logged_args,
+                lambda: errno_,
             )
             raise
         logger.opt(lazy=True).debug(
             "FUSE inode {}{} -> {}",
             lambda: op,
-            logged_args,
+            _logged_args,
             lambda: self._log_value(result),
         )
         return result
@@ -134,10 +140,10 @@ class InodeFuseMixin(InodeOperations, FileSystemMixinBase):
                 raise FuseOSError(errno.ENOENT)
             return self._entry_from_node(name, node, node["id"])
 
-    def getattr(self, ino: int, fh=None) -> dict[str, int]:
+    def getattr(self, ino: int, fh=None) -> LowLevelAttr:
         return self._run_fuse_op(self._getattr_inode, ino, fh)
 
-    def _getattr_inode(self, ino: int, fh=None) -> dict[str, int]:
+    def _getattr_inode(self, ino: int, fh=None) -> LowLevelAttr:
         self._ensure_trash_directory_for_caller()
         with self.metadata.read_transaction():
             return self._attrs_from_node(self._file_node_from_ino_or_fh(ino, fh))
@@ -147,13 +153,20 @@ class InodeFuseMixin(InodeOperations, FileSystemMixinBase):
 
     def _setattr_inode(self, ino: int, attrs: Mapping[str, int], to_set: int, fh=None):
         self._ensure_trash_directory_for_caller()
-        with self._content_lock(self.handles.file_id(fh) or ino), self.metadata.transaction():
+        with (
+            self._content_lock(self.handles.file_id(fh) or ino),
+            self.metadata.transaction(),
+        ):
             node = self._file_node_from_ino_or_fh(ino, fh)
             now = time_ns()
             if to_set & FUSE_SET_ATTR_MODE:
                 self._require_owner(node)
-                kind = {"dir": S_IFDIR, "file": S_IFREG, "symlink": S_IFLNK}[node["kind"]]
-                self.metadata.set_node_mode(node["id"], kind | (attrs["st_mode"] & 0o7777), now)
+                kind = {"dir": S_IFDIR, "file": S_IFREG, "symlink": S_IFLNK}[
+                    node["kind"]
+                ]
+                self.metadata.set_node_mode(
+                    node["id"], kind | (attrs["st_mode"] & 0o7777), now
+                )
             if to_set & (FUSE_SET_ATTR_UID | FUSE_SET_ATTR_GID):
                 if self._caller_ids()[0] != 0:
                     raise FuseOSError(errno.EPERM)
@@ -171,8 +184,16 @@ class InodeFuseMixin(InodeOperations, FileSystemMixinBase):
             if to_set & (FUSE_SET_ATTR_ATIME | FUSE_SET_ATTR_MTIME):
                 if self._caller_ids()[0] != 0 and self._caller_ids()[0] != node["uid"]:
                     self._require_access(node, os.W_OK)
-                atime = attrs["st_atime"] if to_set & FUSE_SET_ATTR_ATIME else node["atime_ns"]
-                mtime = attrs["st_mtime"] if to_set & FUSE_SET_ATTR_MTIME else node["mtime_ns"]
+                atime = (
+                    attrs["st_atime"]
+                    if to_set & FUSE_SET_ATTR_ATIME
+                    else node["atime_ns"]
+                )
+                mtime = (
+                    attrs["st_mtime"]
+                    if to_set & FUSE_SET_ATTR_MTIME
+                    else node["mtime_ns"]
+                )
                 self.metadata.set_node_times(node["id"], atime, mtime, now)
             return self._attrs_from_node(self._node_by_ino(node["id"]))
 
@@ -208,7 +229,9 @@ class InodeFuseMixin(InodeOperations, FileSystemMixinBase):
         if plan.chunks:
             now = time_ns()
             should_flush = self.metadata.defer_node_atime(plan.file_id, now)
-            should_flush = self.block_store.record_block_accesses(accesses, now) or should_flush
+            should_flush = (
+                self.block_store.record_block_accesses(accesses, now) or should_flush
+            )
             if should_flush:
                 with self.metadata.transaction():
                     for access in accesses:
@@ -264,11 +287,18 @@ class InodeFuseMixin(InodeOperations, FileSystemMixinBase):
                     raise FuseOSError(errno.EISDIR)
                 self._require_open_access(existing, flags | os.O_TRUNC)
                 self.file_content.remove_file_chunks(existing["id"])
-                self.metadata.reset_file_node(existing["id"], S_IFREG | (mode & 0o7777), now)
+                self.metadata.reset_file_node(
+                    existing["id"], S_IFREG | (mode & 0o7777), now
+                )
                 node = self._node_by_ino(existing["id"])
             else:
                 inode_id = self.metadata.insert_node(
-                    parent, decoded, "file", S_IFREG | (mode & 0o7777), *self._creation_owner(), now
+                    parent,
+                    decoded,
+                    "file",
+                    S_IFREG | (mode & 0o7777),
+                    *self._creation_owner(),
+                    now,
                 )
                 node = self._node_by_ino(inode_id)
             fh = self.handles.new(node["id"], self._lock_owner())
@@ -286,7 +316,12 @@ class InodeFuseMixin(InodeOperations, FileSystemMixinBase):
             if self.metadata.child(parent, decoded) is not None:
                 raise FuseOSError(errno.EEXIST)
             inode_id = self.metadata.insert_node(
-                parent, decoded, "dir", S_IFDIR | (mode & 0o7777), *self._creation_owner(), time_ns()
+                parent,
+                decoded,
+                "dir",
+                S_IFDIR | (mode & 0o7777),
+                *self._creation_owner(),
+                time_ns(),
             )
             return self._entry_from_node(name, self._node_by_ino(inode_id), inode_id)
 
@@ -381,9 +416,7 @@ class InodeFuseMixin(InodeOperations, FileSystemMixinBase):
             for index, child in enumerate(children, start=first_next_id):
                 encoded = child["name"].encode("utf-8", "surrogateescape")
                 self._remember_dir_cursor(ino, fh, index, child["name"])
-                entries.append(
-                    self._entry_from_node(encoded, child, index)
-                )
+                entries.append(self._entry_from_node(encoded, child, index))
             self.metadata.touch_node_atime(ino, time_ns())
             return tuple(entries)
 
@@ -425,12 +458,14 @@ class InodeFuseMixin(InodeOperations, FileSystemMixinBase):
                 raise FuseOSError(errno.EISDIR)
             self._remove_entry_node(node)
 
-    def rename(self, parent: int, name: bytes, newparent: int, newname: bytes, flags: int):
-        self._run_fuse_op(
-            self._rename_inode, parent, name, newparent, newname, flags
-        )
+    def rename(
+        self, parent: int, name: bytes, newparent: int, newname: bytes, flags: int
+    ):
+        self._run_fuse_op(self._rename_inode, parent, name, newparent, newname, flags)
 
-    def _rename_inode(self, parent: int, name: bytes, newparent: int, newname: bytes, flags: int) -> None:
+    def _rename_inode(
+        self, parent: int, name: bytes, newparent: int, newname: bytes, flags: int
+    ) -> None:
         if flags & ~RENAME_NOREPLACE:
             raise FuseOSError(errno.EINVAL)
         self._ensure_trash_directory_for_caller()
@@ -444,7 +479,9 @@ class InodeFuseMixin(InodeOperations, FileSystemMixinBase):
             target_parent = self._node_by_ino(newparent)
             self._require_access(old_parent, os.W_OK | os.X_OK)
             self._require_access(target_parent, os.W_OK | os.X_OK)
-            if source["kind"] == "dir" and self.metadata.is_descendant(newparent, source["id"]):
+            if source["kind"] == "dir" and self.metadata.is_descendant(
+                newparent, source["id"]
+            ):
                 raise FuseOSError(errno.EINVAL)
             target = self.metadata.child(newparent, target_name)
             if target is not None:
@@ -556,7 +593,9 @@ class InodeFuseMixin(InodeOperations, FileSystemMixinBase):
     ) -> None:
         self._run_fuse_op(self._setxattr_inode, ino, name, value, options)
 
-    def _setxattr_inode(self, ino: int, name: bytes, value: bytes, options: int) -> None:
+    def _setxattr_inode(
+        self, ino: int, name: bytes, value: bytes, options: int
+    ) -> None:
         self._ensure_trash_directory_for_caller()
         decoded = self._decode_name(name)
         with self.metadata.transaction():
@@ -596,7 +635,9 @@ class InodeFuseMixin(InodeOperations, FileSystemMixinBase):
             uid, _gid, pid = self._caller_ids()
             lock.setdefault("l_pid", pid)
         with self._lock:
-            return self.locks.apply(node["id"], owner, int(lock.get("l_pid", pid)), cmd, lock)
+            return self.locks.apply(
+                node["id"], owner, int(lock.get("l_pid", pid)), cmd, lock
+            )
 
     def flock(self, ino: int, fh, op: int):
         if op & fcntl.LOCK_UN:
@@ -610,5 +651,11 @@ class InodeFuseMixin(InodeOperations, FileSystemMixinBase):
             if op & fcntl.LOCK_NB
             else getattr(fcntl, "F_SETLKW", fcntl.F_SETLK)
         )
-        lock = {"l_type": lock_type, "l_whence": 0, "l_start": 0, "l_len": 0, "l_pid": 0}
+        lock = {
+            "l_type": lock_type,
+            "l_whence": 0,
+            "l_start": 0,
+            "l_len": 0,
+            "l_pid": 0,
+        }
         return self.setlk(ino, fh, cmd, lock)

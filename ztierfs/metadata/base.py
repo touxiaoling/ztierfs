@@ -1,3 +1,5 @@
+"""各 metadata mixin 的共享字段与抽象方法（由 MetadataStore 组合实现）。"""
+
 from __future__ import annotations
 
 import sqlite3
@@ -11,7 +13,7 @@ if TYPE_CHECKING:
 
 
 class MetadataMixinBase:
-    """Shared type contract for metadata mixins composed into MetadataStore."""
+    """组成 MetadataStore 的 mixin 所共享的状态与未实现占位方法。"""
 
     _deferred_access_lock: threading.Lock
     _deferred_node_atimes: dict[int, int]

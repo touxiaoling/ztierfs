@@ -1,3 +1,5 @@
+"""基于 FUSE 调用方 uid/gid 的简易 POSIX mode 权限检查（含 root 特例）。"""
+
 import errno
 import os
 
@@ -8,6 +10,8 @@ from .fs_mixins import FileSystemMixinBase
 
 
 class AccessControlMixin(FileSystemMixinBase):
+    """open/access/chmod 等路径上的 RWX 与打开模式校验。"""
+
     def _require_open_access(self, node, flags: int) -> None:
         access_mode = flags & os.O_ACCMODE
         if access_mode == os.O_RDONLY:
@@ -27,7 +31,9 @@ class AccessControlMixin(FileSystemMixinBase):
         uid, gid, _pid = self._caller_ids()
         if uid == 0:
             if mask & os.X_OK and not node["mode"] & 0o111:
-                logger.debug("root 执行权限检查失败：inode={}，mask={:#x}", node["id"], mask)
+                logger.debug(
+                    "root 执行权限检查失败：inode={}，mask={:#x}", node["id"], mask
+                )
                 raise FuseOSError(errno.EACCES)
             return
         if uid == node["uid"]:
@@ -39,19 +45,42 @@ class AccessControlMixin(FileSystemMixinBase):
         else:
             bits = node["mode"] & 0o7
         if mask & os.R_OK and not bits & 0o4:
-            logger.debug("读权限检查失败：inode={}，uid={}，gid={}，mask={:#x}", node["id"], uid, gid, mask)
+            logger.debug(
+                "读权限检查失败：inode={}，uid={}，gid={}，mask={:#x}",
+                node["id"],
+                uid,
+                gid,
+                mask,
+            )
             raise FuseOSError(errno.EACCES)
         if mask & os.W_OK and not bits & 0o2:
-            logger.debug("写权限检查失败：inode={}，uid={}，gid={}，mask={:#x}", node["id"], uid, gid, mask)
+            logger.debug(
+                "写权限检查失败：inode={}，uid={}，gid={}，mask={:#x}",
+                node["id"],
+                uid,
+                gid,
+                mask,
+            )
             raise FuseOSError(errno.EACCES)
         if mask & os.X_OK and not bits & 0o1:
-            logger.debug("执行权限检查失败：inode={}，uid={}，gid={}，mask={:#x}", node["id"], uid, gid, mask)
+            logger.debug(
+                "执行权限检查失败：inode={}，uid={}，gid={}，mask={:#x}",
+                node["id"],
+                uid,
+                gid,
+                mask,
+            )
             raise FuseOSError(errno.EACCES)
 
     def _require_owner(self, node) -> None:
         uid, _gid, _pid = self._caller_ids()
         if uid != 0 and uid != node["uid"]:
-            logger.debug("所有者权限检查失败：inode={}，caller_uid={}，owner_uid={}", node["id"], uid, node["uid"])
+            logger.debug(
+                "所有者权限检查失败：inode={}，caller_uid={}，owner_uid={}",
+                node["id"],
+                uid,
+                node["uid"],
+            )
             raise FuseOSError(errno.EPERM)
 
     def _caller_ids(self) -> tuple[int, int, int]:

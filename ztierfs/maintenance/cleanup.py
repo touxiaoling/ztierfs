@@ -1,3 +1,5 @@
+"""copy-up 后冷层上多余块副本的按龄清理。"""
+
 from pathlib import Path
 from dataclasses import dataclass
 from time import time_ns
@@ -70,14 +72,22 @@ def cleanup_promoted_cold_copies(
                 probe = probe_path(path)
                 if probe.unavailable:
                     skipped += 1
-                    logger.warning("维护清理跳过冷层副本：冷层临时不可用，hash={}，error={}", row["hash"][:12], probe.error)
+                    logger.warning(
+                        "维护清理跳过冷层副本：冷层临时不可用，hash={}，error={}",
+                        row["hash"][:12],
+                        probe.error,
+                    )
                     continue
                 try:
                     if probe.present:
                         unlink_path(path)
                 except PathUnavailable as exc:
                     skipped += 1
-                    logger.warning("维护清理跳过冷层副本：删除时冷层临时不可用，hash={}，error={}", row["hash"][:12], exc)
+                    logger.warning(
+                        "维护清理跳过冷层副本：删除时冷层临时不可用，hash={}，error={}",
+                        row["hash"][:12],
+                        exc,
+                    )
                     continue
                 db.execute(
                     "DELETE FROM block_locations WHERE hash = ? AND tier = 2",

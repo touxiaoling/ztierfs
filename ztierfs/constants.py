@@ -1,3 +1,5 @@
+"""全库共享的默认块大小、热层水位、内联阈值与「跳过压缩」后缀集合。"""
+
 CHUNK_SIZE = 4 * 1024 * 1024
 DEFAULT_FUSE_IOSIZE = CHUNK_SIZE
 DEFAULT_FUSE_METADATA_CACHE_SECONDS = 5.0

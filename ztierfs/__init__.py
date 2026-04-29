@@ -1,3 +1,5 @@
+"""ztierfs：基于 SQLite 与内容寻址块的可写分层 FUSE 文件系统包。"""
+
 from .constants import (
     CHUNK_SIZE,
     COMPRESSED_SUFFIXES,

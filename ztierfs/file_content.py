@@ -1,3 +1,5 @@
+"""按固定分块组织的文件体：稀疏读、局部覆盖、截断、内联小文件与块引用更新。"""
+
 import errno
 
 from collections.abc import Callable
@@ -48,6 +50,8 @@ class PreparedFileWrite:
 
 
 class FileContentService:
+    """文件字节与 file_chunks / blocks 元数据及 BlockStore 之间的协调层。"""
+
     def __init__(
         self,
         metadata: MetadataStore,
@@ -81,7 +85,12 @@ class FileContentService:
         if node["kind"] != "file":
             raise FuseOSError(errno.EISDIR)
         if offset >= node["size"]:
-            logger.debug("生成读取计划：inode={}，offset={} 超过文件大小 {}", node["id"], offset, node["size"])
+            logger.debug(
+                "生成读取计划：inode={}，offset={} 超过文件大小 {}",
+                node["id"],
+                offset,
+                node["size"],
+            )
             return FileReadPlan(file_id=node["id"], chunks=[])
 
         end = min(offset + size, node["size"])
@@ -134,13 +143,22 @@ class FileContentService:
         )
         for read in plan.chunks:
             if read.row is None:
-                logger.debug("读取稀疏块：inode={}，expected_size={}", plan.file_id, read.expected_size)
+                logger.debug(
+                    "读取稀疏块：inode={}，expected_size={}",
+                    plan.file_id,
+                    read.expected_size,
+                )
                 chunks.append(b"\x00" * (read.stop - read.start))
                 continue
             chunk, access = next(block_results)
             accesses.append(access)
             chunks.append(chunk[read.start : read.stop])
-        logger.debug("执行读取计划完成：inode={}，chunks={}，block_accesses={}", plan.file_id, len(plan.chunks), len(accesses))
+        logger.debug(
+            "执行读取计划完成：inode={}，chunks={}，block_accesses={}",
+            plan.file_id,
+            len(plan.chunks),
+            len(accesses),
+        )
         return b"".join(chunks), accesses
 
     def write_file(self, node, path: str, data: bytes, offset: int) -> int:
@@ -231,7 +249,9 @@ class FileContentService:
             if inline_data is not None and chunk_index == 0:
                 chunk = bytearray(inline_data[:existing_len])
             else:
-                chunk = bytearray(self.read_chunk(node["id"], chunk_index, existing_len))
+                chunk = bytearray(
+                    self.read_chunk(node["id"], chunk_index, existing_len)
+                )
             if len(chunk) < chunk_len:
                 chunk.extend(b"\x00" * (chunk_len - len(chunk)))
             chunk[write_start:write_stop] = source
@@ -325,7 +345,12 @@ class FileContentService:
             return b""
         row = self.metadata.chunk_block(file_id, chunk_index)
         if row is None:
-            logger.debug("读取缺失 chunk，返回稀疏零填充：inode={}，chunk={}，expected_size={}", file_id, chunk_index, expected_size)
+            logger.debug(
+                "读取缺失 chunk，返回稀疏零填充：inode={}，chunk={}，expected_size={}",
+                file_id,
+                chunk_index,
+                expected_size,
+            )
             return b"\x00" * expected_size
         data, _access = self.block_store.read_block_snapshot(row, expected_size)
         return data
@@ -347,7 +372,12 @@ class FileContentService:
 
         if old is not None and old["hash"] == block.digest:
             self.metadata.update_file_chunk_size(file_id, chunk_index, block.raw_size)
-            logger.debug("chunk 指向未变化，仅更新大小：inode={}，chunk={}，hash={}", file_id, chunk_index, block.digest[:12])
+            logger.debug(
+                "chunk 指向未变化，仅更新大小：inode={}，chunk={}，hash={}",
+                file_id,
+                chunk_index,
+                block.digest[:12],
+            )
             return
 
         self.block_store.ensure_prepared_block(block)
@@ -363,14 +393,24 @@ class FileContentService:
         )
         if old is not None:
             self.block_store.decrement_block(old["hash"])
-            logger.debug("替换 chunk 旧块引用：inode={}，chunk={}，old_hash={}", file_id, chunk_index, old["hash"][:12])
+            logger.debug(
+                "替换 chunk 旧块引用：inode={}，chunk={}，old_hash={}",
+                file_id,
+                chunk_index,
+                old["hash"][:12],
+            )
 
     def remove_chunk(self, file_id: int, chunk_index: int) -> None:
         old = self.metadata.file_chunk_hash(file_id, chunk_index)
         if old is not None:
             self.metadata.delete_file_chunk(file_id, chunk_index)
             self.block_store.decrement_block(old["hash"])
-            logger.debug("删除 chunk：inode={}，chunk={}，old_hash={}", file_id, chunk_index, old["hash"][:12])
+            logger.debug(
+                "删除 chunk：inode={}，chunk={}，old_hash={}",
+                file_id,
+                chunk_index,
+                old["hash"][:12],
+            )
 
     def remove_file_chunks(self, file_id: int, first_index: int = 0) -> None:
         if first_index == 0:
@@ -379,7 +419,12 @@ class FileContentService:
         self.metadata.delete_file_chunks_from(file_id, first_index)
         for digest in hashes:
             self.block_store.decrement_block(digest)
-        logger.debug("删除文件 chunk 范围：inode={}，first_index={}，count={}", file_id, first_index, len(hashes))
+        logger.debug(
+            "删除文件 chunk 范围：inode={}，first_index={}，count={}",
+            file_id,
+            first_index,
+            len(hashes),
+        )
 
     def can_store_inline(self, size: int) -> bool:
         return (

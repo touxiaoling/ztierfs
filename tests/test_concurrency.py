@@ -89,7 +89,9 @@ def test_metadata_store_logs_expected_fuse_errors_at_debug(tmp_path, monkeypatch
     assert calls["exception"] == []
 
 
-def test_metadata_store_keeps_exception_logs_for_unexpected_errors(tmp_path, monkeypatch):
+def test_metadata_store_keeps_exception_logs_for_unexpected_errors(
+    tmp_path, monkeypatch
+):
     fs_impl = make_fs(tmp_path)
     calls = {"exception": []}
 
@@ -160,8 +162,13 @@ def test_ztierfs_serializes_parallel_writes_to_same_inode(tmp_path):
             payload = payloads[index]
             offset = index * len(payload)
             start.wait(timeout=5)
-            assert fs("write", "/shared.bin", payload, offset, handles[index]) == len(payload)
-            assert fs("read", "/shared.bin", len(payload), offset, handles[index]) == payload
+            assert fs("write", "/shared.bin", payload, offset, handles[index]) == len(
+                payload
+            )
+            assert (
+                fs("read", "/shared.bin", len(payload), offset, handles[index])
+                == payload
+            )
 
         with ThreadPoolExecutor(max_workers=len(payloads)) as executor:
             list(executor.map(write_chunk, range(len(payloads))))

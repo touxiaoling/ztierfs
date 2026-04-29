@@ -1,3 +1,5 @@
+"""组装 ZTierFS：组合 FUSE 与各领域 mixin，并完成元数据、块层、句柄等初始化。"""
+
 import os
 import threading
 
@@ -216,7 +218,9 @@ class ZTierFS(
 
     def _ensure_filesystem_config(self, *, update_config: bool) -> None:
         payload_store_path = (
-            str(self.payload_store_path) if self.payload_store_path is not None else None
+            str(self.payload_store_path)
+            if self.payload_store_path is not None
+            else None
         )
         desired = {
             "hot_tier_path": str(self.tier1),

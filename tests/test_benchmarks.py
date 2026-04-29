@@ -100,7 +100,9 @@ def test_benchmark_small_file_read_adapter(tmp_path, benchmark):
 
 
 @pytest.mark.parametrize("payload_store", ["sqlite", "filekv"])
-def test_benchmark_small_file_read_payload_store_matrix(tmp_path, benchmark, payload_store):
+def test_benchmark_small_file_read_payload_store_matrix(
+    tmp_path, benchmark, payload_store
+):
     fs_impl = make_fs(tmp_path, payload_store=payload_store)
     payload = b"small payload"
 
@@ -158,7 +160,9 @@ def test_benchmark_inode_first_metadata_walk(tmp_path, benchmark):
 
     def seed():
         for index in range(256):
-            entry, fh = fs_impl.create(1, f"inode-{index}.txt".encode(), 0o644, os.O_RDWR, None)
+            entry, fh = fs_impl.create(
+                1, f"inode-{index}.txt".encode(), 0o644, os.O_RDWR, None
+            )
             fs_impl.write(entry.ino, b"x", 0, fh)
             fs_impl.release(entry.ino, fh)
 
@@ -211,9 +215,10 @@ def test_benchmark_sequential_block_read_adapter(tmp_path, benchmark):
 
         def read_sequential():
             for offset in range(0, len(data), 64 * 1024):
-                assert fs("read", "/sequential.jpg", 64 * 1024, offset, fh) == data[
-                    offset : offset + 64 * 1024
-                ]
+                assert (
+                    fs("read", "/sequential.jpg", 64 * 1024, offset, fh)
+                    == data[offset : offset + 64 * 1024]
+                )
 
         benchmark.pedantic(read_sequential, rounds=5, iterations=1)
         fs("release", "/sequential.jpg", fh)
@@ -231,7 +236,10 @@ def test_benchmark_random_read_adapter(tmp_path, benchmark):
 
         def read_offsets():
             for offset in offsets:
-                assert fs("read", "/random.jpg", 4096, offset, fh) == data[offset : offset + 4096]
+                assert (
+                    fs("read", "/random.jpg", 4096, offset, fh)
+                    == data[offset : offset + 4096]
+                )
 
         benchmark.pedantic(read_offsets, rounds=5, iterations=1)
         fs("release", "/random.jpg", fh)
@@ -252,9 +260,10 @@ def test_benchmark_repeated_random_read_cache_adapter(tmp_path, benchmark):
         def read_offsets_twice():
             for _ in range(2):
                 for offset in offsets:
-                    assert fs("read", "/cached.jpg", 4096, offset, fh) == data[
-                        offset : offset + 4096
-                    ]
+                    assert (
+                        fs("read", "/cached.jpg", 4096, offset, fh)
+                        == data[offset : offset + 4096]
+                    )
 
         benchmark.pedantic(read_offsets_twice, rounds=5, iterations=1)
         fs("release", "/cached.jpg", fh)
@@ -338,7 +347,10 @@ def test_benchmark_cold_copy_up_adapter(tmp_path, benchmark):
         hot_fh = fs("create", "/hot.jpg", 0o644)
         fs("write", "/cold.jpg", cold_data, 0, cold_fh)
         fs("write", "/hot.jpg", hot_data, 0, hot_fh)
-        assert rows(fs_impl, "SELECT COUNT(*) AS total FROM block_records WHERE cold_present = 1")[0]["total"]
+        assert rows(
+            fs_impl,
+            "SELECT COUNT(*) AS total FROM block_records WHERE cold_present = 1",
+        )[0]["total"]
 
         def read_cold():
             assert fs("read", "/cold.jpg", len(cold_data), 0, cold_fh) == cold_data
@@ -347,7 +359,10 @@ def test_benchmark_cold_copy_up_adapter(tmp_path, benchmark):
         fs("release", "/cold.jpg", cold_fh)
         fs("release", "/hot.jpg", hot_fh)
 
-    presence = rows(fs_impl, "SELECT SUM(hot_present) AS hot, SUM(cold_present) AS cold FROM block_records")[0]
+    presence = rows(
+        fs_impl,
+        "SELECT SUM(hot_present) AS hot, SUM(cold_present) AS cold FROM block_records",
+    )[0]
     assert presence["hot"] >= 1
     assert presence["cold"] >= 1
 

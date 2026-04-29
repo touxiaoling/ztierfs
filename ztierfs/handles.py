@@ -1,7 +1,11 @@
+"""FUSE 文件句柄（fh）到 inode 的映射；支持 rename/unlink 后仍按打开时 inode 读。"""
+
 import threading
 
 
 class HandleTable:
+    """进程内 fh 分配、inode 绑定与按 inode 的打开计数（用于延迟 unlink 清理）。"""
+
     def __init__(self, lock: threading.RLock):
         self._lock = lock
         self._next_fh = 0
@@ -13,7 +17,9 @@ class HandleTable:
         with self._lock:
             self._next_fh += 1
             self._handles[self._next_fh] = file_id
-            self._lock_owners[self._next_fh] = lock_owner if lock_owner is not None else self._next_fh
+            self._lock_owners[self._next_fh] = (
+                lock_owner if lock_owner is not None else self._next_fh
+            )
             self._open_counts[file_id] = self._open_counts.get(file_id, 0) + 1
             return self._next_fh
 

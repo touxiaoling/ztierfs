@@ -194,7 +194,10 @@ def cold_copy_up(root: Path, profile: cProfile.Profile) -> None:
         hot_fh = fs("create", "/hot.jpg", 0o644)
         fs("write", "/cold.jpg", cold_data, 0, cold_fh)
         fs("write", "/hot.jpg", hot_data, 0, hot_fh)
-        assert rows(fs_impl, "SELECT COUNT(*) AS total FROM block_records WHERE cold_present = 1")[0]["total"]
+        assert rows(
+            fs_impl,
+            "SELECT COUNT(*) AS total FROM block_records WHERE cold_present = 1",
+        )[0]["total"]
         for _ in range(200):
             fs("read", "/cold.jpg", len(cold_data), 0, cold_fh)
         fs("release", "/cold.jpg", cold_fh)
@@ -259,7 +262,9 @@ def main() -> None:
         default=sorted(WORKLOADS),
         help="workloads to profile; defaults to all",
     )
-    parser.add_argument("--limit", type=int, default=30, help="number of profile rows per workload")
+    parser.add_argument(
+        "--limit", type=int, default=30, help="number of profile rows per workload"
+    )
     parser.add_argument("--output", type=Path, help="optional path for the text report")
     args = parser.parse_args()
 

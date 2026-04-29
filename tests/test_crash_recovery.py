@@ -35,13 +35,17 @@ def _assert_fsck_ok(fs_impl):
     assert report.issues == []
 
 
-def test_write_crash_after_block_file_before_metadata_commit_is_repairable_orphan(tmp_path, monkeypatch):
+def test_write_crash_after_block_file_before_metadata_commit_is_repairable_orphan(
+    tmp_path, monkeypatch
+):
     fs_impl = make_fs(tmp_path, inline_max_bytes=0)
     original_insert_block = fs_impl.metadata.insert_block
 
     def insert_block_then_crash(*args, **kwargs):
         original_insert_block(*args, **kwargs)
-        raise SimulatedCrash("crash after block metadata insert before transaction commit")
+        raise SimulatedCrash(
+            "crash after block metadata insert before transaction commit"
+        )
 
     monkeypatch.setattr(fs_impl.metadata, "insert_block", insert_block_then_crash)
 
@@ -60,7 +64,9 @@ def test_write_crash_after_block_file_before_metadata_commit_is_repairable_orpha
     assert not any((tmp_path / "hot" / "blocks").glob("*/*/*"))
 
 
-def test_demote_crash_after_hot_unlink_before_metadata_commit_is_repaired(tmp_path, monkeypatch):
+def test_demote_crash_after_hot_unlink_before_metadata_commit_is_repaired(
+    tmp_path, monkeypatch
+):
     fs_impl = make_fs(
         tmp_path,
         hot_cache_max_bytes=0,
@@ -84,7 +90,9 @@ def test_demote_crash_after_hot_unlink_before_metadata_commit_is_repaired(tmp_pa
             raise SimulatedCrash("crash after hot block unlink before metadata commit")
         original_set_block_presence(digest, **kwargs)
 
-    monkeypatch.setattr(fs_impl.metadata, "set_block_presence", crash_before_recording_demote)
+    monkeypatch.setattr(
+        fs_impl.metadata, "set_block_presence", crash_before_recording_demote
+    )
 
     with pytest.raises(SimulatedCrash):
         with fs_impl.metadata.transaction():
@@ -108,7 +116,9 @@ def test_demote_crash_after_hot_unlink_before_metadata_commit_is_repaired(tmp_pa
         assert fs("read", "/file.jpg", len(data), 0, fh) == data
 
 
-@pytest.mark.parametrize("operation", ["unlink", "truncate", "overwrite", "rename_overwrite"])
+@pytest.mark.parametrize(
+    "operation", ["unlink", "truncate", "overwrite", "rename_overwrite"]
+)
 def test_crash_after_block_delete_before_metadata_commit_reports_missing_referenced_block(
     tmp_path,
     monkeypatch,
@@ -123,7 +133,9 @@ def test_crash_after_block_delete_before_metadata_commit_reports_missing_referen
         original_delete_block_file(*args, **kwargs)
         raise SimulatedCrash("crash after block file delete before transaction commit")
 
-    monkeypatch.setattr(fs_impl.block_store, "delete_block_file", delete_block_file_then_crash)
+    monkeypatch.setattr(
+        fs_impl.block_store, "delete_block_file", delete_block_file_then_crash
+    )
 
     with pytest.raises(SimulatedCrash):
         with adapted(fs_impl) as fs:
@@ -159,7 +171,9 @@ def test_crash_after_block_delete_before_metadata_commit_reports_missing_referen
     assert report.has_unrepaired
 
 
-def test_hardlink_unlink_crash_after_entry_remove_rolls_back_metadata(tmp_path, monkeypatch):
+def test_hardlink_unlink_crash_after_entry_remove_rolls_back_metadata(
+    tmp_path, monkeypatch
+):
     fs_impl = make_fs(tmp_path, inline_max_bytes=0)
     data = bytes(range(256)) * 4
     original_remove_entry = fs_impl.metadata.remove_entry
@@ -237,7 +251,9 @@ def test_xattr_crash_before_commit_preserves_inode_xattrs(
 
     reopened = make_fs(tmp_path, inline_max_bytes=0)
     with adapted(reopened) as fs:
-        assert fs("listxattr", "/file.jpg") == ([] if expected is None else ["user.note"])
+        assert fs("listxattr", "/file.jpg") == (
+            [] if expected is None else ["user.note"]
+        )
         if expected is None:
             with pytest.raises(FuseOSError) as exc:
                 fs("getxattr", "/alias.jpg", "user.note", 0)
@@ -306,7 +322,9 @@ def test_cross_block_overwrite_crash_leaves_old_file_and_repairable_orphans(
         fs("write", "/movie.jpg", original, 0, fh)
 
         monkeypatch.setattr(
-            fs_impl.metadata, "attach_file_chunk_to_block", attach_second_new_chunk_then_crash
+            fs_impl.metadata,
+            "attach_file_chunk_to_block",
+            attach_second_new_chunk_then_crash,
         )
         with pytest.raises(SimulatedCrash):
             fs("write", "/movie.jpg", replacement, 512, fh)
@@ -422,7 +440,9 @@ def test_cleanup_crash_after_cold_unlink_before_metadata_commit_is_repaired(
 
     def crash_after_cleanup_unlinks_cold_copy(digest, **kwargs):
         if kwargs.get("cold_present") is False:
-            raise SimulatedCrash("crash after cleanup cold unlink before metadata commit")
+            raise SimulatedCrash(
+                "crash after cleanup cold unlink before metadata commit"
+            )
         original_set_block_presence(digest, **kwargs)
 
     monkeypatch.setattr(
@@ -455,7 +475,9 @@ def test_cleanup_crash_after_cold_unlink_before_metadata_commit_is_repaired(
         assert fs("read", "/file.jpg", len(data), 0, fh) == data
 
 
-def test_refcount_decrement_crash_before_commit_rolls_back_shared_block(tmp_path, monkeypatch):
+def test_refcount_decrement_crash_before_commit_rolls_back_shared_block(
+    tmp_path, monkeypatch
+):
     fs_impl = make_fs(tmp_path, inline_max_bytes=0)
     shared = bytes(range(256)) * 4
     original_decrement = fs_impl.metadata.decrement_block_refcount
@@ -502,7 +524,9 @@ def test_hardlink_last_unlink_crash_after_block_delete_reports_missing_block(
 
     def delete_block_file_then_crash(*args, **kwargs):
         original_delete_block_file(*args, **kwargs)
-        raise SimulatedCrash("crash after last hardlink block file delete before commit")
+        raise SimulatedCrash(
+            "crash after last hardlink block file delete before commit"
+        )
 
     with adapted(fs_impl) as fs:
         fh = fs("create", "/original.jpg", 0o644)

@@ -1,3 +1,5 @@
+"""进程内 POSIX advisory 文件锁（fcntl）的记录与冲突检测。"""
+
 import errno
 import fcntl
 import sys
@@ -18,6 +20,8 @@ class FileLock:
 
 
 class AdvisoryLockTable:
+    """单挂载进程内的建议锁表；不与其它挂载实例协调。"""
+
     def __init__(self) -> None:
         self._locks: list[FileLock] = []
 

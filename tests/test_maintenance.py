@@ -90,7 +90,9 @@ def test_update_config_rehomes_database_storage_paths(tmp_path):
     report = run_fsck(new_hot, new_cold, fs_impl.database, update_config=True)
 
     assert report.ok
-    config = rows(fs_impl, "SELECT hot_tier_path, cold_tier_path FROM filesystem_config")[0]
+    config = rows(
+        fs_impl, "SELECT hot_tier_path, cold_tier_path FROM filesystem_config"
+    )[0]
     assert config["hot_tier_path"] == str(new_hot.resolve())
     assert config["cold_tier_path"] == str(new_cold.resolve())
 
@@ -188,7 +190,10 @@ def test_fsck_repairs_unreferenced_block_record_and_file(tmp_path):
         db.execute("DELETE FROM file_chunks")
 
     report = run_fsck(fs_impl.tier1, fs_impl.tier2, fs_impl.database, repair=True)
-    assert {issue.code for issue in report.issues} == {"refcount_mismatch", "unreferenced_block_record"}
+    assert {issue.code for issue in report.issues} == {
+        "refcount_mismatch",
+        "unreferenced_block_record",
+    }
     assert all(issue.repaired for issue in report.issues)
     assert rows(fs_impl, "SELECT * FROM blocks") == []
     assert not path.exists()
@@ -374,7 +379,9 @@ def test_cleanup_removes_old_promoted_cold_copy(tmp_path):
     assert report.removed == 1
     assert report.skipped == 0
     assert not cold_path.exists()
-    assert rows(fs_impl, "SELECT cold_present FROM block_records")[0]["cold_present"] == 0
+    assert (
+        rows(fs_impl, "SELECT cold_present FROM block_records")[0]["cold_present"] == 0
+    )
 
 
 def test_cleanup_skips_cold_copy_when_cold_tier_unavailable(tmp_path, monkeypatch):
@@ -409,7 +416,9 @@ def test_cleanup_skips_cold_copy_when_cold_tier_unavailable(tmp_path, monkeypatc
 
     assert report.removed == 0
     assert report.skipped == 1
-    assert rows(fs_impl, "SELECT cold_present FROM block_records")[0]["cold_present"] == 1
+    assert (
+        rows(fs_impl, "SELECT cold_present FROM block_records")[0]["cold_present"] == 1
+    )
 
 
 def test_schema_rejects_invalid_metadata_rows(tmp_path):
@@ -425,7 +434,9 @@ def test_schema_rejects_invalid_metadata_rows(tmp_path):
                     """
                 )
             with pytest.raises(sqlite3.IntegrityError):
-                db.execute("INSERT INTO dir_entries (parent_id, name, inode_id) VALUES (1, '', 1)")
+                db.execute(
+                    "INSERT INTO dir_entries (parent_id, name, inode_id) VALUES (1, '', 1)"
+                )
             with pytest.raises(sqlite3.IntegrityError):
                 db.execute(
                     """
@@ -466,7 +477,9 @@ def test_schema_version_mismatch_is_rejected(tmp_path):
         ("invalid_dir_entry", "invalid_dir_entry"),
     ],
 )
-def test_fsck_reports_chunk_and_directory_metadata_corruption(tmp_path, corrupt, expected_code):
+def test_fsck_reports_chunk_and_directory_metadata_corruption(
+    tmp_path, corrupt, expected_code
+):
     fs_impl = make_fs(tmp_path, inline_max_bytes=0)
     with adapted(fs_impl) as fs:
         fh = fs("create", "/note.txt", 0o644)
@@ -515,7 +528,9 @@ def test_fsck_repairs_nlink_mismatch(tmp_path):
 
     assert [issue.code for issue in report.issues] == ["nlink_mismatch"]
     assert report.issues[0].repaired
-    assert rows(fs_impl, "SELECT nlink FROM inodes WHERE kind = 'file'")[0]["nlink"] == 1
+    assert (
+        rows(fs_impl, "SELECT nlink FROM inodes WHERE kind = 'file'")[0]["nlink"] == 1
+    )
 
 
 def test_fsck_repairs_inline_payload_table_corruption(tmp_path):
@@ -553,9 +568,9 @@ def test_fsck_repairs_inode_payload_table_corruption(tmp_path):
         fs("mkdir", "/docs", 0o755)
 
     orphan_inode = 999
-    directory_inode = rows(fs_impl, "SELECT inode_id FROM dir_entries WHERE name = 'docs'")[0][
-        "inode_id"
-    ]
+    directory_inode = rows(
+        fs_impl, "SELECT inode_id FROM dir_entries WHERE name = 'docs'"
+    )[0]["inode_id"]
     with sqlite3.connect(fs_impl.database) as db:
         db.execute("PRAGMA foreign_keys=OFF")
         db.execute(
