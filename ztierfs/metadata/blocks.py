@@ -1,4 +1,7 @@
-"""blocks / block_locations / block_payloads 上的 refcount 与 tier 信息。"""
+"""blocks / block_locations / block_payloads 上的 refcount 与冷热层（tier）信息。
+
+block_locations.tier 约定：1 表示热层，2 表示冷层；inline 块不走冷热复制路径。
+"""
 
 import sqlite3
 
@@ -10,6 +13,7 @@ class BlockMetadataMixin(MetadataMixinBase):
     """内容寻址块在库内的存在性、引用计数与冷热位置更新。"""
 
     def block_exists(self, digest: str) -> bool:
+        """处理 block exists。"""
         return (
             self._db.execute(
                 "SELECT 1 FROM blocks WHERE hash = ?", (digest,)
@@ -18,6 +22,7 @@ class BlockMetadataMixin(MetadataMixinBase):
         )
 
     def block_record(self, digest: str) -> sqlite3.Row | None:
+        """处理 block record。"""
         return self._db.execute(
             f"""
             SELECT *
@@ -28,6 +33,7 @@ class BlockMetadataMixin(MetadataMixinBase):
         ).fetchone()
 
     def block_refcount_and_presence(self, digest: str) -> sqlite3.Row | None:
+        """处理 block refcount and presence。"""
         return self._db.execute(
             """
             SELECT
@@ -56,6 +62,7 @@ class BlockMetadataMixin(MetadataMixinBase):
         now: int,
         inline_payload: bytes | None = None,
     ) -> None:
+        """处理 insert block。"""
         is_inline = inline_payload is not None
         payload_store = self.payload_store.name if is_inline else "sqlite"
         payload_key = None
@@ -98,16 +105,19 @@ class BlockMetadataMixin(MetadataMixinBase):
             )
 
     def increment_block_refcount(self, digest: str) -> None:
+        """将指定块的引用计数加一（有新 chunk 或链接指向该内容地址块时调用）。"""
         self._db.execute(
             "UPDATE blocks SET refcount = refcount + 1 WHERE hash = ?", (digest,)
         )
 
     def decrement_block_refcount(self, digest: str) -> None:
+        """将指定块的引用计数减一（移除 chunk 引用或 unlink 导致释放时调用）。"""
         self._db.execute(
             "UPDATE blocks SET refcount = refcount - 1 WHERE hash = ?", (digest,)
         )
 
     def delete_block(self, digest: str) -> None:
+        """删除block。"""
         row = self._db.execute(
             """
             SELECT payload_store, payload_key
@@ -121,6 +131,7 @@ class BlockMetadataMixin(MetadataMixinBase):
             self.payload_store.delete(row["payload_key"])
 
     def inline_block_payload(self, digest: str) -> bytes | None:
+        """处理 inline block payload。"""
         row = self._db.execute(
             """
             SELECT payload, payload_store, payload_key
@@ -146,6 +157,13 @@ class BlockMetadataMixin(MetadataMixinBase):
         last_demoted_ns: int | None = None,
         cold_verified_ns: int | None = None,
     ) -> None:
+        """更新块在冷热层的物理存在标记及 blocks 表中的冷热迁移动态字段。
+
+        hot_present / cold_present 为 True 时在对应 tier（1=热，2=冷）插入
+        block_locations 行，为 False 时删除；不传则不改该行。
+        preferred_tier、last_promoted_ns、last_demoted_ns、cold_verified_ns 仅更新
+        blocks 表中已给出的列；若本次调用未产生任何 blocks 列赋值则直接返回。
+        """
         assignments: list[str] = []
         values: list[int | str | None] = []
         if hot_present is not None:
@@ -173,6 +191,7 @@ class BlockMetadataMixin(MetadataMixinBase):
         )
 
     def _set_block_location(self, digest: str, tier: int, present: bool) -> None:
+        """按 tier（1 热 / 2 冷）插入或删除 block_locations 一行。"""
         if present:
             self._db.execute(
                 "INSERT OR IGNORE INTO block_locations (hash, tier) VALUES (?, ?)",
@@ -185,6 +204,7 @@ class BlockMetadataMixin(MetadataMixinBase):
             )
 
     def hot_tier_stored_size(self) -> int:
+        """处理 hot tier stored size。"""
         return self._db.execute(
             """
             SELECT COALESCE(SUM(stored_size), 0)
@@ -200,6 +220,16 @@ class BlockMetadataMixin(MetadataMixinBase):
         protected_prefix_chunks: int,
         max_atime_ns: int,
     ) -> sqlite3.Row | None:
+        """选出一只适合从热层降级到冷层的块（若无可选则返回 None）。
+
+        查询意图：仅考虑 tiered 且当前在热层存在位置的块；最近访问时间不晚于
+        max_atime_ns；排除任一所属文件的 chunk_index 落在「文件开头受保护前缀」
+        （chunk_index < protected_prefix_chunks）内的块，避免大块头部频繁读被迁冷；
+        与 file_chunks 左连接得到该块在各文件中出现的最早 chunk 序号 first_chunk_index。
+        分组后在候选集中按「读次数升序 → 越早出现在文件中的块越优先（序号降序）→
+        访问时间升序」排序，取 LIMIT 1。返回列含 hash、stored_size、cold_present、
+        first_chunk_index（无关联 chunk 时用极大序号占位）。
+        """
         return self._db.execute(
             """
             SELECT
@@ -235,6 +265,7 @@ class BlockMetadataMixin(MetadataMixinBase):
         ).fetchone()
 
     def promoted_cold_copy_candidates(self, cutoff_ns: int) -> list[sqlite3.Row]:
+        """处理 promoted cold copy candidates。"""
         return self._db.execute(
             """
             SELECT blocks.hash

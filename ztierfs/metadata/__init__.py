@@ -1,4 +1,13 @@
-"""导出元数据存储、连接池、建库与块记录公共 SQL 片段。"""
+"""ztierfs 元数据子包的对外入口（少量常用符号再导出）。
+
+再导出：
+
+- `MetadataStore`：SQLite 元数据门面（事务、命名空间、块表等的组合入口）。
+- `ConnectionPool`、`SQLitePragmas`、`open_database`：连接池、PRAGMA 参数与打开数据库。
+- `SCHEMA_VERSION`：代码期望的 schema 版本（应与库内 `PRAGMA user_version` 一致）。
+- `BLOCK_RECORD_SELECT`：`blocks`、`block_locations`、`block_payloads` 联表查询的公共 SQL 片段。
+
+其余 API 见 `ztierfs.metadata` 包内各子模块。"""
 
 from .connection import ConnectionPool, SQLitePragmas, open_database
 from .schema import BLOCK_RECORD_SELECT, SCHEMA_VERSION

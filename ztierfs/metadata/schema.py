@@ -1,4 +1,21 @@
-"""版本化 schema：建表/迁移、配置行与块记录联表查询片段。"""
+"""版本化 schema：建表/迁移、配置行与块记录联表查询片段。
+
+**SCHEMA_VERSION 与 user_version**
+
+- `SCHEMA_VERSION`：代码期望的元数据布局版本，建库/迁移成功后应与库内 `PRAGMA user_version` 相等。
+- `PRAGMA user_version`：SQLite 持久化的无符号 32 位整数（库文件头），供启动时判断是否与当前代码兼容；
+  破坏性演进时同时改 DDL 与 `SCHEMA_VERSION`，并在迁移流程里 `PRAGMA user_version = ...` 与之对齐。
+
+**CONFIG_VERSION**
+
+`filesystem_config.config_version` 使用的行语义版本，与块/inode 布局的 `SCHEMA_VERSION` 独立。
+
+**BLOCK_RECORD_SELECT**
+
+将 `blocks` 与 `block_locations`（按 tier 区分热/冷）及可选 `block_payloads` 联表，供一次查询块元数据、
+内联载荷与各层是否存在。`block_locations.tier`：1=热层块路径，2=冷层（同一 hash 每层至多一行）。
+结果列 `hot_present`/`cold_present` 由对 tier 1/2 的 LEFT JOIN 是否为 NULL 推导（无行为 0，有为 1）。
+"""
 
 import os
 
@@ -9,7 +26,6 @@ from .base import MetadataMixinBase
 
 SCHEMA_VERSION = 6
 CONFIG_VERSION = 1
-
 
 BLOCK_RECORD_SELECT = """
     SELECT
@@ -46,9 +62,14 @@ BLOCK_RECORD_SELECT = """
 
 
 class SchemaMixin(MetadataMixinBase):
-    """建表、版本检查与随版本演进的 DDL（与 SCHEMA_VERSION 对齐）。"""
+    """提供建表 DDL、启动时 schema 版本校验及根 inode 初始化（与 `SCHEMA_VERSION` 一致）。"""
 
     def _validate_schema_version(self) -> None:
+        """校验 `PRAGMA user_version` 是否与 `SCHEMA_VERSION` 匹配。
+
+        `user_version == SCHEMA_VERSION` 则通过；若为 0 且库中尚无任何用户表，视为空库待建表，亦通过；
+        否则抛出 `RuntimeError`，表示库文件与当前代码不兼容。
+        """
         version = int(self._db.execute("PRAGMA user_version").fetchone()[0])
         if version == SCHEMA_VERSION:
             return
@@ -59,6 +80,7 @@ class SchemaMixin(MetadataMixinBase):
         )
 
     def _has_existing_schema(self) -> bool:
+        """若 `sqlite_master` 中已有非系统对象（表/索引/触发器/视图），返回 True；否则 False。"""
         row = self._db.execute(
             """
             SELECT 1
@@ -71,6 +93,7 @@ class SchemaMixin(MetadataMixinBase):
         return row is not None
 
     def _create_schema(self) -> None:
+        """执行完整 DDL：inode/目录项/块/位置/chunk/xattr/配置表及 `block_records` 视图等。"""
         self._db.execute(
             """
             CREATE TABLE IF NOT EXISTS inodes (
@@ -232,6 +255,7 @@ class SchemaMixin(MetadataMixinBase):
         )
 
     def _ensure_root(self) -> None:
+        """确保 inode `id=1` 的根目录存在（`INSERT OR IGNORE`）。"""
         now = time_ns()
         self._db.execute(
             """
@@ -244,6 +268,7 @@ class SchemaMixin(MetadataMixinBase):
         )
 
     def filesystem_config(self):
+        """读取 `filesystem_config` 单行（id=1）：热/冷路径与 payload 存储配置。"""
         return self._db.execute(
             """
             SELECT hot_tier_path, cold_tier_path, payload_store, payload_store_path
@@ -260,6 +285,7 @@ class SchemaMixin(MetadataMixinBase):
         payload_store: str,
         payload_store_path: str | None,
     ) -> None:
+        """写入或更新挂载配置（upsert id=1），`config_version` 使用模块常量 `CONFIG_VERSION`。"""
         self._db.execute(
             """
             INSERT INTO filesystem_config (

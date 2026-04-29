@@ -1,4 +1,7 @@
-"""ztierfs：基于 SQLite 与内容寻址块的可写分层 FUSE 文件系统包。"""
+"""ztierfs：基于 SQLite 与内容寻址块的可写分层 FUSE 文件系统。
+
+对外导出 `ZTierFS` 与常用默认常量（块大小、冷热层水位与内联阈值等），便于 `from ztierfs import ...`。
+"""
 
 from .constants import (
     CHUNK_SIZE,

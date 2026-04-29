@@ -1,4 +1,11 @@
-"""内容寻址块文件：压缩、冷热层放置、原子写入、降级/提升与读缓存。"""
+"""内容寻址块存储（tier1=热层，tier2=冷层）。
+
+负责 zstd 压缩、按内容摘要在各 tier 目录下的原子写入、与 SQLite `blocks`/`block_locations`
+元数据协同（引用计数、存在性、preferred_tier）。包含读 LRU 缓存、异步 prepare、热→冷降级与读冷层时的
+copy-up，以及在元数据与物理文件不一致时的有限自修复。
+
+块文件即用户数据：须保持临时文件+rename、fsync 等与项目其它模块一致的原子性与持久化约定。
+"""
 
 import errno
 import os
@@ -31,7 +38,15 @@ from .tier_access import (
 
 @dataclass(frozen=True)
 class TieringPolicy:
-    """热层容量上下限、文件头块保护、最小热驻留时间等冷热策略参数。"""
+    """冷热分层（tiering）策略：用字节阈值驱动热层→冷层降级与写放大控制。
+
+    ``hot_max_bytes`` / ``hot_min_bytes`` 构成滞回区间：热层已存 payload 总字节数超过
+    ``hot_max_bytes`` 时触发降级循环，直至回落到 ``hot_min_bytes`` 以下或没有候选块。
+    ``protected_prefix_chunks`` 保护每个文件最前若干逻辑块不参与降级，降低顺序读头延迟。
+    ``min_hot_age_ns`` 以纳秒计的最小“在热层年龄”，过新的块不作为降级候选，避免抖动。
+    ``cold_copy_cleanup_age_ns`` 在 copy-up 后保留冷层副本的保留期，超时后由维护清理删除
+    冷层冗余文件（元数据仍由调用方配合更新）。
+    """
 
     hot_max_bytes: int
     hot_min_bytes: int
@@ -40,6 +55,7 @@ class TieringPolicy:
     cold_copy_cleanup_age_ns: int = 0
 
     def __post_init__(self) -> None:
+        """校验各字段非负及 ``hot_min_bytes`` 不大于 ``hot_max_bytes``。"""
         if self.hot_max_bytes < 0:
             raise ValueError("hot_max_bytes must not be negative")
         if self.hot_min_bytes < 0:
@@ -56,7 +72,12 @@ class TieringPolicy:
 
 @dataclass(frozen=True)
 class PreparedBlock:
-    """待提交块：摘要、原始大小、（可选压缩）载荷及可内联的小块数据。"""
+    """经 ``prepare_block(s)`` 得到的待落盘块描述，供 ``ensure_prepared_block`` 原子写入与 SQLite 登记。
+
+    ``digest`` 为原始未压缩数据的 SHA-256 十六进制摘要；``raw_size`` 为逻辑块原始字节数。
+    ``payload`` 为磁盘或内联存储字节序列（可能经 zstd 压缩，由 ``compressed`` 标明）。
+    ``inline_payload`` 非 ``None`` 时表示整块走 SQLite 内联存储，不写 tier 目录下的块文件。
+    """
 
     digest: str
     raw_size: int
@@ -67,7 +88,13 @@ class PreparedBlock:
 
 @dataclass(frozen=True)
 class BlockAccess:
-    """一次块读取解析出的层级、存在性与是否触发降级等上下文。"""
+    """单次读路径解析结果，供延迟刷新的访问统计与冷热存在位（presence）修正。
+
+    ``tier``：0 表示内联块；1 热层（tier1）；2 冷层（tier2）。``stored_size`` 为本次读取所依据
+    的存储字节数。``hot_present`` / ``cold_present`` / ``preferred_tier`` / ``last_promoted_ns``
+    在自修复路径上可携带待写回 SQLite 的修正值。``request_demotion`` 为真时表示热层写入已累积
+    到策略阈值，应在提交访问记录后尽快执行 ``demote_cold_blocks`` 等降级逻辑。
+    """
 
     digest: str
     tier: int
@@ -80,7 +107,16 @@ class BlockAccess:
 
 
 class BlockStore:
-    """块文件与元数据协同：写入、读取、去重引用计数及 tier 间迁移。"""
+    """内容寻址块在热层（tier1）与冷层（tier2）目录上的 IO、进程内读解码缓存与分层迁移。
+
+    新块默认先 ``write_block_file`` 到热层，再以临时文件 + ``fsync`` + ``os.replace`` 保证
+    块文件原子落盘；跨层 ``copy_block`` 同样经临时文件与目录 ``fsync``。读冷层且满足策略时
+    可异步 **copy-up** 到热层并更新 ``preferred_tier``；热层超水位时 **降级** 将 payload 复制
+    到冷层后删除热层文件。``read_cache_bytes`` 控制解码后明文 LRU 缓存上限（内联块亦可命中）。
+
+    注意：``ensure_prepared_block`` / ``demote_cold_blocks`` / copy-up 回调内对 ``MetadataStore``
+    的更新须在调用方约定的写事务或本类已开启的事务中与块文件操作一致提交，避免元数据与磁盘脱节。
+    """
 
     def __init__(
         self,
@@ -94,6 +130,7 @@ class BlockStore:
         inline_max_bytes: int,
         read_cache_bytes: int = 128 * 1024 * 1024,
     ):
+        """绑定元数据存储、热/冷层块根目录、``TieringPolicy`` 与压缩/内联/读缓存容量（字节）。"""
         self.metadata = metadata
         self.tier1_blocks = tier1_blocks
         self.tier2_blocks = tier2_blocks
@@ -113,6 +150,7 @@ class BlockStore:
         self._copy_up_lock = threading.Lock()
 
     def close(self) -> None:
+        """刷净延迟块访问并关闭后台 ``prepare`` 线程池；应在卸载或进程退出前调用。"""
         logger.info("关闭块存储")
         if self.metadata.has_deferred_accesses():
             with self.metadata.transaction():
@@ -123,11 +161,17 @@ class BlockStore:
             executor.shutdown(wait=True)
 
     def read_block(self, row, expected_size: int) -> bytes:
+        """读块并立即将本次 ``BlockAccess`` 记入元数据（访问时间、存在位修正与降级请求）。"""
         data, access = self.read_block_snapshot(row, expected_size)
         self.record_block_access(access, time_ns())
         return data
 
     def read_block_snapshot(self, row, expected_size: int) -> tuple[bytes, BlockAccess]:
+        """返回截断/零填充至 ``expected_size`` 的数据与 ``BlockAccess``；不单独刷写延迟访问。
+
+        内联块与 tier 块均可能命中进程内 **LRU 解码缓存**。从冷层读且 ``should_copy_up_from_cold``
+        成立时会 **调度异步 copy-up**（不阻塞当前读）。缺块或解压失败抛 ``EIO``。
+        """
         if row["storage"] == "inline":
             inline_payload = row["inline_payload"]
             if inline_payload is None and row["inline_payload_store"] != "sqlite":
@@ -233,6 +277,7 @@ class BlockStore:
     def read_block_snapshots(
         self, requests: list[tuple[object, int]]
     ) -> list[tuple[bytes, BlockAccess]]:
+        """批量 ``read_block_snapshot``；多请求时在共享线程池中并行读盘/解码。"""
         if len(requests) <= 1:
             return [
                 self.read_block_snapshot(row, expected_size)
@@ -246,6 +291,7 @@ class BlockStore:
         return [future.result() for future in futures]
 
     def should_copy_up_from_cold(self, row, tier: int) -> bool:
+        """当本次从冷层（tier2）读取、且块 ``stored_size`` 不超过 ``hot_max_bytes`` 时建议 copy-up。"""
         return (
             tier == 2
             and self.policy.hot_max_bytes > 0
@@ -253,6 +299,7 @@ class BlockStore:
         )
 
     def schedule_cold_copy_up(self, digest: str, stored_size: int) -> None:
+        """对同一 ``digest`` 去重后在线程池中异步执行 ``_copy_up_cold_block``，避免重复 in-flight。"""
         with self._copy_up_lock:
             if digest in self._copy_up_inflight:
                 return
@@ -264,6 +311,7 @@ class BlockStore:
         future.add_done_callback(lambda done: self._finish_cold_copy_up(digest, done))
 
     def _copy_up_cold_block(self, digest: str, stored_size: int) -> None:
+        """将冷层块 **copy-up** 到热层（原子复制），在写事务中标记冷热均存在、首选热层并尝试 ``demote_cold_blocks``。"""
         self.copy_block(digest, 2, 1)
         if not probe_path(self.block_path(digest, 1)).present:
             logger.debug("冷层块后台提升未产生热层副本：hash={}", digest[:12])
@@ -283,6 +331,7 @@ class BlockStore:
         )
 
     def _finish_cold_copy_up(self, digest: str, future: Future[None]) -> None:
+        """释放 in-flight 标记并消费 ``Future``；失败时记录异常但不向 FUSE 上抛。"""
         with self._copy_up_lock:
             self._copy_up_inflight.discard(digest)
         try:
@@ -291,11 +340,13 @@ class BlockStore:
             logger.exception("冷层块后台提升失败：hash={}", digest[:12])
 
     def record_block_access(self, access: BlockAccess, now: int) -> None:
+        """合并延迟访问时间戳、按 ``BlockAccess`` 更新存在位/首选层，并立即 ``flush_deferred_accesses``。"""
         self.metadata.defer_block_accesses(iter((access.digest,)), now)
         self.record_block_presence(access, now)
         self.metadata.flush_deferred_accesses()
 
     def record_block_accesses(self, accesses: Iterable[BlockAccess], now: int) -> bool:
+        """批量延迟访问；若队列已满或任一条目需元数据修正则返回真，提示调用方尽快 flush。"""
         pending = list(accesses)
         should_flush = self.metadata.defer_block_accesses(
             (access.digest for access in pending), now
@@ -305,6 +356,7 @@ class BlockStore:
         )
 
     def access_requires_metadata_update(self, access: BlockAccess) -> bool:
+        """判断该次访问是否携带需写回 SQLite 的存在位、首选层、提升时间或显式降级请求。"""
         return (
             access.hot_present is not None
             or access.cold_present is not None
@@ -314,6 +366,7 @@ class BlockStore:
         )
 
     def record_block_presence(self, access: BlockAccess, now: int) -> None:
+        """若 ``BlockAccess`` 含存在位或首选层信息则 ``set_block_presence``；``request_demotion`` 时置内部降级标志。"""
         if (
             access.hot_present is not None
             or access.cold_present is not None
@@ -332,12 +385,17 @@ class BlockStore:
             self._demotion_requested = True
 
     def ensure_block(self, digest: str, data: bytes, compress: bool) -> None:
+        """``prepare_block`` 后校验摘要与 ``digest`` 一致，再 ``ensure_prepared_block``（幂等）。"""
         block = self.prepare_block(data, compress)
         if block.digest != digest:
             raise ValueError("digest does not match block data")
         self.ensure_prepared_block(block)
 
     def ensure_prepared_block(self, block: PreparedBlock) -> None:
+        """若块不存在：非内联则 **原子写入** 热层块文件并 ``note_hot_write``，再 ``insert_block`` 登记。
+
+        已存在时直接返回。调用方须保证与引用计数/文件块元数据在同一元数据事务中一致提交。
+        """
         digest = block.digest
         if self.metadata.block_exists(digest):
             logger.debug("块已存在，跳过写入：hash={}", digest[:12])
@@ -367,6 +425,7 @@ class BlockStore:
     def prepare_blocks(
         self, chunks: Iterable[tuple[int, bytes]], compress: bool
     ) -> list[tuple[int, PreparedBlock]]:
+        """对多块并行或同步计算摘要与编码，填充 **读缓存** 明文，并判定是否 **内联** 存储。"""
         pending = list(chunks)
         if len(pending) <= 1 or not compress:
             logger.debug("同步准备块：count={}，compress={}", len(pending), compress)
@@ -407,9 +466,11 @@ class BlockStore:
         return prepared
 
     def prepare_block(self, data: bytes, compress: bool) -> PreparedBlock:
+        """单块 ``prepare_blocks`` 的便捷封装。"""
         return self.prepare_blocks([(0, data)], compress)[0][1]
 
     def _prepare_block_sync(self, data: bytes, compress: bool) -> PreparedBlock:
+        """在当前线程完成编码、摘要、缓存与内联判定（无并行开销）。"""
         payload, compressed = self._timed_encode_block(data, compress)
         digest = self._timed_digest_block(data)
         self._cache_put(digest, data)
@@ -423,6 +484,7 @@ class BlockStore:
         )
 
     def _executor(self) -> ThreadPoolExecutor:
+        """懒创建用于 ``prepare_blocks`` / 并行读 / copy-up 的共享 ``ThreadPoolExecutor``。"""
         executor = self._prepare_executor
         if executor is not None:
             return executor
@@ -437,21 +499,25 @@ class BlockStore:
 
     @staticmethod
     def digest_block(data: bytes) -> str:
+        """返回 ``data`` 的 SHA-256 十六进制摘要（与内容寻址主键一致）。"""
         return sha256(data).hexdigest()
 
     def _timed_digest_block(self, data: bytes) -> str:
+        """带性能计时的 ``digest_block``，供并行 ``prepare`` 路径使用。"""
         with timed(
             "block_prepare.hash", bytes_key="block_prepare.hash_bytes", size=len(data)
         ):
             return self.digest_block(data)
 
     def _timed_encode_block(self, data: bytes, compress: bool) -> tuple[bytes, bool]:
+        """带性能计时的 ``encode_block``。"""
         with timed(
             "block_prepare.encode", bytes_key="block_prepare.raw_bytes", size=len(data)
         ):
             return self.encode_block(data, compress)
 
     def decrement_block(self, digest: str) -> None:
+        """引用计数递减；降至零时删除 SQLite 块行并在 **tier 存储** 上 ``delete_block_file``。"""
         row = self.metadata.block_refcount_and_presence(digest)
         if row is None:
             logger.warning("递减块引用时未找到块记录：hash={}", digest[:12])
@@ -473,6 +539,7 @@ class BlockStore:
         )
 
     def encode_block(self, data: bytes, compress: bool) -> tuple[bytes, bool]:
+        """按策略尝试 zstd；过短、禁用压缩或压缩无体积收益时返回原始字节与 ``compressed=False``。"""
         if not compress:
             logger.debug("跳过压缩块：raw_size={}，原因=路径策略", len(data))
             return data, False
@@ -491,6 +558,7 @@ class BlockStore:
         return packed, True
 
     def decode_payload(self, row, payload: bytes) -> bytes:
+        """按 ``row["compressed"]`` 解压或直通，并校验解码后长度等于 ``row["raw_size"]``。"""
         try:
             data = zstd.decompress(payload) if row["compressed"] else payload
         except zstd.ZstdError as exc:
@@ -509,9 +577,11 @@ class BlockStore:
         return data
 
     def should_inline(self, payload: bytes) -> bool:
+        """当 ``inline_max_bytes > 0`` 且 ``payload`` 不超过该阈值时整块可放入 SQLite 内联列。"""
         return self.inline_max_bytes > 0 and len(payload) <= self.inline_max_bytes
 
     def _cache_get(self, digest: str) -> bytes | None:
+        """LRU 命中则将键移到队尾并返回 **解码后明文**；缓存关闭或未命中返回 ``None``。"""
         if self.read_cache_bytes <= 0:
             return None
         with self._read_cache_lock:
@@ -522,6 +592,7 @@ class BlockStore:
             return data
 
     def _cache_put(self, digest: str, data: bytes) -> None:
+        """插入或更新明文缓存并在总字节数超 ``read_cache_bytes`` 时从队首驱逐（单块过大则不缓存）。"""
         if self.read_cache_bytes <= 0 or len(data) > self.read_cache_bytes:
             return
         with self._read_cache_lock:
@@ -535,14 +606,17 @@ class BlockStore:
                 self._read_cache_size -= len(old_data)
 
     def block_path(self, digest: str, tier: int) -> Path:
+        """返回给定 ``digest`` 在 tier1（1）或 tier2（2）下的内容寻址块文件路径。"""
         return block_file_path(self.tier1_blocks, self.tier2_blocks, digest, tier)
 
     def take_demotion_request(self) -> bool:
+        """原子地读取并清除内部“需要 **热层降级**”标志（由 ``note_hot_write`` 或访问记录置位）。"""
         requested = self._demotion_requested
         self._demotion_requested = False
         return requested
 
     def note_hot_write(self, stored_size: int) -> None:
+        """累加热层新写字节；自上次检查以来累计达到 ``hot_max_bytes`` 时置 **降级请求** 并重置累计。"""
         if self.policy.hot_max_bytes <= 0:
             return
         self._hot_bytes_added_since_check += stored_size
@@ -551,6 +625,10 @@ class BlockStore:
             self._hot_bytes_added_since_check = 0
 
     def write_block_file(self, digest: str, tier: int, payload: bytes) -> None:
+        """向 ``tier`` 目录 **原子写入** 块文件：临时文件 → ``fsync`` → ``os.replace`` → 父目录 ``fsync``。
+
+        目标路径已存在则跳过（幂等）。``payload`` 为磁盘存储字节序列（可为压缩形式）。
+        """
         path = self.block_path(digest, tier)
         if probe_path(path).present:
             logger.debug("块文件已存在，跳过写入：hash={}，tier={}", digest[:12], tier)
@@ -574,6 +652,7 @@ class BlockStore:
         )
 
     def delete_block_file(self, digest: str) -> None:
+        """依次尝试删除 tier1 与 tier2 上同名块文件；路径临时不可用时记警告并跳过该层。"""
         for candidate_tier in (1, 2):
             try:
                 if unlink_path(self.block_path(digest, candidate_tier)):
@@ -588,6 +667,10 @@ class BlockStore:
                 )
 
     def copy_block(self, digest: str, source_tier: int, target_tier: int) -> None:
+        """跨层 **原子复制**：``shutil.copyfile`` 至临时文件、读 ``fsync``、``replace`` 落位、目录 ``fsync``。
+
+        源缺失、任一侧路径不可用或目标已存在时安全返回；用于 **copy-up** 与降级前冷层落盘。
+        """
         source = self.block_path(digest, source_tier)
         target = self.block_path(digest, target_tier)
         source_probe = probe_path(source)
@@ -636,6 +719,12 @@ class BlockStore:
         )
 
     def demote_cold_blocks(self) -> None:
+        """当热层已存 payload 总字节超过 ``hot_max_bytes`` 时，循环选取候选块 **降级** 到冷层。
+
+        先 ``flush_deferred_accesses``；若冷层尚无副本则 ``copy_block(1→2)``，再删热层文件并更新
+        SQLite 存在位与 ``preferred_tier=2``。受 ``protected_prefix_chunks`` 与 ``min_hot_age_ns`` 约束；
+        冷/热路径不可用时中止本轮。
+        """
         if self.policy.hot_max_bytes <= 0:
             return
         self.metadata.flush_deferred_accesses()
@@ -687,6 +776,10 @@ class BlockStore:
             )
 
     def cleanup_promoted_cold_copies(self) -> int:
+        """删除 **copy-up** 后超过 ``cold_copy_cleanup_age_ns`` 仍留在冷层的冗余副本，并清除 ``cold_present``。
+
+        ``cold_copy_cleanup_age_ns <= 0`` 时禁用。返回成功删除的块数。
+        """
         if self.policy.cold_copy_cleanup_age_ns <= 0:
             return 0
         cutoff = time_ns() - self.policy.cold_copy_cleanup_age_ns
@@ -716,6 +809,11 @@ class BlockStore:
     def _read_path(
         self, row, *, repair_metadata: bool = True
     ) -> tuple[Path, int, dict[str, bool | int]]:
+        """根据 SQLite 存在位与磁盘探测选择实际读路径与 ``tier``，并在不一致时 **有限自修复**。
+
+        ``repair_metadata`` 为真时可写回 ``hot_present`` / ``cold_present`` / ``preferred_tier``。
+        返回的 ``dict`` 供构造 ``BlockAccess`` 上的可选修正字段。冷层临时不可用且无热副本时抛 ``EIO``。
+        """
         digest = row["hash"]
         hot_path = self.block_path(digest, 1)
         cold_path = self.block_path(digest, 2)
@@ -798,6 +896,7 @@ class BlockStore:
         return cold_path, 2, repair
 
     def fsync_dir(self, path: Path) -> None:
+        """在支持 ``O_DIRECTORY`` 的平台上对目录 fd 执行 ``fsync``，巩固 **rename 落盘** 的目录项持久化。"""
         if not hasattr(os, "O_DIRECTORY"):
             return
         fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)

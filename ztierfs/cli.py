@@ -1,4 +1,9 @@
-"""命令行：挂载、fsck/scrub/stats/cleanup 等维护子命令与参数解析。"""
+"""ztierfs 命令行入口：解析参数并分派子命令。
+
+子命令：``mount``（FUSE 挂载，含冷热层、块大小、压缩、SQLite/FUSE 调优等）、
+``fsck`` / ``scrub``（元数据与块一致性；scrub 另校验 payload 可读）、
+``stats``（空间与引用等统计）、``cleanup``（清理 copy-up 后遗留的冷层副本）。
+"""
 
 import argparse
 import json
@@ -35,6 +40,7 @@ from .maintenance import (
 
 
 def _parse_size(value: str) -> int:
+    """将带单位的大小字符串（如 ``10g``）解析为字节数。"""
     units = {"k": 1024, "m": 1024**2, "g": 1024**3, "t": 1024**4}
     normalized = value.strip().lower()
     if normalized[-1:] in units:
@@ -43,6 +49,7 @@ def _parse_size(value: str) -> int:
 
 
 def _parse_nonnegative_float(value: str) -> float:
+    """解析非负浮点数；若为负则抛出 ``ArgumentTypeError``。"""
     parsed = float(value)
     if parsed < 0:
         raise argparse.ArgumentTypeError("must be non-negative")
@@ -50,6 +57,7 @@ def _parse_nonnegative_float(value: str) -> float:
 
 
 def _parse_nonnegative_int(value: str) -> int:
+    """解析非负整数；若为负则抛出 ``ArgumentTypeError``。"""
     parsed = int(value)
     if parsed < 0:
         raise argparse.ArgumentTypeError("must be non-negative")
@@ -57,6 +65,7 @@ def _parse_nonnegative_int(value: str) -> int:
 
 
 def main(argv: list[str] | None = None) -> None:
+    """解析 ``argv``（默认同 ``sys.argv``），配置日志与会话输出，执行对应子命令处理函数。"""
     parser = _build_parser()
     args = parser.parse_args(argv)
     with console_output(_console_config_from_args(args)):
@@ -64,6 +73,7 @@ def main(argv: list[str] | None = None) -> None:
 
 
 def _build_parser() -> argparse.ArgumentParser:
+    """构建根解析器及 ``mount`` / ``fsck`` / ``scrub`` / ``stats`` / ``cleanup`` 子解析器。"""
     parser = argparse.ArgumentParser(description="SQLite + zstd 分片去重 FUSE 文件系统")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -238,11 +248,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _add_tier_args(parser: argparse.ArgumentParser) -> None:
+    """为 ``mount`` 注册热层、冷层两个位置参数。"""
     parser.add_argument("tier1", help="第一层热块目录")
     parser.add_argument("tier2", help="第二层冷块目录")
 
 
 def _add_maintenance_storage_args(parser: argparse.ArgumentParser) -> None:
+    """注册维护子命令的位置参数：元数据路径，及可选的冷层路径（救援/显式层路径）。"""
     parser.add_argument(
         "path",
         help="SQLite 元数据文件；也可作为救援形式传热层目录并同时传 cold-tier",
@@ -255,10 +267,12 @@ def _add_maintenance_storage_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_database_arg(parser: argparse.ArgumentParser) -> None:
+    """注册 ``--database``，覆盖默认放在热层目录下的 SQLite 元数据路径。"""
     parser.add_argument("--database", help="SQLite 元数据文件，默认放在第一层目录")
 
 
 def _add_maintenance_args(parser: argparse.ArgumentParser) -> None:
+    """组合存储路径、数据库、日志、配置覆盖，以及 ``fsck``/``scrub`` 的 ``--repair``/``--json``。"""
     _add_maintenance_storage_args(parser)
     _add_database_arg(parser)
     _add_logging_args(parser)
@@ -268,6 +282,7 @@ def _add_maintenance_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_config_override_args(parser: argparse.ArgumentParser) -> None:
+    """注册与数据库记录不一致时的 ``--allow-config-mismatch`` 与路径重写 ``--update-config``。"""
     parser.add_argument(
         "--allow-config-mismatch",
         action="store_true",
@@ -283,6 +298,7 @@ def _add_config_override_args(parser: argparse.ArgumentParser) -> None:
 def _add_logging_args(
     parser: argparse.ArgumentParser, *, include_debug: bool = False
 ) -> None:
+    """注册 ``--log-level``、``--log-file``；``include_debug`` 为真时另加 ``mount`` 专用 ``--debug``。"""
     parser.add_argument(
         "--log-level",
         choices=["TRACE", "DEBUG", "INFO", "WARNING", "ERROR"],
@@ -303,11 +319,13 @@ def _add_logging_args(
 
 
 def _console_config_from_args(args: argparse.Namespace) -> ConsoleOutputConfig:
+    """根据解析结果构造 ``ConsoleOutputConfig``（``--debug`` 时提升日志级别）。"""
     logger_level = "DEBUG" if getattr(args, "debug", False) else args.log_level
     return ConsoleOutputConfig(logger_level=logger_level, log_file=args.log_file)
 
 
 def _run_mount(args: argparse.Namespace) -> None:
+    """按参数构造 ``ZTierFS`` 并以给定挂载选项启动 macFUSE。"""
     from macfusepy import FUSE
 
     logger.info(
@@ -356,6 +374,7 @@ def _run_mount(args: argparse.Namespace) -> None:
 
 
 def _run_fsck_command(args: argparse.Namespace) -> None:
+    """运行 ``run_fsck``，按文本或 JSON 输出报告；存在未自动修复项时以退出码 1 结束。"""
     logger.info("开始执行 fsck：repair={}", args.repair)
     report = run_fsck(
         args.path,
@@ -369,6 +388,7 @@ def _run_fsck_command(args: argparse.Namespace) -> None:
 
 
 def _run_scrub_command(args: argparse.Namespace) -> None:
+    """运行 ``run_scrub``（读校验块内容），输出与退出约定同 ``_run_fsck_command``。"""
     logger.info("开始执行 scrub：repair={}", args.repair)
     report = run_scrub(
         args.path,
@@ -382,6 +402,7 @@ def _run_scrub_command(args: argparse.Namespace) -> None:
 
 
 def _run_stats_command(args: argparse.Namespace) -> None:
+    """调用 ``collect_stats``，以可读摘要或 JSON 打印统计（块、 inode、层占用等由实现决定）。"""
     logger.info("开始收集文件系统统计信息")
     report = collect_stats(
         args.path,
@@ -397,6 +418,7 @@ def _run_stats_command(args: argparse.Namespace) -> None:
 
 
 def _run_cleanup_command(args: argparse.Namespace) -> None:
+    """调用 ``cleanup_promoted_cold_copies``，按 ``--age`` 等条件删除过期的冷层残留副本并汇报数量。"""
     logger.info("开始清理已提升块遗留的冷层副本：min_age_seconds={}", args.age)
     report = cleanup_promoted_cold_copies(
         args.path,
@@ -423,6 +445,7 @@ def _run_cleanup_command(args: argparse.Namespace) -> None:
 
 
 def _emit_check_report(report, *, json_output: bool) -> None:
+    """输出 fsck/scrub 报告（文本或 JSON）；若报告中仍有未修复问题则 ``SystemExit(1)``。"""
     if json_output:
         _emit_stdout(json.dumps(report.to_dict(), ensure_ascii=False, sort_keys=True))
     else:
@@ -432,6 +455,7 @@ def _emit_check_report(report, *, json_output: bool) -> None:
 
 
 def _emit_stdout(text: str) -> None:
+    """将字符串写入标准输出，若末尾无换行则追加 ``\\n``。"""
     sys.stdout.write(text)
     if not text.endswith("\n"):
         sys.stdout.write("\n")

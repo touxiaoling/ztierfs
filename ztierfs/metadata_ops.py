@@ -1,4 +1,8 @@
-"""inode 元数据侧 FUSE：getattr、chmod、时间戳、xattr 等与 stat 属性映射。"""
+"""inode 元数据侧 FUSE：getattr、chmod、时间戳、xattr 等与 stat 属性映射。
+
+目录的 `st_nlink` 含子目录贡献的链接计数约定；`st_blocks` 由实际占用字节换算。xattr 的
+CREATE/REPLACE 与 `ENOATTR`（或 `ENODATA` 回落）行为见模块内常量注释。
+"""
 
 import errno
 import os
@@ -19,9 +23,22 @@ MACOS_DELETE_ACCESS = 0x800
 
 
 class MetadataOpsMixin(FileSystemMixinBase):
-    """POSIX 元数据与 xattr；将 SQLite 中的 inode 行映射为 FUSE LowLevelAttr。"""
+    """POSIX 元数据侧 FUSE 回调混入类。
+
+    **getattr / stat 字段**：由 `_attrs_from_node` 把 SQLite 中的 inode 行映射为
+    `LowLevelAttr`；目录的 `st_nlink` 按「2 + 子目录数」计入 `.` 与 `..`；普通文件的
+    `st_blocks` 由实际占用字节（含内联块或分块元数据中的已分配量）按 512 字节向上取整。
+
+    **xattr**：键值存在 `inode_xattrs`；读需 `R_OK`，写/删需 `W_OK`；`XATTR_CREATE` /
+    `XATTR_REPLACE` 与缺失名时的 `ENOATTR`（或平台回落 `ENODATA`）语义见模块顶部常量说明。
+
+    **statfs**：对热层、冷层挂载点分别 `statvfs`，在统一块大小下合并可用/空闲块与 inode 计数。
+
+    **lock**：进程内 POSIX 建议锁（`fcntl` 语义经 `self.locks`）；仅普通文件，目录返回 `EISDIR`。
+    """
 
     def _allocated_bytes_from_node(self, node) -> int:
+        """由 inode 行估算用于 `st_blocks` 的已分配字节数（普通文件含内联或分块占用，目录用 `size`）。"""
         if node["kind"] == "file":
             if node["inline_stored_size"]:
                 return int(node["inline_stored_size"])
@@ -29,6 +46,7 @@ class MetadataOpsMixin(FileSystemMixinBase):
         return int(node["size"])
 
     def _attrs_from_node(self, node) -> LowLevelAttr:
+        """将命名空间中的 inode 记录转为 FUSE `LowLevelAttr`（含目录 `nlink` 与块数换算）。"""
         nlink = (
             2 + self.metadata.child_dir_count(node["id"])
             if node["kind"] == "dir"
@@ -51,6 +69,7 @@ class MetadataOpsMixin(FileSystemMixinBase):
         )
 
     def _getattr(self, path: str, fh=None) -> LowLevelAttr:
+        """按路径或已打开句柄解析 inode，在只读事务中返回 `getattr` 所需的 `LowLevelAttr`。"""
         logger.debug("获取属性：path={}，fh={}", path, fh)
         self._ensure_trash_directory_for_caller()
         with self.metadata.read_transaction():
@@ -58,6 +77,7 @@ class MetadataOpsMixin(FileSystemMixinBase):
             return self._attrs_from_node(node)
 
     def _chmod(self, path: str, mode: int, fh=None) -> None:
+        """内部：处理 chmod。"""
         logger.debug("修改权限：path={}，mode={:o}，fh={}", path, mode, fh)
         self._ensure_trash_directory_for_caller()
         with self.metadata.transaction():
@@ -71,6 +91,7 @@ class MetadataOpsMixin(FileSystemMixinBase):
             )
 
     def _chown(self, path: str, uid: int, gid: int, fh=None) -> None:
+        """内部：处理 chown。"""
         logger.debug("修改所有者：path={}，uid={}，gid={}，fh={}", path, uid, gid, fh)
         self._ensure_trash_directory_for_caller()
         with self.metadata.transaction():
@@ -90,6 +111,7 @@ class MetadataOpsMixin(FileSystemMixinBase):
             )
 
     def _utimens(self, path: str, times, fh=None) -> None:
+        """内部：处理 utimens。"""
         logger.debug("更新时间戳：path={}，times={}，fh={}", path, times, fh)
         self._ensure_trash_directory_for_caller()
         with self.metadata.transaction():
@@ -102,6 +124,7 @@ class MetadataOpsMixin(FileSystemMixinBase):
             logger.debug("更新时间戳完成：path={}，inode={}", path, node["id"])
 
     def _getxattr(self, path: str, name: str) -> bytes:
+        """读取指定扩展属性值；无该名时抛出 `ENOATTR`（或平台等价码）。需对目标节点具备读权限。"""
         logger.debug("读取扩展属性：path={}，name={}", path, name)
         self._ensure_trash_directory_for_caller()
         with self.metadata.read_transaction():
@@ -113,6 +136,7 @@ class MetadataOpsMixin(FileSystemMixinBase):
             return bytes(row["value"])
 
     def _listxattr(self, path: str) -> list[str]:
+        """返回该 inode 上所有扩展属性名的列表；需对目标节点具备读权限。"""
         logger.debug("列出扩展属性：path={}", path)
         self._ensure_trash_directory_for_caller()
         with self.metadata.read_transaction():
@@ -121,6 +145,7 @@ class MetadataOpsMixin(FileSystemMixinBase):
             return self.metadata.xattr_names(node["id"])
 
     def _setxattr(self, path: str, name: str, value: bytes, options: int) -> None:
+        """写入或替换扩展属性；`XATTR_CREATE` 且已存在则 `EEXIST`，`XATTR_REPLACE` 且不存在则 `ENOATTR`。需写权限。"""
         logger.debug(
             "设置扩展属性：path={}，name={}，bytes={}，options={:#x}",
             path,
@@ -143,6 +168,7 @@ class MetadataOpsMixin(FileSystemMixinBase):
             )
 
     def _removexattr(self, path: str, name: str) -> None:
+        """删除指定扩展属性；无该名时抛出 `ENOATTR`。需写权限。"""
         logger.debug("删除扩展属性：path={}，name={}", path, name)
         self._ensure_trash_directory_for_caller()
         with self.metadata.transaction():
@@ -155,6 +181,7 @@ class MetadataOpsMixin(FileSystemMixinBase):
             )
 
     def _require_amode_access(self, node, amode: int) -> None:
+        """内部：处理 require amode access。"""
         posix_amode = amode & (os.R_OK | os.W_OK | os.X_OK)
         if amode & MACOS_DELETE_ACCESS and node["parent_id"] is not None:
             parent = self.metadata.node_by_id(node["parent_id"])
@@ -163,6 +190,7 @@ class MetadataOpsMixin(FileSystemMixinBase):
         self._require_access(node, posix_amode)
 
     def _access(self, path: str, amode: int) -> int:
+        """内部：处理 access。"""
         posix_amode = amode & (os.R_OK | os.W_OK | os.X_OK)
         logger.debug(
             "检查访问权限：path={}，amode={:#x}，posix_amode={:#x}",
@@ -179,6 +207,7 @@ class MetadataOpsMixin(FileSystemMixinBase):
     def _lock_file(
         self, path: str, fh, cmd: int, lock: dict[str, int]
     ) -> dict[str, int] | None:
+        """对普通文件应用进程内 POSIX 建议锁（`cmd`/`lock` 交由 `self.locks`）；非文件返回 `EISDIR`。先在只读事务中解析 inode，再在进程内锁表上更新。"""
         logger.debug("处理文件锁：path={}，fh={}，cmd={}，lock={}", path, fh, cmd, lock)
         with self.metadata.read_transaction():
             node = self._node_from_handle_or_path(path, fh)
@@ -197,12 +226,14 @@ class MetadataOpsMixin(FileSystemMixinBase):
             return result
 
     def _statfs(self) -> dict[str, int]:
+        """合并热层与冷层挂载点的 `statvfs` 结果，按热层片段大小归一化块计数后返回 FUSE `statfs` 字段字典。"""
         logger.debug("读取文件系统容量统计")
         hot = os.statvfs(self.tier1)
         cold = os.statvfs(self.tier2)
         block_size = hot.f_frsize or hot.f_bsize
 
         def blocks(st, attr: str) -> int:
+            """将某一 `statvfs` 结构体中的块计数字段换算为以 `block_size` 为单位的块数。"""
             return getattr(st, attr) * (st.f_frsize or st.f_bsize) // block_size
 
         return {

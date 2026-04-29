@@ -18,6 +18,7 @@ class FileOpsMixin(FileSystemMixinBase):
     """文件相关 FUSE 回调的高层实现（依赖元数据事务与 FileContentService）。"""
 
     def _create(self, path: str, mode: int, flags: int = os.O_RDWR) -> int:
+        """内部：处理 create。"""
         logger.debug(
             "创建或截断文件：path={}，mode={:o}，flags={:#x}", path, mode, flags
         )
@@ -53,12 +54,22 @@ class FileOpsMixin(FileSystemMixinBase):
             return self.handles.new(file_id, self._lock_owner())
 
     def _create_with_attrs(self, path: str, mode: int, flags: int = os.O_RDWR):
+        """内部：处理 create with attrs。"""
         fh = self._create(path, mode, flags)
         with self.metadata.read_transaction():
             node = self._node_from_handle_or_path(path, fh)
             return fh, self._attrs_from_node(node)
 
     def _open(self, path: str, flags: int) -> int:
+        """内部：打开已存在的普通文件（非 create）。
+
+        返回的整数 ``fh`` 是进程内文件句柄，由句柄表分配并与该文件的
+        ``inode``（元数据中的节点 id）绑定；后续读写以 ``fh`` 为准即可
+        定位到同一 inode，即使路径上的目录项被 rename/unlink，只要句柄
+        未 release，仍操作原 inode。``path`` 仅在本次调用时用于解析节点
+        与权限检查。若 ``flags`` 含 ``O_TRUNC``，在内容锁保护下将文件
+        截断为 0 字节后再返回句柄。
+        """
         logger.debug("打开文件：path={}，flags={:#x}", path, flags)
         self._ensure_trash_directory_for_caller()
         with self.metadata.read_transaction():
@@ -75,6 +86,12 @@ class FileOpsMixin(FileSystemMixinBase):
         return self.handles.new(inode_id, self._lock_owner())
 
     def _node_from_handle_or_path(self, path: str, fh) -> Any:
+        """内部：解析本次 I/O 应对应的元数据节点行。
+
+        若 ``fh`` 为有效句柄，优先用其绑定的 ``inode`` 查节点（与路径
+        解耦，适用于已打开文件被改名或删除目录项后仍继续读写的语义）；
+        否则回退为按 ``path`` 查找。二者均失败时抛出 ``ENOENT``。
+        """
         file_id = self.handles.file_id(fh)
         if file_id is not None:
             row = self.metadata.node_by_id(file_id)
@@ -86,6 +103,11 @@ class FileOpsMixin(FileSystemMixinBase):
         return row
 
     def _inode_id_from_handle_or_path(self, path: str, fh) -> int:
+        """内部：解析本次 I/O 的 inode id（与 `_node_from_handle_or_path` 同规则）。
+
+        有有效 ``fh`` 时直接取句柄上的 inode；否则在只读事务内按 ``path``
+        解析。用于在加内容锁前确定锁定的 inode，避免与路径竞态。
+        """
         file_id = self.handles.file_id(fh)
         if file_id is not None:
             return file_id
@@ -93,6 +115,13 @@ class FileOpsMixin(FileSystemMixinBase):
             return self.metadata.get_node(path)["id"]
 
     def _read(self, path: str, size: int, offset: int, fh) -> bytes:
+        """内部：从普通文件按 ``offset`` 起读取最多 ``size`` 字节。
+
+        节点解析遵循「句柄优先、路径兜底」：有效 ``fh`` 绑定打开时的
+        inode；无句柄或句柄无效时再用 ``path``。读路径上会检查读权限、
+        执行分块读取计划、惰性刷新 atime/块访问统计，并可能触发热层降级；
+        另根据顺序读启发式调度预读（见 `_schedule_readahead`）。
+        """
         logger.debug(
             "读取文件：path={}，size={}，offset={}，fh={}", path, size, offset, fh
         )
@@ -125,6 +154,15 @@ class FileOpsMixin(FileSystemMixinBase):
         return data
 
     def _schedule_readahead(self, plan, offset: int, data_len: int, fh) -> None:
+        """内部：在顺序读场景下异步预取后续若干文件块。
+
+        用 ``fh`` 在 `_read_positions` 中记录「上一段已读区间的右端点」；
+        仅当本次读取起点与上次连续（典型顺序读）且配置允许时，才从
+        ``plan`` 最后一个 chunk 起向线程池提交后续 chunk 的预取任务。
+        此处 ``fh`` 是打开句柄键，不是 inode；预取任务内再按 inode id
+        查元数据，避免与 rename 后的路径不一致。非整数 ``fh`` 或关闭
+        预读配置时直接返回。
+        """
         if (
             not isinstance(fh, int)
             or self.readahead_blocks <= 0
@@ -158,6 +196,12 @@ class FileOpsMixin(FileSystemMixinBase):
     def _prefetch_chunk(
         self, file_id: int, chunk_index: int, key: tuple[int, int]
     ) -> None:
+        """内部：预读工作线程执行的单次 chunk 拉取。
+
+        ``file_id`` 为 inode；在只读事务内校验仍为普通文件且未越界后，
+        若该 chunk 已有块映射则经 `BlockStore` 读入快照以预热缓存/冷层
+        copy-up 路径。失败静默；结束时从 `_readahead_inflight` 移除 ``key``。
+        """
         try:
             with self.metadata.read_transaction():
                 node = self.metadata.node_by_id(file_id)
@@ -177,6 +221,12 @@ class FileOpsMixin(FileSystemMixinBase):
                 self._readahead_inflight.discard(key)
 
     def _write(self, path: str, data: bytes, offset: int, fh) -> int:
+        """内部：在 ``offset`` 处写入 ``data``，返回实际写入字节数。
+
+        inode 解析与 `_read` 相同：优先 ``fh`` 绑定的打开 inode，否则
+        ``path``。在内容锁内先只读准备写计划，再写事务提交，以保证
+        chunk/块引用与元数据一致；写后可能触发热层降级检查。
+        """
         logger.debug(
             "写入文件：path={}，bytes={}，offset={}，fh={}", path, len(data), offset, fh
         )
@@ -201,6 +251,12 @@ class FileOpsMixin(FileSystemMixinBase):
         return written
 
     def _truncate(self, path: str, length: int, fh=None) -> None:
+        """内部：将普通文件截断或扩展到 ``length`` 字节。
+
+        ``fh`` 非默认时与打开句柄关联的 inode 对齐（``ftruncate`` 语义）；
+        ``fh`` 为 ``None`` 时仅依赖 ``path``（路径截断）。须写权限；
+        非普通文件报 ``EISDIR``。完成后可能触发热层降级检查。
+        """
         logger.debug("截断文件：path={}，length={}，fh={}", path, length, fh)
         self._ensure_trash_directory_for_caller()
         inode_id = self._inode_id_from_handle_or_path(path, fh)
@@ -220,10 +276,18 @@ class FileOpsMixin(FileSystemMixinBase):
                 self.block_store.demote_cold_blocks()
 
     def _flush(self) -> None:
+        """内部：处理 flush。"""
         logger.debug("刷新元数据事务")
         self.metadata.commit()
 
     def _release(self, fh) -> int:
+        """内部：释放 ``open``/``create`` 返回的句柄 ``fh``。
+
+        从句柄表摘除映射、清除该 ``fh`` 的预读游标、释放本进程对该 inode
+        的 advisory 锁上下文。若该 inode 在进程内已无任何打开句柄，且
+        磁盘上 ``nlink == 0``（已 unlink 的最后一道引用），则在此触发
+        未链接 inode 的数据与元数据清理。返回值对 macFUSE 约定为 0。
+        """
         logger.debug("释放文件句柄：fh={}", fh)
         released = self.handles.release(fh)
         if isinstance(fh, int):
@@ -251,6 +315,7 @@ class FileOpsMixin(FileSystemMixinBase):
         return 0
 
     def _remove_entry_node(self, node) -> None:
+        """内部：处理 remove entry node。"""
         now = time_ns()
         remaining = self.metadata.remove_entry(
             node["parent_id"], node["name"], node["id"], now
@@ -268,12 +333,14 @@ class FileOpsMixin(FileSystemMixinBase):
         self._delete_inode_payload(node)
 
     def _cleanup_unlinked_inode(self, inode_id: int) -> None:
+        """内部：处理 cleanup unlinked inode。"""
         node = self.metadata.node_by_id(inode_id)
         if node is None or node["nlink"] > 0:
             return
         self._delete_inode_payload(node)
 
     def _delete_inode_payload(self, node) -> None:
+        """内部：处理 delete inode payload。"""
         if node["kind"] == "file":
             self.file_content.remove_file_chunks(node["id"])
         logger.debug(

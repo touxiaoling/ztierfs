@@ -1,4 +1,17 @@
-"""一致性检查与校验读取：对照元数据验证块文件与内联载荷。"""
+"""维护侧一致性检查：用 SQLite 元数据对照磁盘上的块文件与内联载荷。
+
+**fsck（`run_fsck`）**：在元数据与路径探测层面核对引用计数、块记录与 `file_chunks`、
+冷热层上块文件是否存在、`blocks` 与 `block_locations` 是否一致、目录项与 chunk
+关系等；不读取整块 payload 做解压与逐字节校验（内联块仅检查是否有对应行/可读路径）。
+
+**scrub（`run_scrub`）**：在 fsck 相同流程之后，对 inode 内联数据与块文件执行读盘、
+按需 zstd 解压，并核对 `stored_size`/`raw_size` 等，用于发现静默损坏或尺寸不一致。
+
+**修复（`repair=True`）**：以 `BEGIN IMMEDIATE` 开启写事务，仅对标记为可修复的问题
+执行回调 SQL/删文件；冷层或外置载荷路径**暂时不可用**（`PathUnavailable`、探测为
+`unavailable`）时，不把「无法核实」当成「缺失」去删无引用块等破坏性操作；真正路径
+不存在（`PathMissing`）才按缺失处理。
+"""
 
 import sqlite3
 
@@ -33,6 +46,7 @@ def run_fsck(
     allow_config_mismatch: bool = False,
     update_config: bool = False,
 ) -> CheckReport:
+    """执行 fsck：元数据与存在性/引用一致性检查，不启用逐块内容校验（`scrub=False`）。"""
     return Checker(
         path,
         tier2,
@@ -53,6 +67,7 @@ def run_scrub(
     allow_config_mismatch: bool = False,
     update_config: bool = False,
 ) -> CheckReport:
+    """执行 scrub：在 fsck 基础上对块与内联 payload 做读盘与解压后的尺寸校验（`scrub=True`）。"""
     return Checker(
         path,
         tier2,
@@ -65,7 +80,10 @@ def run_scrub(
 
 
 class Checker:
-    """打开配置与数据库，执行结构检查、可选修复与按块的 scrub。"""
+    """根据热/冷层与数据库路径解析配置，打开 SQLite，顺序执行各项检查并汇总 `Issue`。
+
+    `scrub` 为真时，`run` 在常规 fsck 步骤之后额外调用 `_scrub_block_payloads`。
+    """
 
     def __init__(
         self,
@@ -78,6 +96,7 @@ class Checker:
         allow_config_mismatch: bool,
         update_config: bool,
     ):
+        """保存 tier1/tier2、数据库与外置 payload 根路径，以及是否修复、是否 scrub 的标志。"""
         paths = resolve_maintenance_paths(
             path,
             tier2,
@@ -94,6 +113,7 @@ class Checker:
         self.issues: list[Issue] = []
 
     def run(self) -> CheckReport:
+        """开启事务（修复模式下 `BEGIN IMMEDIATE`），加载块表与 chunk 引用、扫描磁盘块目录，依次执行块记录、内联载荷、磁盘孤儿、chunk/目录项、`nlink` 检查；若启用 scrub 则校验 payload 内容；提交或出错回滚后返回 `CheckReport`。"""
         command = "scrub" if self.scrub else "fsck"
         logger.info(
             "开始维护检查：command={}，database={}，tier1={}，tier2={}，repair={}",
@@ -152,6 +172,13 @@ class Checker:
         blocks: dict[str, sqlite3.Row],
         actual_refs: dict[str, int],
     ) -> None:
+        """核对 `blocks` 各行：与 `file_chunks` 聚合引用计数是否一致；探测冷热层块文件是否存在。
+
+        区分冷层**暂时不可用**（探测 `unavailable` 且元数据认为应有冷副本或热层缺失）与
+        双 tier 均**确实缺失**文件：前者报 `block_payload_unavailable` 且不对无引用块执行
+        可修复删除；后者报 `missing_block_file`。另覆盖内联块缺行、`hot_present`/`cold_present`
+        与磁盘不符、`preferred_tier` 指向不存在副本、以及 tiered 却未声明任一层等情形。
+        """
         for digest, row in blocks.items():
             actual = actual_refs.get(digest, 0)
             hot_probe = probe_path(block_path(self.tier1, self.tier2, digest, 1))
@@ -305,6 +332,11 @@ class Checker:
     def _check_inline_payload_records(
         self, db: sqlite3.Connection, *, has_block_records: bool
     ) -> None:
+        """检查 `inode_payloads` 与 inode 类型一致性、`block_payloads` 与 `blocks.storage` 一致性。
+
+        当库中尚无任一块元数据时，额外查找「size>0 却无 chunk 且无内联」的文件 inode，
+        报告 `missing_inode_payload`。
+        """
         for row in db.execute(
             """
             SELECT inode_payloads.inode_id, inodes.kind
@@ -391,6 +423,7 @@ class Checker:
         blocks: dict[str, sqlite3.Row],
         disk_blocks: dict[str, set[int]],
     ) -> None:
+        """扫描磁盘上存在、但元数据中不存在（或非 tiered 块）的块文件，报告为孤儿块文件。"""
         for digest, tiers in sorted(disk_blocks.items()):
             if digest in blocks and blocks[digest]["storage"] == "tiered":
                 continue
@@ -405,6 +438,7 @@ class Checker:
             )
 
     def _check_chunk_metadata(self, db: sqlite3.Connection) -> None:
+        """校验 `file_chunks` 指向的块与 inode 是否存在、chunk 尺寸与 `blocks.raw_size` 是否一致、chunk 是否挂在非文件 inode 上，并检查 `dir_entries` 父子 inode 与目录类型。"""
         for row in db.execute(
             """
             SELECT file_chunks.file_id, file_chunks.chunk_index, file_chunks.hash
@@ -475,6 +509,7 @@ class Checker:
             )
 
     def _check_nlinks(self, db: sqlite3.Connection) -> None:
+        """将每个 inode 的 `nlink` 与目录项中实际硬链接计数对比（根 inode 特例为 1）。"""
         rows = db.execute(
             """
             SELECT inodes.id, inodes.kind, inodes.nlink, COUNT(dir_entries.inode_id) AS actual
@@ -505,6 +540,11 @@ class Checker:
     def _scrub_block_payloads(
         self, db: sqlite3.Connection, blocks: dict[str, sqlite3.Row]
     ) -> None:
+        """scrub 阶段：读取 inode 内联与块级内联/分层文件中的 payload，校验压缩与 `stored_size`/`raw_size`/`size`。
+
+        读盘时区分路径缺失（`PathMissing`）与暂时不可读（`PathUnavailable`）；后者记入
+        `block_payload_unavailable` 而非当作内容损坏。
+        """
         for row in db.execute(
             """
             SELECT inodes.id, inodes.size, inode_payloads.payload,
@@ -600,6 +640,7 @@ class Checker:
                     )
 
     def _payload_path_available(self, digest: str, tier: int) -> bool:
+        """探测某层块路径是否可访问：暂时不可用则记录 issue 并返回 False；存在则返回 True。"""
         path = block_path(self.tier1, self.tier2, digest, tier)
         probe = probe_path(path)
         if probe.unavailable:
@@ -614,6 +655,10 @@ class Checker:
     def _inline_payload_bytes(
         self, row: sqlite3.Row, *, issue_context: dict[str, Any]
     ) -> bytes | None:
+        """从内联行读取 payload：`sqlite` 列直接返回字节；外置 store 则按 key 拼路径读文件。
+
+        读失败时根据 `issue_context` 上报 `payload_store_unavailable` 并返回 None。
+        """
         store = (
             row["payload_store"]
             if "payload_store" in row.keys()
@@ -646,6 +691,7 @@ class Checker:
             return None
 
     def _external_payload_path(self, key: str) -> Path:
+        """将外置 payload 的 key 规范化为相对 `payload_store_path`（缺省为 tier1 下 `payload-kv`）的分片路径。"""
         safe = key.replace("/", "_")
         root = self.payload_store_path or self.tier1 / "payload-kv"
         return root / safe[:2] / safe[2:4] / safe
@@ -657,6 +703,7 @@ class Checker:
         payload: bytes,
         location: dict[str, Any],
     ) -> None:
+        """对已读入的块字节校验 `stored_size`，解压后校验与 `raw_size` 是否一致。"""
         if len(payload) != row["stored_size"]:
             self._issue(
                 "stored_size_mismatch",
@@ -690,6 +737,7 @@ class Checker:
             )
 
     def _scan_disk_blocks(self) -> dict[str, set[int]]:
+        """遍历热/冷层 `blocks` 目录，收集 64 位十六进制文件名的摘要及所在 tier；根目录不可扫描时区分暂时不可用与不存在。"""
         found: dict[str, set[int]] = {}
         for tier, root in ((1, self.tier1 / "blocks"), (2, self.tier2 / "blocks")):
             root_probe = probe_path(root)
@@ -745,6 +793,7 @@ class Checker:
         repairable: bool = False,
         repair: Any = None,
     ) -> None:
+        """构造 `Issue`：若 `repair` 且 `repairable` 且提供了 `repair` 可调用对象则执行并标记已修复。"""
         issue = Issue(code, message, details, repairable)
         if self.repair and repairable and repair is not None:
             repair()
@@ -762,6 +811,7 @@ class Checker:
     def _delete_block_record_and_files(
         self, db: sqlite3.Connection, digest: str
     ) -> None:
+        """删除 `blocks` 中指定摘要的行，并尝试删除冷热层上对应块文件。"""
         logger.info("删除无引用块记录和块文件：hash={}", digest[:12])
         db.execute("DELETE FROM blocks WHERE hash = ?", (digest,))
         self._delete_disk_block_files(digest, (1, 2))
@@ -774,6 +824,7 @@ class Checker:
         cold: bool,
         preferred_tier: int,
     ) -> None:
+        """用磁盘上 hot/cold 实际存在情况重写 `block_locations`，并更新 `preferred_tier`。"""
         logger.info(
             "修复块位置元数据：hash={}，hot={}，cold={}，preferred_tier={}",
             digest[:12],
@@ -803,6 +854,7 @@ class Checker:
         digest: str,
         hot: bool,
     ) -> None:
+        """在冷层暂时不可核实场景下，仅同步热层（tier=1）在 `block_locations` 中的存在性。"""
         logger.info("修复热层块位置元数据：hash={}，hot={}", digest[:12], hot)
         if hot:
             db.execute(
@@ -816,10 +868,12 @@ class Checker:
             )
 
     def _delete_disk_block_files(self, digest: str, tiers: tuple[int, ...]) -> None:
+        """对给定 tier 列表逐个调用 `_unlink_block_file` 删除块文件。"""
         for tier in tiers:
             self._unlink_block_file(digest, tier)
 
     def _unlink_block_file(self, digest: str, tier: int) -> None:
+        """探测块路径后删除文件：路径暂时不可用报 `block_payload_unavailable`；已缺失则静默跳过。"""
         try:
             path = block_path(self.tier1, self.tier2, digest, tier)
             probe = probe_path(path)

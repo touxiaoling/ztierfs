@@ -1,4 +1,8 @@
-"""目录树与命名空间：mkdir、link、symlink、rename、readdir 等路径级操作。"""
+"""目录树与命名空间：mkdir、link、symlink、rename、readdir 等路径级操作。
+
+在已规范化路径上操作 inode 与 `dir_entries`；返回的 `errno` 对齐常见 POSIX 期望（如 `ENOTDIR`、
+`EEXIST`）。普通文件字节读写不在此模块。
+"""
 
 import errno
 import os
@@ -15,9 +19,28 @@ RENAME_NOREPLACE = 0x1
 
 
 class NamespaceOpsMixin(FileSystemMixinBase):
-    """路径解析后的目录项与 inode 创建/改名/删除（不含普通文件读写）。"""
+    """在已规范化路径上维护命名空间：目录项的增删改查、硬链接与符号链接、重命名与 macOS clonefile。
+
+    目录相关：``mkdir`` / ``rmdir`` / ``readdir`` 校验父目录写权限与目标类型（如 ``ENOTDIR``、
+    ``EISDIR``、``ENOTEMPTY``）；根目录不可 ``rmdir``（``EBUSY``）。
+
+    ``rename``：支持同 inode 改名无操作、目录不能迁入自身子树（``EINVAL``）、目标存在时可替换
+    （非目录覆盖目录项等类型组合遵循 POSIX）；``flags`` 仅识别 ``RENAME_NOREPLACE``，目标已存在
+    且带该标志时返回 ``EEXIST``；未知 ``flags`` 位返回 ``EINVAL``。
+
+    ``clonefile``：源须为普通文件；在目标父目录下新建**独立** inode，复制分块引用（递增块引用
+    计数）、内联 payload 与扩展属性，**不**重新压缩或重写内容寻址块数据（与 APFS 语义相近的
+    逻辑克隆）。目录或非常规类型会拒绝（``EISDIR`` / ``EINVAL``）；目标路径已有目录项则
+    ``EEXIST``。
+
+    普通文件的字节级读写不在此 mixin。
+    """
 
     def _readdir(self, path: str):
+        """列出目录：返回 ``.``、``..`` 及子项名与属性；要求节点为目录且对调用方可读可进入。
+
+        会更新目录的访问时间（atime）。非目录路径返回 ``ENOTDIR``。
+        """
         logger.debug("读取目录：path={}", path)
         self._ensure_trash_directory_for_caller()
         with self.metadata.transaction():
@@ -46,6 +69,10 @@ class NamespaceOpsMixin(FileSystemMixinBase):
             ]
 
     def _mkdir(self, path: str, mode: int):
+        """在父目录下创建空子目录；``mode`` 的低 12 位与目录类型位写入 inode。
+
+        父目录需写权限与执行权限；同名已存在则 ``EEXIST``。
+        """
         logger.debug("创建目录：path={}，mode={:o}", path, mode)
         self._ensure_trash_directory_for_caller()
         with self.metadata.transaction():
@@ -67,6 +94,7 @@ class NamespaceOpsMixin(FileSystemMixinBase):
             return self._attrs_from_node(node)
 
     def _mknod(self, path: str, mode: int, dev: int):
+        """内部：处理 mknod。"""
         logger.debug(
             "创建设备/普通节点请求：path={}，mode={:o}，dev={}", path, mode, dev
         )
@@ -95,6 +123,7 @@ class NamespaceOpsMixin(FileSystemMixinBase):
             return self._attrs_from_node(node)
 
     def _symlink(self, target: str, source: str):
+        """内部：处理 symlink。"""
         logger.debug("创建符号链接：target={}，source={}", target, source)
         self._ensure_trash_directory_for_caller()
         with self.metadata.transaction():
@@ -119,6 +148,7 @@ class NamespaceOpsMixin(FileSystemMixinBase):
             return self._attrs_from_node(node)
 
     def _readlink(self, path: str) -> str:
+        """内部：处理 readlink。"""
         logger.debug("读取符号链接：path={}", path)
         with self.metadata.transaction():
             node = self.metadata.get_node(path)
@@ -129,6 +159,7 @@ class NamespaceOpsMixin(FileSystemMixinBase):
             return node["symlink_target"]
 
     def _link(self, target: str, source: str) -> None:
+        """内部：处理 link。"""
         logger.debug("创建硬链接：source={}，target={}", source, target)
         self._ensure_trash_directory_for_caller()
         with self.metadata.transaction():
@@ -146,6 +177,12 @@ class NamespaceOpsMixin(FileSystemMixinBase):
             )
 
     def _clonefile(self, source: str, target: str) -> None:
+        """macOS ``clonefile`` 语义：为 ``target`` 新建普通文件 inode，共享源文件的数据分块
+        （增加块引用计数）并复制 xattr / 内联 payload 元数据；不重新哈希、压缩或重写块文件。
+
+        源必须为普通文件（目录 ``EISDIR``，其它类型 ``EINVAL``）；需对源有读权限，对目标父
+        目录有写+执行权限；``target`` 最后一级名在父目录下不得已存在（``EEXIST``）。
+        """
         logger.debug("clonefile：source={}，target={}", source, target)
         self._ensure_trash_directory_for_caller()
         with self.metadata.transaction():
@@ -178,6 +215,7 @@ class NamespaceOpsMixin(FileSystemMixinBase):
             )
 
     def _unlink(self, path: str) -> None:
+        """内部：处理 unlink。"""
         logger.debug("删除文件目录项：path={}", path)
         self._ensure_trash_directory_for_caller()
         with self.metadata.transaction():
@@ -190,6 +228,11 @@ class NamespaceOpsMixin(FileSystemMixinBase):
             logger.debug("删除文件目录项完成：path={}，inode={}", path, node["id"])
 
     def _rmdir(self, path: str) -> None:
+        """删除**空**目录：移除目录项并在无硬链接时回收 inode。
+
+        非目录返回 ``ENOTDIR``；根 inode（通常为 1）返回 ``EBUSY``；仍有子项返回
+        ``ENOTEMPTY``。父目录需写权限与执行权限。
+        """
         logger.debug("删除目录：path={}", path)
         self._ensure_trash_directory_for_caller()
         with self.metadata.transaction():
@@ -206,6 +249,17 @@ class NamespaceOpsMixin(FileSystemMixinBase):
             logger.debug("删除目录完成：path={}，inode={}", path, node["id"])
 
     def _rename(self, old: str, new: str, flags: int) -> None:
+        """将 ``old`` 所指的目录项移动到 ``new``（可跨父目录）；源与目标父目录均需写+执行权限。
+
+        ``flags``：除 ``RENAME_NOREPLACE``（0x1）外若有其它位则 ``EINVAL``。带
+        ``RENAME_NOREPLACE`` 且目标名已存在则 ``EEXIST``。若目标与源为同一 inode 与路径
+        语义上的同一项则直接返回。
+
+        若目标已存在且允许替换：文件/目录/符号链接类型组合需合法（例如不能把目录项改名为已存在
+        非目录名等）；替换目录时该目录必须为空（``ENOTEMPTY``）。若源为目录，新父目录不能是
+        源目录的后代（``EINVAL``）。替换目标会先 ``unlink`` 式移除目标目录项（含 inode 回收
+        规则由下层实现）。
+        """
         logger.debug("重命名：old={}，new={}，flags={:#x}", old, new, flags)
         if flags & ~RENAME_NOREPLACE:
             logger.warning(

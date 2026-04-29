@@ -1,4 +1,4 @@
-"""作为模块运行时转调 CLI（等价于 `python -m ztierfs`）。"""
+"""`python -m ztierfs` 的包入口：将执行转交给 `ztierfs.cli.main`。"""
 
 from .cli import main
 

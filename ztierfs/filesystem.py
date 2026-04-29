@@ -1,4 +1,11 @@
-"""组装 ZTierFS：组合 FUSE 与各领域 mixin，并完成元数据、块层、句柄等初始化。"""
+"""组装可挂载的 `ZTierFS`：按 MRO 将 inode 级 FUSE、文件内容、命名空间、元数据与权限等 mixin 组合在一起。
+
+本模块负责构造期的组件接线与共享状态字段：解析冷热层路径、打开 SQLite `MetadataStore`、
+校验或写入 `filesystem_config`、再挂接 `HandleTable`、`AdvisoryLockTable`、`BlockStore` 与
+`FileContentService`。读前瞻与 `OperationProfiler` 的参数字段在此落盘，实际调度与日志输出
+在其它 mixin（如读路径上的预取、FUSE `init`/`destroy`）中完成。根下 macOS 回收站目录
+（`.Trashes` / `.Trashes/<uid>/`）按调用方 UID 惰性确保，见 `_ensure_trash_directory_for_caller`。
+"""
 
 import os
 import threading
@@ -51,7 +58,7 @@ class ZTierFS(
     InodeLocksMixin,
     LoggingMixIn,
 ):
-    """基于 SQLite、内容寻址块和 POSIX 元数据语义的可写 FUSE 文件系统。"""
+    """可挂载的 FUSE 实例骨架：具体回调与语义由各 mixin 实现，`cli` 解析参数后构造本类并交给 macfusepy。"""
 
     def __init__(
         self,
@@ -79,6 +86,35 @@ class ZTierFS(
         profile_interval_seconds: float = 0,
         caller_provider: Callable[[], tuple[int, int, int]] | None = None,
     ):
+        """构造文件系统内核对象并完成组件接线。
+
+        路径与策略：将 `tier1`/`tier2` 解析为热层与冷层根目录，默认在热层放置 SQLite 库
+        （可用 `database` 覆盖）；创建 `blocks` 子目录与库父目录。分块大小、热层水位、受保护
+        前缀块数、冷层副本清理年龄等写入 `TieringPolicy` 并交给 `BlockStore`；压缩级别、最小
+        压缩长度、跳过后缀集合与内联阈值同时约束块层与 `FileContentService`。
+
+        元数据与内联 payload：`payload_store` 为 ``sqlite`` 时内联数据在库内；为 ``filekv`` 时
+        使用 `payload_store_path`（默认 `tier1/payload-kv`）下的键值存储。`sqlite_synchronous`
+        控制 SQLite 同步模式。`update_config` 与已有 `filesystem_config` 不一致时的行为见
+        `_ensure_filesystem_config`。
+
+        组件顺序：在持锁的 `MetadataStore` 就绪并写入配置后，依次构造进程内 `HandleTable`、
+        POSIX 建议锁表 `AdvisoryLockTable`、`BlockStore`（内容寻址块与冷热迁移）以及
+        `FileContentService`（分块读写、稀疏与截断等）。全局 `threading.RLock` 供元数据与
+        句柄表共用；按 inode 的 `_content_locks` 与按文件句柄的 `_read_positions` 在此初始化，
+        供 mixin 在读写与顺序读检测中使用。
+
+        读前瞻：`readahead_blocks` / `readahead_workers` 保存为实例属性；`_readahead_executor`
+        初始为 ``None``，在首次需要预取时由读路径惰性创建线程池（名称前缀 ``ztierfs-readahead``），
+        `_readahead_inflight` 与 `_readahead_lock` 用于去重并发预取任务。任一为 0 时关闭预读。
+
+        性能采样：`profile_interval_seconds > 0` 时创建 `OperationProfiler`，按间隔汇总并
+        记录热点操作；为 0 则不分配采样器。`caller_provider` 默认绑定 `fuse_get_context` 以取得
+        ``(uid, gid, pid)``；测试或非标准上下文中可注入替代实现。
+
+        回收站：`_ensured_trash_uids` 记录已为哪些 UID 在元数据中确保过 `.Trashes` 布局；
+        实际创建在 `_ensure_trash_directory_for_caller` 中按请求上下文惰性执行。
+        """
         if chunk_size <= 0:
             raise ValueError("chunk_size must be positive")
         if inline_max_bytes < 0:
@@ -214,9 +250,16 @@ class ZTierFS(
         )
 
     def _compression_allowed(self, path: str) -> bool:
+        """根据构造期配置的已知已压缩后缀集合，判断给定 POSIX 路径是否允许再走 zstd。"""
         return compression_allowed(path, self.compressed_suffixes)
 
     def _ensure_filesystem_config(self, *, update_config: bool) -> None:
+        """将当前冷热层路径与 payload 存储选择持久化到 `filesystem_config`，并与已有记录对齐。
+
+        库中尚无配置或 `update_config` 为真时，直接写入期望字段。否则逐项比对：若与当前
+        进程传入的路径或 `payload_store` 选择不一致，抛出 `RuntimeError`，提示应使用
+        CLI 的 ``--update-config`` 显式改写本地配置，避免误用属于其它挂载点的数据库文件。
+        """
         payload_store_path = (
             str(self.payload_store_path)
             if self.payload_store_path is not None
@@ -247,6 +290,12 @@ class ZTierFS(
                 )
 
     def _ensure_trash_directory_for_caller(self) -> None:
+        """按 FUSE 调用方 UID/GID 在根 inode 下确保 macOS 回收站目录树存在（幂等）。
+
+        在元数据事务中调用 `ensure_trash_directories`：根级 ``.Trashes``（粘滞位、属主 root）
+        及 ``.Trashes/<uid>/``（属主为当前用户）。同一 UID 在进程内只执行一次元数据写入，
+        后续依赖 `_ensured_trash_uids` 短路；Finder 等将文件移入废纸篓前需此布局。
+        """
         uid, gid, _pid = self._caller_ids()
         if uid in self._ensured_trash_uids:
             return

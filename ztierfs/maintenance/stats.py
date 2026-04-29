@@ -1,4 +1,7 @@
-"""从元数据库汇总空间、块与 inode 用量等统计。"""
+"""从 SQLite 元数据库读取维护用统计，组装为 `StatsReport`。
+
+`StatsReport` 五段（`inodes` / `entries` / `chunks` / `blocks` / `storage`）均为 SQL 聚合结果，彼此维度不同，不可直接相加等同「磁盘占用」或「用户可见文件总大小」。例如 `blocks.total` 是 `blocks` 表行数；`storage.logical_file_bytes` 是普通文件 inode 上记录的 `size` 之和；去重与压缩会使 `unique_raw_bytes`、`stored_bytes` 与逻辑大小不一致。
+"""
 
 from pathlib import Path
 
@@ -10,6 +13,7 @@ from .reports import StatsReport
 
 
 def scalar(db, sql: str) -> int:
+    """执行只返回单行单列的 SQL（如 ``COUNT(*)``、``COALESCE(SUM(...), 0)``），取第一列并转为 ``int``。"""
     return int(db.execute(sql).fetchone()[0])
 
 
@@ -21,6 +25,34 @@ def collect_stats(
     allow_config_mismatch: bool = False,
     update_config: bool = False,
 ) -> StatsReport:
+    """解析维护路径并打开元数据库，用聚合查询填充 `StatsReport`。
+
+    **inodes**：由 ``SELECT kind, COUNT(*) ... GROUP BY kind`` 得到各类 inode 个数；返回中的 ``total`` 为各类之和，``files``/``directories``/``symlinks`` 分别对应 ``kind`` 为 ``file``/``dir``/``symlink`` 的 ``COUNT(*)``。
+
+    **entries**：``dir_entries`` 为 ``COUNT(*)``，目录项（名字 → inode）总行数。
+
+    **chunks**：``file_chunks`` 为 ``COUNT(*)``，文件块映射表总行数（描述文件逻辑区间与块 ``hash`` 的对应关系）。
+
+    **blocks**（均为 ``COUNT(*)``，计数对象略有不同）：
+
+    - ``total``：``blocks`` 表行数（内容寻址块记录总数）。
+    - ``inline``：``storage_kind = 'inline'`` 的块（小块元数据记在 ``blocks``，载荷可在 SQLite）。
+    - ``inode_inline``：``inode_payloads`` 表 ``COUNT(*)``（inode 侧内联载荷行数，与 ``blocks.inline`` 分列统计）。
+    - ``hot``：``storage_kind = 'tiered'`` 且在 ``block_locations`` 中存在 ``tier = 1`` 的块（与热层位置表关联后的行数意义上的「有热层副本」的块数）。
+    - ``cold``：同上但 ``tier = 2``（冷层）。
+    - ``both``：同时关联到 ``tier = 1`` 与 ``tier = 2`` 的 ``tiered`` 块（例如迁移中间态或双副本策略下的块数）。
+    - ``compressed``：``compressed = 1`` 的块行数。
+
+    **storage**（字节和；多处为 ``SUM``，无行时 ``COALESCE(..., 0)``）：
+
+    - ``logical_file_bytes``：``inodes`` 中 ``kind = 'file'`` 的 ``SUM(size)``，即各普通文件当前逻辑长度之和（稀疏/洞不一定反映在未引用块上）。
+    - ``referenced_chunk_bytes``：``file_chunks.size`` 的 ``SUM``，chunk 行声明覆盖的字节总量（与 inode size、块去重关系需分开理解）。
+    - ``unique_raw_bytes``：``blocks.raw_size`` 与 ``inode_payloads.raw_size`` 两段 ``SUM`` 相加，未压缩载荷字节总量（去重后按块/内联存储计）。
+    - ``stored_bytes``：``blocks.stored_size`` 与 ``inode_payloads.stored_size`` 两段 ``SUM`` 相加，实际持久化字节（含压缩等）。
+    - ``inode_inline_stored_bytes``：仅 ``inode_payloads`` 的 ``SUM(stored_size)``。
+    - ``inline_stored_bytes``：仅 ``blocks`` 且 ``storage_kind = 'inline'`` 的 ``SUM(stored_size)``。
+    - ``hot_stored_bytes`` / ``cold_stored_bytes``：``tiered`` 块按 ``block_locations`` 连接至 ``tier = 1`` 或 ``2`` 后对 ``blocks.stored_size`` 求和（按层统计占用；同一 ``tiered`` 块若在两 tier 均有位置，两段 ``SUM`` 可能各计一份，与 ``both`` 语义一致）。
+    """
     paths = resolve_maintenance_paths(
         path,
         tier2,

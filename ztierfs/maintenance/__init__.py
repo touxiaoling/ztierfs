@@ -1,4 +1,4 @@
-"""离线维护：fsck、scrub、统计、冷层副本清理与路径解析。"""
+"""离线维护入口：fsck/scrub、统计报表、冷层晋升副本清理，以及块与数据库路径辅助。"""
 
 from .checker import run_fsck, run_scrub
 from .cleanup import CleanupReport, cleanup_promoted_cold_copies
