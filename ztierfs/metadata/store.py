@@ -81,7 +81,11 @@ class MetadataStore(
         self._deferred_access_flush_blocks = deferred_access_flush_blocks
         self._deferred_access_flush_ns = deferred_access_flush_ns
         logger.info("初始化 SQLite 元数据存储：path={}", path)
-        self.setup()
+        try:
+            self.setup()
+        except Exception:
+            self._pool.close()
+            raise
 
     def close(self) -> None:
         """先在有延迟访问时通过一次空写事务刷盘并提交（见 `transaction`），再关闭连接池。"""

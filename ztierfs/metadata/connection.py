@@ -67,6 +67,9 @@ def open_database(
     使用 `TimedConnection` 作为连接类、`isolation_level=None`（自动提交模式由上层事务控制）、
     `check_same_thread=False` 以配合连接池跨线程复用。若未传入 `pragmas`，则用
     `busy_timeout_ms` 参数或默认忙等待构造 `SQLitePragmas`。
+
+    将返回值用作 ``with open_database(...) as db`` 时，退出上下文只处理事务提交/回滚，
+    **不会** ``close()`` 连接；一次性使用请包一层 ``contextlib.closing``（维护 CLI 已如此）。
     """
     logger.debug("打开 SQLite 连接：path={}", path)
     pragmas = pragmas or SQLitePragmas(
@@ -117,6 +120,7 @@ class ConnectionPool:
         self._condition = threading.Condition()
         self._created = 0
         self._closed = False
+        self._connections: set[sqlite3.Connection] = set()
         logger.debug("创建 SQLite 连接池：path={}，max_size={}", path, max_size)
 
     @contextmanager
@@ -153,7 +157,9 @@ class ConnectionPool:
                 logger.debug(
                     "连接池创建新连接：path={}，created={}", self.path, self._created
                 )
-                return open_database(self.path, pragmas=self.pragmas)
+                db = open_database(self.path, pragmas=self.pragmas)
+                self._connections.add(db)
+                return db
             except Exception:
                 with self._condition:
                     self._created -= 1
@@ -167,6 +173,7 @@ class ConnectionPool:
         with self._condition:
             if self._closed:
                 db.close()
+                self._connections.discard(db)
                 raise RuntimeError("connection pool is closed")
         return db
 
@@ -175,6 +182,7 @@ class ConnectionPool:
         with self._condition:
             if self._closed:
                 db.close()
+                self._connections.discard(db)
                 return
         self._available.put(db)
 
@@ -190,6 +198,10 @@ class ConnectionPool:
             except Empty:
                 break
             db.close()
+            self._connections.discard(db)
+        for db in list(self._connections):
+            db.close()
+        self._connections.clear()
 
 
 class ReadWriteLock:

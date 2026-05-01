@@ -22,6 +22,19 @@ from ztierfs.inode_fuse import (
 )
 from ztierfs.pathing import split_path
 
+_test_ztierfs_instances: list[ZTierFS] = []
+
+
+@contextmanager
+def connect_sqlite(database):
+    """测试用短连接：成功路径 ``commit``，且始终 ``close``（避免依赖 ``with sqlite3.connect`` 的提交语义）。"""
+    conn = sqlite3.connect(database)
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
 
 class TestOperationsAdapter:
     def __init__(self, operations: ZTierFS):
@@ -206,7 +219,7 @@ def adapted(operations):
 
 
 def rows(fs: ZTierFS, sql: str):
-    with sqlite3.connect(fs.database) as db:
+    with connect_sqlite(fs.database) as db:
         db.row_factory = sqlite3.Row
         return db.execute(sql).fetchall()
 
@@ -250,7 +263,7 @@ def user_dir_entry_rows(fs: ZTierFS):
 
 
 def make_fs(tmp_path, **kwargs):
-    return ZTierFS(
+    fs = ZTierFS(
         tmp_path / "hot",
         tmp_path / "cold",
         tmp_path / "metadata.sqlite3",
@@ -258,6 +271,13 @@ def make_fs(tmp_path, **kwargs):
         hot_cache_max_bytes=kwargs.pop("hot_cache_max_bytes", 0),
         **kwargs,
     )
+    _test_ztierfs_instances.append(fs)
+    return fs
+
+
+def close_registered_ztierfs_instances() -> None:
+    while _test_ztierfs_instances:
+        _test_ztierfs_instances.pop().close()
 
 
 def unmount(path: Path):
@@ -328,3 +348,7 @@ def mounted_ztierfs(tmp_path):
         if process.poll() is None:
             process.kill()
             process.wait(timeout=5)
+        if process.stdout:
+            process.stdout.close()
+        if process.stderr:
+            process.stderr.close()

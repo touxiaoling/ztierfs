@@ -6,7 +6,62 @@ import pytest
 from macfusepy import FuseOSError
 from stat import S_IFDIR, S_IFLNK, S_IFMT, S_IMODE
 
+from ztierfs.pathing import normalize_path
+
 from .helpers import adapted, make_fs, rows, user_dir_entry_rows, user_inode_rows
+
+
+def test_ztierfs_rejects_invalid_paths_and_supports_name_max_components(tmp_path):
+    fs_impl = make_fs(tmp_path)
+
+    for path in ("", "relative/path", "/bad\x00name"):
+        with pytest.raises(FuseOSError) as exc:
+            normalize_path(path)
+        assert exc.value.errno == errno.EINVAL
+
+    long_name = "n" * 255
+    with adapted(fs_impl) as fs:
+        fh = fs("create", f"/{long_name}", 0o644)
+        fs("write", f"/{long_name}", b"ok", 0, fh)
+        assert fs("read", f"/{long_name}", 2, 0, fh) == b"ok"
+        assert long_name in fs("readdir", "/", None)
+
+
+def test_ztierfs_preserves_zero_byte_files_without_blocks(tmp_path):
+    fs_impl = make_fs(tmp_path)
+
+    with adapted(fs_impl) as fs:
+        fh = fs("create", "/empty.txt", 0o644)
+        assert fs("getattr", "/empty.txt")["st_size"] == 0
+        assert fs("read", "/empty.txt", 64, 0, fh) == b""
+        fs("release", "/empty.txt", fh)
+
+    assert rows(fs_impl, "SELECT * FROM file_chunks") == []
+    assert rows(fs_impl, "SELECT * FROM blocks") == []
+
+    reopened = make_fs(tmp_path)
+    with adapted(reopened) as fs:
+        fh = fs("open", "/empty.txt", os.O_RDONLY)
+        assert fs("read", "/empty.txt", 64, 0, fh) == b""
+
+
+def test_ztierfs_handles_reads_and_writes_on_exact_chunk_boundaries(tmp_path):
+    fs_impl = make_fs(tmp_path, chunk_size=8, inline_max_bytes=0)
+
+    with adapted(fs_impl) as fs:
+        fh = fs("create", "/boundary.bin", 0o644)
+        assert fs("write", "/boundary.bin", b"abcdefgh", 0, fh) == 8
+        assert fs("write", "/boundary.bin", b"XYZ", 8, fh) == 3
+
+        assert fs("read", "/boundary.bin", 11, 0, fh) == b"abcdefghXYZ"
+        assert fs("read", "/boundary.bin", 4, 7, fh) == b"hXYZ"
+        assert fs("getattr", "/boundary.bin")["st_size"] == 11
+
+    chunk_rows = rows(
+        fs_impl,
+        "SELECT chunk_index FROM file_chunks ORDER BY chunk_index",
+    )
+    assert [row["chunk_index"] for row in chunk_rows] == [0, 1]
 
 
 def test_ztierfs_handles_sparse_and_partial_writes(tmp_path):
@@ -256,6 +311,33 @@ def test_ztierfs_reports_expected_errors(tmp_path):
             fs("rename", "/docs", "/docs/child", 0)
 
 
+def test_ztierfs_reports_precise_namespace_error_numbers(tmp_path):
+    fs_impl = make_fs(tmp_path)
+
+    with adapted(fs_impl) as fs:
+        fs("mkdir", "/parent", 0o755)
+        fs("mkdir", "/parent/child", 0o755)
+        file_fh = fs("create", "/file.txt", 0o644)
+
+        with pytest.raises(FuseOSError) as exc:
+            fs("rmdir", "/parent")
+        assert exc.value.errno == errno.ENOTEMPTY
+
+        with pytest.raises(FuseOSError) as exc:
+            fs("rename", "/file.txt", "/renamed.txt", 0x2)
+        assert exc.value.errno == errno.EINVAL
+
+        with pytest.raises(FuseOSError) as exc:
+            fs("rename", "/file.txt", "/parent", 0)
+        assert exc.value.errno == errno.EISDIR
+
+        with pytest.raises(FuseOSError) as exc:
+            fs("rename", "/parent", "/file.txt", 0)
+        assert exc.value.errno == errno.ENOTDIR
+
+        fs("release", "/file.txt", file_fh)
+
+
 def test_ztierfs_supports_symlinks(tmp_path):
     fs_impl = make_fs(tmp_path)
 
@@ -345,6 +427,42 @@ def test_ztierfs_enforces_basic_mode_permissions(tmp_path, monkeypatch):
         assert fs("read", "/private.txt", 6, 0, readable) == b"secret"
 
 
+def test_ztierfs_denies_writes_and_metadata_changes_without_permission(
+    tmp_path, monkeypatch
+):
+    owner_uid = os.getuid()
+    owner_gid = os.getgid()
+    if owner_uid == 0:
+        pytest.skip("root bypasses normal write permission checks")
+    other_uid = owner_uid + 10000
+    other_gid = owner_gid + 10000
+    fs_impl = make_fs(
+        tmp_path, caller_provider=lambda: (owner_uid, owner_gid, 1234)
+    )
+
+    with adapted(fs_impl) as fs:
+        fh = fs("create", "/readonly.txt", 0o644)
+        fs("write", "/readonly.txt", b"data", 0, fh)
+        fs("chmod", "/readonly.txt", 0o444)
+
+        with pytest.raises(FuseOSError) as exc:
+            fs("write", "/readonly.txt", b"x", 0, fh)
+        assert exc.value.errno == errno.EACCES
+
+        with pytest.raises(FuseOSError) as exc:
+            fs("setxattr", "/readonly.txt", "user.note", b"value", 0, 0)
+        assert exc.value.errno == errno.EACCES
+
+        monkeypatch.setattr(
+            fs_impl, "_caller_provider", lambda: (other_uid, other_gid, 1235)
+        )
+        with pytest.raises(FuseOSError) as exc:
+            fs("chmod", "/readonly.txt", 0o644)
+        assert exc.value.errno == errno.EPERM
+
+        assert fs("read", "/readonly.txt", 4, 0, fh) == b"data"
+
+
 def test_ztierfs_advisory_locks_conflict_by_owner(tmp_path, monkeypatch):
     fs_impl = make_fs(tmp_path)
     uid = os.getuid()
@@ -398,3 +516,26 @@ def test_ztierfs_advisory_locks_conflict_by_owner(tmp_path, monkeypatch):
             fcntl.F_SETLK,
             {"l_type": fcntl.F_RDLCK, "l_start": 0, "l_len": 10, "l_pid": 1002},
         )
+
+
+def test_ztierfs_read_beyond_eof_returns_empty(tmp_path):
+    fs_impl = make_fs(tmp_path)
+    with adapted(fs_impl) as fs:
+        fh = fs("create", "/small.txt", 0o644)
+        fs("write", "/small.txt", b"abc", 0, fh)
+        assert fs("read", "/small.txt", 10, 0, fh) == b"abc"
+        assert fs("read", "/small.txt", 10, 3, fh) == b""
+        assert fs("read", "/small.txt", 5, 10, fh) == b""
+        fs("release", "/small.txt", fh)
+
+
+def test_ztierfs_write_spanning_chunk_boundary(tmp_path):
+    """默认 chunk_size=1024：在 1023 处写 2 字节应落到相邻两块。"""
+    fs_impl = make_fs(tmp_path, inline_max_bytes=0)
+    with adapted(fs_impl) as fs:
+        fh = fs("create", "/span.txt", 0o644)
+        fs("write", "/span.txt", b"x" * 1023, 0, fh)
+        fs("write", "/span.txt", b"yz", 1023, fh)
+        assert fs("getattr", "/span.txt")["st_size"] == 1025
+        assert fs("read", "/span.txt", 1025, 0, fh) == b"x" * 1023 + b"yz"
+        fs("release", "/span.txt", fh)

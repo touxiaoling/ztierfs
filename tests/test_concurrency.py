@@ -11,7 +11,7 @@ from macfusepy import FuseOSError
 import ztierfs.metadata.store as store_module
 from ztierfs.metadata import ConnectionPool
 
-from .helpers import adapted, make_fs, rows, user_dir_entry_rows, user_inode_rows
+from .helpers import adapted, connect_sqlite, make_fs, rows, user_dir_entry_rows, user_inode_rows
 
 
 def _assert_no_refcount_drift(fs_impl) -> None:
@@ -145,7 +145,7 @@ def test_ztierfs_handles_parallel_reads_and_writes_without_refcount_drift(tmp_pa
 
     _assert_no_refcount_drift(fs_impl)
 
-    with sqlite3.connect(fs_impl.database) as db:
+    with connect_sqlite(fs_impl.database) as db:
         assert db.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
 
 

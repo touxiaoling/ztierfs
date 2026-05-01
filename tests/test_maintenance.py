@@ -16,7 +16,7 @@ from ztierfs.maintenance import (
 )
 from ztierfs.tier_access import PathUnavailable
 
-from .helpers import adapted, make_fs, rows
+from .helpers import adapted, connect_sqlite, make_fs, rows
 
 
 def _make_cold_only_block(fs_impl, data: bytes = b"hello") -> tuple[str, bytes, Path]:
@@ -29,7 +29,7 @@ def _make_cold_only_block(fs_impl, data: bytes = b"hello") -> tuple[str, bytes, 
     cold_path = block_path(fs_impl.tier1, fs_impl.tier2, digest, 2)
     cold_path.parent.mkdir(parents=True, exist_ok=True)
     hot_path.replace(cold_path)
-    with sqlite3.connect(fs_impl.database) as db:
+    with connect_sqlite(fs_impl.database) as db:
         db.execute("DELETE FROM block_locations WHERE hash = ? AND tier = 1", (digest,))
         db.execute(
             "INSERT OR IGNORE INTO block_locations (hash, tier) VALUES (?, 2)",
@@ -143,7 +143,7 @@ def test_fsck_repairs_block_refcount_mismatch(tmp_path):
         fs("write", "/note.txt", b"hello", 0, fh)
 
     digest = rows(fs_impl, "SELECT hash FROM blocks")[0]["hash"]
-    with sqlite3.connect(fs_impl.database) as db:
+    with connect_sqlite(fs_impl.database) as db:
         db.execute("UPDATE blocks SET refcount = 99 WHERE hash = ?", (digest,))
 
     report = run_fsck(fs_impl.tier1, fs_impl.tier2, fs_impl.database, repair=True)
@@ -186,7 +186,7 @@ def test_fsck_repairs_unreferenced_block_record_and_file(tmp_path):
 
     digest = rows(fs_impl, "SELECT hash FROM blocks")[0]["hash"]
     path = block_path(fs_impl.tier1, fs_impl.tier2, digest, 1)
-    with sqlite3.connect(fs_impl.database) as db:
+    with connect_sqlite(fs_impl.database) as db:
         db.execute("DELETE FROM file_chunks")
 
     report = run_fsck(fs_impl.tier1, fs_impl.tier2, fs_impl.database, repair=True)
@@ -206,7 +206,7 @@ def test_fsck_reports_missing_inline_payload_record(tmp_path):
         fs("write", "/note.txt", b"a" * 1024, 0, fh)
 
     digest = rows(fs_impl, "SELECT hash FROM blocks")[0]["hash"]
-    with sqlite3.connect(fs_impl.database) as db:
+    with connect_sqlite(fs_impl.database) as db:
         db.execute("DELETE FROM block_payloads WHERE hash = ?", (digest,))
 
     report = run_fsck(fs_impl.tier1, fs_impl.tier2, fs_impl.database, repair=True)
@@ -220,7 +220,7 @@ def test_fsck_reports_missing_inode_payload_record(tmp_path):
         fh = fs("create", "/note.txt", 0o644)
         fs("write", "/note.txt", b"hello", 0, fh)
 
-    with sqlite3.connect(fs_impl.database) as db:
+    with connect_sqlite(fs_impl.database) as db:
         db.execute("DELETE FROM inode_payloads")
 
     report = run_fsck(fs_impl.tier1, fs_impl.tier2, fs_impl.database, repair=True)
@@ -358,7 +358,7 @@ def test_cleanup_removes_old_promoted_cold_copy(tmp_path):
     cold_path = block_path(fs_impl.tier1, fs_impl.tier2, digest, 2)
     cold_path.parent.mkdir(parents=True, exist_ok=True)
     cold_path.write_bytes(hot_path.read_bytes())
-    with sqlite3.connect(fs_impl.database) as db:
+    with connect_sqlite(fs_impl.database) as db:
         db.execute(
             """
             UPDATE blocks SET preferred_tier = 1, last_promoted_ns = ? WHERE hash = ?
@@ -395,7 +395,7 @@ def test_cleanup_skips_cold_copy_when_cold_tier_unavailable(tmp_path, monkeypatc
     cold_path = block_path(fs_impl.tier1, fs_impl.tier2, digest, 2)
     cold_path.parent.mkdir(parents=True, exist_ok=True)
     cold_path.write_bytes(hot_path.read_bytes())
-    with sqlite3.connect(fs_impl.database) as db:
+    with connect_sqlite(fs_impl.database) as db:
         db.execute(
             "UPDATE blocks SET preferred_tier = 1, last_promoted_ns = ? WHERE hash = ?",
             (time_ns() - 10_000_000_000, digest),
@@ -424,7 +424,7 @@ def test_cleanup_skips_cold_copy_when_cold_tier_unavailable(tmp_path, monkeypatc
 def test_schema_rejects_invalid_metadata_rows(tmp_path):
     fs_impl = make_fs(tmp_path)
     try:
-        with sqlite3.connect(fs_impl.database) as db:
+        with connect_sqlite(fs_impl.database) as db:
             with pytest.raises(sqlite3.IntegrityError):
                 db.execute(
                     """
@@ -460,7 +460,7 @@ def test_schema_rejects_invalid_metadata_rows(tmp_path):
 
 def test_schema_version_mismatch_is_rejected(tmp_path):
     database = tmp_path / "metadata.sqlite3"
-    with sqlite3.connect(database) as db:
+    with connect_sqlite(database) as db:
         db.execute("PRAGMA user_version=1")
 
     with pytest.raises(RuntimeError, match="unsupported metadata schema version"):
@@ -486,7 +486,7 @@ def test_fsck_reports_chunk_and_directory_metadata_corruption(
         fs("write", "/note.txt", b"hello", 0, fh)
 
     digest = rows(fs_impl, "SELECT hash FROM blocks")[0]["hash"]
-    with sqlite3.connect(fs_impl.database) as db:
+    with connect_sqlite(fs_impl.database) as db:
         db.execute("PRAGMA foreign_keys=OFF")
         if corrupt == "missing_block":
             db.execute("DELETE FROM blocks WHERE hash = ?", (digest,))
@@ -521,7 +521,7 @@ def test_fsck_repairs_nlink_mismatch(tmp_path):
         fh = fs("create", "/note.txt", 0o644)
         fs("write", "/note.txt", b"hello", 0, fh)
 
-    with sqlite3.connect(fs_impl.database) as db:
+    with connect_sqlite(fs_impl.database) as db:
         db.execute("UPDATE inodes SET nlink = 99 WHERE kind = 'file'")
 
     report = run_fsck(fs_impl.tier1, fs_impl.tier2, fs_impl.database, repair=True)
@@ -541,7 +541,7 @@ def test_fsck_repairs_inline_payload_table_corruption(tmp_path):
 
     digest = rows(fs_impl, "SELECT hash FROM blocks")[0]["hash"]
     orphan_digest = "c" * 64
-    with sqlite3.connect(fs_impl.database) as db:
+    with connect_sqlite(fs_impl.database) as db:
         db.execute("PRAGMA foreign_keys=OFF")
         db.execute(
             "INSERT INTO block_payloads (hash, payload) VALUES (?, ?)",
@@ -571,7 +571,7 @@ def test_fsck_repairs_inode_payload_table_corruption(tmp_path):
     directory_inode = rows(
         fs_impl, "SELECT inode_id FROM dir_entries WHERE name = 'docs'"
     )[0]["inode_id"]
-    with sqlite3.connect(fs_impl.database) as db:
+    with connect_sqlite(fs_impl.database) as db:
         db.execute("PRAGMA foreign_keys=OFF")
         db.execute(
             """
@@ -611,7 +611,7 @@ def test_scrub_reports_payload_size_mismatches(tmp_path, sql, expected_code):
         fh = fs("create", "/note.txt", 0o644)
         fs("write", "/note.txt", b"hello", 0, fh)
 
-    with sqlite3.connect(fs_impl.database) as db:
+    with connect_sqlite(fs_impl.database) as db:
         db.execute(sql)
 
     report = run_scrub(fs_impl.tier1, fs_impl.tier2, fs_impl.database)

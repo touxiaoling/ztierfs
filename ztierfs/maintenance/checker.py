@@ -15,6 +15,7 @@
 
 import sqlite3
 
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -123,7 +124,7 @@ class Checker:
             self.tier2,
             self.repair,
         )
-        with open_database(self.database) as db:
+        with closing(open_database(self.database)) as db:
             db.execute("BEGIN IMMEDIATE" if self.repair else "BEGIN")
             try:
                 blocks = {

@@ -3,6 +3,7 @@
 `StatsReport` 五段（`inodes` / `entries` / `chunks` / `blocks` / `storage`）均为 SQL 聚合结果，彼此维度不同，不可直接相加等同「磁盘占用」或「用户可见文件总大小」。例如 `blocks.total` 是 `blocks` 表行数；`storage.logical_file_bytes` 是普通文件 inode 上记录的 `size` 之和；去重与压缩会使 `unique_raw_bytes`、`stored_bytes` 与逻辑大小不一致。
 """
 
+from contextlib import closing
 from pathlib import Path
 
 from loguru import logger
@@ -67,7 +68,7 @@ def collect_stats(
         paths.tier1,
         paths.tier2,
     )
-    with open_database(db_path) as db:
+    with closing(open_database(db_path)) as db:
         inode_counts = {
             row["kind"]: row["count"]
             for row in db.execute(

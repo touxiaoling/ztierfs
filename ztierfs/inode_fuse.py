@@ -103,6 +103,8 @@ class InodeFuseMixin(InodeOperations, FileSystemMixinBase):
 
     def close(self) -> None:
         """关闭预读线程池、块存储与元数据连接，并输出性能分析收尾日志。"""
+        if getattr(self, "_ztierfs_closed", False):
+            return
         executor = getattr(self, "_readahead_executor", None)
         if executor is not None:
             executor.shutdown(wait=True)
@@ -112,6 +114,7 @@ class InodeFuseMixin(InodeOperations, FileSystemMixinBase):
         profiler = getattr(self, "_operation_profiler", None)
         if profiler is not None:
             profiler.log_final()
+        self._ztierfs_closed = True
 
     def _log_value(self, value):
         """将调试日志中的参数值转为可打印形式（缩短 ``bytes``、递归容器）。"""

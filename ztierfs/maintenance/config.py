@@ -14,6 +14,7 @@
 
 import sqlite3
 
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -146,7 +147,7 @@ def _read_optional_config(db_path: Path) -> sqlite3.Row | None:
     显式 tier 模式下用于判断库内是否已有存储路径配置，以便走 mismatch / 写回 / 新建
     分支；其它 ``sqlite3.OperationalError`` 仍会向上抛出。
     """
-    with open_database(db_path) as db:
+    with closing(open_database(db_path)) as db:
         try:
             return db.execute(
                 """
@@ -177,7 +178,7 @@ def _write_config(
     payload_store = payload_store or _detect_payload_store(db_path)
     if payload_store == "filekv" and payload_store_path is None:
         payload_store_path = tier1 / "payload-kv"
-    with open_database(db_path) as db:
+    with closing(open_database(db_path)) as db:
         db.execute("BEGIN IMMEDIATE")
         try:
             db.execute(
@@ -229,7 +230,7 @@ def _detect_payload_store(db_path: Path) -> str:
     若任一行非 ``sqlite`` 则返回 ``"filekv"``，否则 ``"sqlite"``，供 ``_write_config`` 在
     未显式传入 ``payload_store`` 时保持与现有数据布局一致。
     """
-    with open_database(db_path) as db:
+    with closing(open_database(db_path)) as db:
         for table in ("inode_payloads", "block_payloads"):
             try:
                 count = db.execute(

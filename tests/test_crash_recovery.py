@@ -8,7 +8,7 @@ from macfusepy import FuseOSError
 from ztierfs.block_store import TieringPolicy
 from ztierfs.maintenance import block_path, run_fsck
 
-from .helpers import adapted, make_fs, rows
+from .helpers import adapted, connect_sqlite, make_fs, rows
 
 
 class SimulatedCrash(RuntimeError):
@@ -432,7 +432,7 @@ def test_cleanup_crash_after_cold_unlink_before_metadata_commit_is_repaired(
         fh = fs("open", "/file.jpg", os.O_RDONLY)
         assert fs("read", "/file.jpg", len(data), 0, fh) == data
 
-    with sqlite3.connect(fs_impl.database) as db:
+    with connect_sqlite(fs_impl.database) as db:
         db.execute("UPDATE blocks SET last_promoted_ns = 0 WHERE hash = ?", (digest,))
 
     reopened = make_fs(tmp_path, inline_max_bytes=0)

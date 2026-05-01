@@ -5,7 +5,7 @@ import time
 
 from concurrent.futures import ThreadPoolExecutor
 
-from .helpers import adapted, make_fs, rows
+from .helpers import adapted, connect_sqlite, make_fs, rows
 
 
 def _wait_until(predicate, timeout: float = 2.0) -> None:
@@ -595,7 +595,7 @@ def test_ztierfs_recovers_when_block_metadata_points_to_missing_tier(tmp_path):
         fs("flush", "/file.bin", fh)
 
         digest = rows(fs_impl, "SELECT hash FROM blocks")[0]["hash"]
-        with sqlite3.connect(fs_impl.database) as db:
+        with connect_sqlite(fs_impl.database) as db:
             db.execute(
                 """
                 UPDATE blocks SET preferred_tier = 2 WHERE hash = ?
@@ -611,7 +611,7 @@ def test_ztierfs_recovers_when_block_metadata_points_to_missing_tier(tmp_path):
             )
 
         assert fs("read", "/file.bin", len(data), 0, fh) == data
-        with sqlite3.connect(fs_impl.database) as db:
+        with connect_sqlite(fs_impl.database) as db:
             row = db.execute(
                 """
                 SELECT hot_present, cold_present, preferred_tier

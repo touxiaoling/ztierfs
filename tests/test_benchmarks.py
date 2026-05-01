@@ -5,7 +5,7 @@ import sys
 
 import pytest
 
-from .helpers import adapted, make_fs, mounted_ztierfs, rows, user_dir_entry_rows
+from .helpers import adapted, connect_sqlite, make_fs, mounted_ztierfs, rows, user_dir_entry_rows
 
 
 pytestmark = pytest.mark.benchmark
@@ -391,7 +391,7 @@ def test_benchmark_real_mount_mixed_workload(tmp_path, benchmark):
 
         benchmark.pedantic(mixed_workload, rounds=3, iterations=1)
 
-        with sqlite3.connect(database) as db:
+        with connect_sqlite(database) as db:
             assert (
                 db.execute(
                     """

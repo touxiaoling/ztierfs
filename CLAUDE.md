@@ -4,7 +4,19 @@ Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-s
 
 **Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.
 
-## 1. Think Before Coding
+## 1. Cursor Task 与子代理
+
+执行用户任务时，**优先用 Task 子代理**承担可并行的重活，避免主对话上下文被海量检索输出占满。
+
+**适合交给子代理：**跨目录探索与关键词定位、多步只读调查、可写清验收标准的独立子任务、长时间或需密切跟进的 shell/构建（按需后台运行）。
+
+**不必强行子代理：**目标与改动点已明确的一两处编辑、单文件小补丁、读一两个已知路径即可回答的问题。
+
+**模型 `gpt-5.5-high`：**当任务明显依赖复杂推理、多方案权衡、或大范围理解后再下结论时，可在发起 Task 时指定 **`gpt-5.5-high`**；不要为省事先滥用。若用户点名其它模型 slug，仅使用平台当前允许列表中的值，不可用则如实说明。
+
+**约束：**子代理看不到本会话的隐含约定，须在 Task 的说明里写清工作目录、目标、交付格式与仓库级约束（例如本文件中的支持策略与测试要求）。
+
+## 2. Think Before Coding
 
 **Don't assume. Don't hide confusion. Surface tradeoffs.**
 
@@ -14,7 +26,7 @@ Before implementing:
 - If a simpler approach exists, say so. Push back when warranted.
 - If something is unclear, stop. Name what's confusing. Ask.
 
-## 2. Simplicity First
+## 3. Simplicity First
 
 **Minimum code that solves the problem. Nothing speculative.**
 
@@ -26,7 +38,7 @@ Before implementing:
 
 Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
 
-## 3. Surgical Changes
+## 4. Surgical Changes
 
 **Touch only what you must. Clean up only your own mess.**
 
@@ -42,7 +54,7 @@ When your changes create orphans:
 
 The test: Every changed line should trace directly to the user's request.
 
-## 4. Goal-Driven Execution
+## 5. Goal-Driven Execution
 
 **Define success criteria. Loop until verified.**
 
@@ -59,18 +71,6 @@ For multi-step tasks, state a brief plan:
 ```
 
 Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
-
-## 5. Cursor Task 与子代理
-
-执行用户任务时，在**不违背**上文「Think Before Coding / Simplicity / Surgical」的前提下，**优先用 Task 子代理**承担可并行的重活，避免主对话上下文被海量检索输出占满。
-
-**适合交给子代理：**跨目录探索与关键词定位、多步只读调查、可写清验收标准的独立子任务、长时间或需密切跟进的 shell/构建（按需后台运行）。
-
-**不必强行子代理：**目标与改动点已明确的一两处编辑、单文件小补丁、读一两个已知路径即可回答的问题。
-
-**模型 `gpt-5.5-high`：**当任务明显依赖复杂推理、多方案权衡、或大范围理解后再下结论时，可在发起 Task 时指定 **`gpt-5.5-high`**；不要为省事先滥用。若用户点名其它模型 slug，仅使用平台当前允许列表中的值，不可用则如实说明。
-
-**约束：**子代理看不到本会话的隐含约定，须在 Task 的说明里写清工作目录、目标、交付格式与仓库级约束（例如本文件中的支持策略与测试要求）。
 
 ---
 

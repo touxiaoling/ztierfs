@@ -1,5 +1,6 @@
 """copy-up 后冷层上多余块副本的按龄清理。"""
 
+from contextlib import closing
 from pathlib import Path
 from dataclasses import dataclass
 from time import time_ns
@@ -63,7 +64,7 @@ def cleanup_promoted_cold_copies(
         tier2_path,
         min_age_seconds,
     )
-    with open_database(db_path) as db:
+    with closing(open_database(db_path)) as db:
         db.execute("BEGIN IMMEDIATE")
         try:
             rows = db.execute(
