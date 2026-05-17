@@ -1,21 +1,13 @@
-"""inode 元数据侧 FUSE：getattr、chmod、时间戳、xattr 等与 stat 属性映射。
-
-目录的 `st_nlink` 含子目录贡献的链接计数约定；`st_blocks` 由实际占用字节换算。xattr 的
-CREATE/REPLACE 与 `ENOATTR`（或 `ENODATA` 回落）行为见模块内常量注释。
-"""
+"""inode 属性映射、access 辅助与 statfs。"""
 
 import errno
 import os
 
-from stat import S_IFDIR, S_IFLNK, S_IFREG
-from time import time_ns
-
-from loguru import logger
-from macfusepy import FuseOSError, LowLevelAttr
+from macfusepy import LowLevelAttr
 
 from .fs_mixins import FileSystemMixinBase
 
-# 扩展属性：macOS 常用 ENOATTR；部分平台回落为 ENODATA
+# 扩展属性：macOS 常用 ENOATTR；部分平台回落为 ENODATA。
 ENOATTR = getattr(errno, "ENOATTR", getattr(errno, "ENODATA", errno.ENOENT))
 XATTR_CREATE = 0x1
 XATTR_REPLACE = 0x2
@@ -23,22 +15,10 @@ MACOS_DELETE_ACCESS = 0x800
 
 
 class MetadataOpsMixin(FileSystemMixinBase):
-    """POSIX 元数据侧 FUSE 回调混入类。
-
-    **getattr / stat 字段**：由 `_attrs_from_node` 把 SQLite 中的 inode 行映射为
-    `LowLevelAttr`；目录的 `st_nlink` 按「2 + 子目录数」计入 `.` 与 `..`；普通文件的
-    `st_blocks` 由实际占用字节（含内联块或分块元数据中的已分配量）按 512 字节向上取整。
-
-    **xattr**：键值存在 `inode_xattrs`；读需 `R_OK`，写/删需 `W_OK`；`XATTR_CREATE` /
-    `XATTR_REPLACE` 与缺失名时的 `ENOATTR`（或平台回落 `ENODATA`）语义见模块顶部常量说明。
-
-    **statfs**：对热层、冷层挂载点分别 `statvfs`，在统一块大小下合并可用/空闲块与 inode 计数。
-
-    **lock**：进程内 POSIX 建议锁（`fcntl` 语义经 `self.locks`）；仅普通文件，目录返回 `EISDIR`。
-    """
+    """供 low-level FUSE 回调复用的 POSIX 元数据辅助逻辑。"""
 
     def _allocated_bytes_from_node(self, node) -> int:
-        """由 inode 行估算用于 `st_blocks` 的已分配字节数（普通文件含内联或分块占用，目录用 `size`）。"""
+        """估算用于 `st_blocks` 的已分配字节数。"""
         if node["kind"] == "file":
             if node["inline_stored_size"]:
                 return int(node["inline_stored_size"])
@@ -46,7 +26,7 @@ class MetadataOpsMixin(FileSystemMixinBase):
         return int(node["size"])
 
     def _attrs_from_node(self, node) -> LowLevelAttr:
-        """将命名空间中的 inode 记录转为 FUSE `LowLevelAttr`（含目录 `nlink` 与块数换算）。"""
+        """将 inode 记录转为 FUSE `LowLevelAttr`。"""
         nlink = (
             2 + self.metadata.child_dir_count(node["id"])
             if node["kind"] == "dir"
@@ -68,120 +48,8 @@ class MetadataOpsMixin(FileSystemMixinBase):
             st_birthtime=node["ctime_ns"],
         )
 
-    def _getattr(self, path: str, fh=None) -> LowLevelAttr:
-        """按路径或已打开句柄解析 inode，在只读事务中返回 `getattr` 所需的 `LowLevelAttr`。"""
-        logger.debug("获取属性：path={}，fh={}", path, fh)
-        self._ensure_trash_directory_for_caller()
-        with self.metadata.read_transaction():
-            node = self._node_from_handle_or_path(path, fh)
-            return self._attrs_from_node(node)
-
-    def _chmod(self, path: str, mode: int, fh=None) -> None:
-        """内部：处理 chmod。"""
-        logger.debug("修改权限：path={}，mode={:o}，fh={}", path, mode, fh)
-        self._ensure_trash_directory_for_caller()
-        with self.metadata.transaction():
-            node = self._node_from_handle_or_path(path, fh)
-            self._require_owner(node)
-            kind = {"dir": S_IFDIR, "file": S_IFREG, "symlink": S_IFLNK}[node["kind"]]
-            now = time_ns()
-            self.metadata.set_node_mode(node["id"], kind | (mode & 0o7777), now)
-            logger.debug(
-                "修改权限完成：path={}，inode={}，mode={:o}", path, node["id"], mode
-            )
-
-    def _chown(self, path: str, uid: int, gid: int, fh=None) -> None:
-        """内部：处理 chown。"""
-        logger.debug("修改所有者：path={}，uid={}，gid={}，fh={}", path, uid, gid, fh)
-        self._ensure_trash_directory_for_caller()
-        with self.metadata.transaction():
-            node = self._node_from_handle_or_path(path, fh)
-            if self._caller_ids()[0] != 0:
-                raise FuseOSError(errno.EPERM)
-            next_uid = node["uid"] if uid == -1 else uid
-            next_gid = node["gid"] if gid == -1 else gid
-            now = time_ns()
-            self.metadata.set_node_owner(node["id"], next_uid, next_gid, now)
-            logger.debug(
-                "修改所有者完成：path={}，inode={}，uid={}，gid={}",
-                path,
-                node["id"],
-                next_uid,
-                next_gid,
-            )
-
-    def _utimens(self, path: str, times, fh=None) -> None:
-        """内部：处理 utimens。"""
-        logger.debug("更新时间戳：path={}，times={}，fh={}", path, times, fh)
-        self._ensure_trash_directory_for_caller()
-        with self.metadata.transaction():
-            node = self._node_from_handle_or_path(path, fh)
-            if self._caller_ids()[0] != 0 and self._caller_ids()[0] != node["uid"]:
-                self._require_access(node, os.W_OK)
-            now = time_ns()
-            atime, mtime = times if times else (now, now)
-            self.metadata.set_node_times(node["id"], atime, mtime, now)
-            logger.debug("更新时间戳完成：path={}，inode={}", path, node["id"])
-
-    def _getxattr(self, path: str, name: str) -> bytes:
-        """读取指定扩展属性值；无该名时抛出 `ENOATTR`（或平台等价码）。需对目标节点具备读权限。"""
-        logger.debug("读取扩展属性：path={}，name={}", path, name)
-        self._ensure_trash_directory_for_caller()
-        with self.metadata.read_transaction():
-            node = self.metadata.get_node(path)
-            self._require_access(node, os.R_OK)
-            row = self.metadata.xattr(node["id"], name)
-            if row is None:
-                raise FuseOSError(ENOATTR)
-            return bytes(row["value"])
-
-    def _listxattr(self, path: str) -> list[str]:
-        """返回该 inode 上所有扩展属性名的列表；需对目标节点具备读权限。"""
-        logger.debug("列出扩展属性：path={}", path)
-        self._ensure_trash_directory_for_caller()
-        with self.metadata.read_transaction():
-            node = self.metadata.get_node(path)
-            self._require_access(node, os.R_OK)
-            return self.metadata.xattr_names(node["id"])
-
-    def _setxattr(self, path: str, name: str, value: bytes, options: int) -> None:
-        """写入或替换扩展属性；`XATTR_CREATE` 且已存在则 `EEXIST`，`XATTR_REPLACE` 且不存在则 `ENOATTR`。需写权限。"""
-        logger.debug(
-            "设置扩展属性：path={}，name={}，bytes={}，options={:#x}",
-            path,
-            name,
-            len(value),
-            options,
-        )
-        self._ensure_trash_directory_for_caller()
-        with self.metadata.transaction():
-            node = self.metadata.get_node(path)
-            self._require_access(node, os.W_OK)
-            exists = self.metadata.xattr(node["id"], name) is not None
-            if options & XATTR_CREATE and exists:
-                raise FuseOSError(errno.EEXIST)
-            if options & XATTR_REPLACE and not exists:
-                raise FuseOSError(ENOATTR)
-            self.metadata.set_xattr(node["id"], name, value, time_ns())
-            logger.debug(
-                "设置扩展属性完成：path={}，inode={}，name={}", path, node["id"], name
-            )
-
-    def _removexattr(self, path: str, name: str) -> None:
-        """删除指定扩展属性；无该名时抛出 `ENOATTR`。需写权限。"""
-        logger.debug("删除扩展属性：path={}，name={}", path, name)
-        self._ensure_trash_directory_for_caller()
-        with self.metadata.transaction():
-            node = self.metadata.get_node(path)
-            self._require_access(node, os.W_OK)
-            if not self.metadata.remove_xattr(node["id"], name, time_ns()):
-                raise FuseOSError(ENOATTR)
-            logger.debug(
-                "删除扩展属性完成：path={}，inode={}，name={}", path, node["id"], name
-            )
-
     def _require_amode_access(self, node, amode: int) -> None:
-        """内部：处理 require amode access。"""
+        """处理 POSIX `access(2)` 与 macOS 删除访问探测。"""
         posix_amode = amode & (os.R_OK | os.W_OK | os.X_OK)
         if amode & MACOS_DELETE_ACCESS and node["parent_id"] is not None:
             parent = self.metadata.node_by_id(node["parent_id"])
@@ -189,51 +57,13 @@ class MetadataOpsMixin(FileSystemMixinBase):
             posix_amode &= ~os.X_OK
         self._require_access(node, posix_amode)
 
-    def _access(self, path: str, amode: int) -> int:
-        """内部：处理 access。"""
-        posix_amode = amode & (os.R_OK | os.W_OK | os.X_OK)
-        logger.debug(
-            "检查访问权限：path={}，amode={:#x}，posix_amode={:#x}",
-            path,
-            amode,
-            posix_amode,
-        )
-        self._ensure_trash_directory_for_caller()
-        with self.metadata.read_transaction():
-            node = self.metadata.get_node(path)
-            self._require_amode_access(node, amode)
-            return 0
-
-    def _lock_file(
-        self, path: str, fh, cmd: int, lock: dict[str, int]
-    ) -> dict[str, int] | None:
-        """对普通文件应用进程内 POSIX 建议锁（`cmd`/`lock` 交由 `self.locks`）；非文件返回 `EISDIR`。先在只读事务中解析 inode，再在进程内锁表上更新。"""
-        logger.debug("处理文件锁：path={}，fh={}，cmd={}，lock={}", path, fh, cmd, lock)
-        with self.metadata.read_transaction():
-            node = self._node_from_handle_or_path(path, fh)
-            if node["kind"] != "file":
-                raise FuseOSError(errno.EISDIR)
-            owner = self.handles.lock_owner(fh) or self._lock_owner()
-            uid, _gid, pid = self._caller_ids()
-            lock.setdefault("l_pid", pid)
-        with self._lock:
-            result = self.locks.apply(
-                node["id"], owner, int(lock.get("l_pid", pid)), cmd, lock
-            )
-            logger.debug(
-                "文件锁处理完成：path={}，inode={}，result={}", path, node["id"], result
-            )
-            return result
-
     def _statfs(self) -> dict[str, int]:
-        """合并热层与冷层挂载点的 `statvfs` 结果，按热层片段大小归一化块计数后返回 FUSE `statfs` 字段字典。"""
-        logger.debug("读取文件系统容量统计")
+        """合并热层与冷层挂载点的 `statvfs` 结果。"""
         hot = os.statvfs(self.tier1)
         cold = os.statvfs(self.tier2)
         block_size = hot.f_frsize or hot.f_bsize
 
         def blocks(st, attr: str) -> int:
-            """将某一 `statvfs` 结构体中的块计数字段换算为以 `block_size` 为单位的块数。"""
             return getattr(st, attr) * (st.f_frsize or st.f_bsize) // block_size
 
         return {

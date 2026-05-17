@@ -223,7 +223,7 @@ def test_open_trunc_uses_inode_selected_before_path_replacement(tmp_path, monkey
             return original_content_lock(inode_id)
 
         monkeypatch.setattr(fs_impl, "_content_lock", content_lock_after_path_replacement)
-        opened = fs_impl._open("/target.txt", os.O_RDWR | os.O_TRUNC)
+        opened = fs("open", "/target.txt", os.O_RDWR | os.O_TRUNC)
         fs("release", "/old-name.txt", opened)
 
         old_fh = fs("open", "/old-name.txt", os.O_RDONLY)

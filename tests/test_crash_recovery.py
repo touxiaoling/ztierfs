@@ -8,7 +8,13 @@ from macfusepy import FuseOSError
 from ztierfs.block_store import TieringPolicy
 from ztierfs.maintenance import block_path, cleanup_promoted_cold_copies, run_fsck
 
-from .helpers import adapted, connect_sqlite, make_fs, rows
+from .helpers import (
+    TestOperationsAdapter as OperationsAdapter,
+    adapted,
+    connect_sqlite,
+    make_fs,
+    rows,
+)
 
 
 class SimulatedCrash(RuntimeError):
@@ -24,9 +30,10 @@ def _single_block_digest(fs_impl):
 
 def _write_committed_file(fs_impl, path="/file.jpg", data=None):
     data = data if data is not None else bytes(range(256)) * 4
-    fh = fs_impl._create(path, 0o644)
-    fs_impl._write(path, data, 0, fh)
-    fs_impl._release(fh)
+    fs = OperationsAdapter(fs_impl)
+    fh = fs("create", path, 0o644)
+    fs("write", path, data, 0, fh)
+    fs("release", path, fh)
     return data
 
 
