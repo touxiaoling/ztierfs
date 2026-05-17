@@ -1,11 +1,17 @@
 import os
 import random
-import sqlite3
 import sys
 
 import pytest
 
-from .helpers import adapted, connect_sqlite, make_fs, mounted_ztierfs, rows, user_dir_entry_rows
+from .helpers import (
+    adapted,
+    connect_sqlite,
+    make_fs,
+    mounted_ztierfs,
+    rows,
+    user_dir_entry_rows,
+)
 
 
 pytestmark = pytest.mark.benchmark

@@ -1,5 +1,4 @@
 import os
-import sqlite3
 import threading
 import time
 
@@ -222,7 +221,9 @@ def test_open_trunc_uses_inode_selected_before_path_replacement(tmp_path, monkey
                 fs("rename", "/replacement.txt", "/target.txt", 0)
             return original_content_lock(inode_id)
 
-        monkeypatch.setattr(fs_impl, "_content_lock", content_lock_after_path_replacement)
+        monkeypatch.setattr(
+            fs_impl, "_content_lock", content_lock_after_path_replacement
+        )
         opened = fs("open", "/target.txt", os.O_RDWR | os.O_TRUNC)
         fs("release", "/old-name.txt", opened)
 
@@ -433,6 +434,39 @@ def test_ztierfs_reads_multi_chunk_plan_in_parallel(tmp_path, monkeypatch):
             fs_impl.block_store, "read_block_snapshot", observed_read_block
         )
         assert fs("read", "/movie.jpg", len(data), 0, fh) == data
+
+    assert max_active == 2
+
+
+def test_ztierfs_prepares_uncompressed_multi_chunk_writes_in_parallel(
+    tmp_path, monkeypatch
+):
+    fs_impl = make_fs(tmp_path, inline_max_bytes=0)
+    data = bytes(range(256)) * 8
+    barrier = threading.Barrier(2)
+    lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    original_digest = fs_impl.block_store._timed_digest_block
+
+    def observed_digest(chunk):
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        try:
+            barrier.wait(timeout=2)
+            return original_digest(chunk)
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(fs_impl.block_store, "_timed_digest_block", observed_digest)
+
+    with adapted(fs_impl) as fs:
+        fh = fs("create", "/movie.jpg", 0o644)
+        assert fs("write", "/movie.jpg", data, 0, fh) == len(data)
 
     assert max_active == 2
 

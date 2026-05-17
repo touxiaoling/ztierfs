@@ -17,7 +17,13 @@ url = "https://pypi.tuna.tsinghua.edu.cn/simple"
 default = true
 
 [dependency-groups]
-dev = ["pytest>=9.0.3", "pytest-benchmark>=5.2.3", "pytest-cov>=7.1.0"]
+dev = [
+    "pytest>=9.0.3",
+    "pytest-benchmark>=5.2.3",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.15.13",
+    "ty>=0.0.37",
+]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

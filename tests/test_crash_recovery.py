@@ -1,6 +1,5 @@
 import errno
 import os
-import sqlite3
 
 import pytest
 from macfusepy import FuseOSError
@@ -552,7 +551,9 @@ def test_last_unlink_commit_queues_block_delete_for_cleanup(tmp_path, monkeypatc
     _write_committed_file(fs_impl, "/victim.jpg")
     digest = _single_block_digest(fs_impl)
     fs_impl.metadata._after_commit_hooks.clear()
-    monkeypatch.setattr(fs_impl.block_store, "drain_pending_deletions", lambda **_kwargs: 0)
+    monkeypatch.setattr(
+        fs_impl.block_store, "drain_pending_deletions", lambda **_kwargs: 0
+    )
 
     with adapted(fs_impl) as fs:
         fs("unlink", "/victim.jpg")

@@ -21,6 +21,7 @@ class CleanupReport:
     ``removed``：已成功删除冷层块文件，并从 ``block_locations`` 中移除 tier 2 记录的数量。
     ``skipped``：因冷层路径暂时不可用或删除失败而跳过、未改对应元数据的数量。
     """
+
     removed: int = 0
     skipped: int = 0
     pending_removed: int = 0

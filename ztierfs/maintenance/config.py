@@ -22,6 +22,7 @@ class MaintenancePaths:
     ``database``：打开的 SQLite 元数据库。``tier1`` / ``tier2``：热层、冷层 **根目录**
     （块实际在各自 ``blocks`` 子目录下，由 ``BlockStore`` 约定）。
     """
+
     database: Path
     tier1: Path
     tier2: Path

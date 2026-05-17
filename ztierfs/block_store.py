@@ -409,7 +409,7 @@ class BlockStore:
     ) -> list[tuple[int, PreparedBlock]]:
         """对多块并行或同步计算摘要与编码，填充 **读缓存** 明文，并判定是否 **内联** 存储。"""
         pending = list(chunks)
-        if len(pending) <= 1 or not compress:
+        if len(pending) <= 1:
             logger.debug("同步准备块：count={}，compress={}", len(pending), compress)
             return [
                 (chunk_index, self._prepare_block_sync(data, compress))
@@ -418,32 +418,27 @@ class BlockStore:
 
         executor = self._executor()
         logger.debug("并行准备块：count={}，compress={}", len(pending), compress)
-        digest_futures: list[Future[str]] = []
-        payload_futures: list[Future[tuple[bytes, bool]]] = []
-        for _chunk_index, data in pending:
-            digest_futures.append(executor.submit(self._timed_digest_block, data))
-            payload_futures.append(
+        digest_futures = [
+            executor.submit(self._timed_digest_block, data)
+            for _chunk_index, data in pending
+        ]
+        payload_futures: list[Future[tuple[bytes, bool]]] | None = None
+        if compress:
+            payload_futures = [
                 executor.submit(self._timed_encode_block, data, compress)
-            )
+                for _chunk_index, data in pending
+            ]
         prepared: list[tuple[int, PreparedBlock]] = []
-        for (chunk_index, data), digest_future, payload_future in zip(
-            pending, digest_futures, payload_futures, strict=True
+        for index, ((chunk_index, data), digest_future) in enumerate(
+            zip(pending, digest_futures, strict=True)
         ):
-            payload, compressed = payload_future.result()
+            if payload_futures is None:
+                payload, compressed = data, False
+            else:
+                payload, compressed = payload_futures[index].result()
             digest = digest_future.result()
-            self._cache_put(digest, data)
-            inline_payload = payload if self.should_inline(payload) else None
             prepared.append(
-                (
-                    chunk_index,
-                    PreparedBlock(
-                        digest=digest,
-                        raw_size=len(data),
-                        payload=payload,
-                        compressed=compressed,
-                        inline_payload=inline_payload,
-                    ),
-                )
+                (chunk_index, self._prepared_block(digest, data, payload, compressed))
             )
         return prepared
 
@@ -455,6 +450,12 @@ class BlockStore:
         """在当前线程完成编码、摘要、缓存与内联判定（无并行开销）。"""
         payload, compressed = self._timed_encode_block(data, compress)
         digest = self._timed_digest_block(data)
+        return self._prepared_block(digest, data, payload, compressed)
+
+    def _prepared_block(
+        self, digest: str, data: bytes, payload: bytes, compressed: bool
+    ) -> PreparedBlock:
+        """用已计算好的摘要与 payload 构造 ``PreparedBlock``，并填充明文读缓存。"""
         self._cache_put(digest, data)
         inline_payload = payload if self.should_inline(payload) else None
         return PreparedBlock(
@@ -686,7 +687,9 @@ class BlockStore:
                     self.metadata.remove_pending_deletion(row["id"])
                 removed += 1
                 if deleted_or_missing:
-                    logger.debug("待 GC payload 已清理：id={}，kind={}", row["id"], row["kind"])
+                    logger.debug(
+                        "待 GC payload 已清理：id={}，kind={}", row["id"], row["kind"]
+                    )
 
     def copy_block(self, digest: str, source_tier: int, target_tier: int) -> None:
         """跨层 **原子复制**：``shutil.copyfile`` 至临时文件、读 ``fsync``、``replace`` 落位、目录 ``fsync``。

@@ -57,6 +57,7 @@
 - 保留类 POSIX 错误行为，例如 `ENOENT`、`EISDIR`、`ENOTDIR`、`ENOTEMPTY`、`EINVAL`、`EIO`。
 - 单元测试不应依赖真实 FUSE 挂载；真实挂载测试必须标记为 `integration`。
 - 修改 schema、磁盘布局、CLI 或文档时，同步更新测试和 README 中对应说明。
+- 修改代码后运行`uv run ruff format . && uv run ruff check --fix . && uv run ty check --fix .`然后修复所有问题。
 
 ## 常用命令
 

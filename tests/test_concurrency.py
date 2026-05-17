@@ -1,6 +1,5 @@
 import errno
 import os
-import sqlite3
 import threading
 
 from concurrent.futures import ThreadPoolExecutor
@@ -11,7 +10,14 @@ from macfusepy import FuseOSError
 import ztierfs.metadata.store as store_module
 from ztierfs.metadata import ConnectionPool
 
-from .helpers import adapted, connect_sqlite, make_fs, rows, user_dir_entry_rows, user_inode_rows
+from .helpers import (
+    adapted,
+    connect_sqlite,
+    make_fs,
+    rows,
+    user_dir_entry_rows,
+    user_inode_rows,
+)
 
 
 def _assert_no_refcount_drift(fs_impl) -> None:

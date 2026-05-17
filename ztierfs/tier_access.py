@@ -40,6 +40,7 @@ class PathProbe:
       ETIMEDOUT、ENETDOWN 等），视为冷层/挂载暂时不可用而非缺失；此时 ``errno``、
       ``error`` 供日志与重试策略使用。
     """
+
     status: PathStatus
     errno: int | None = None
     error: str | None = None

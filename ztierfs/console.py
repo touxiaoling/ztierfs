@@ -20,6 +20,7 @@ class ConsoleOutputConfig:
     ``log_file_level``：文件 sink 级别；为 ``None`` 时与 ``logger_level`` 相同。
     ``log_file_rotation`` / ``log_file_retention``：传给 loguru 文件 sink 的轮转与保留策略。
     """
+
     logger_level: str | int = "INFO"
     log_file: str | Path | None = None
     log_file_level: str | int | None = None
@@ -29,6 +30,7 @@ class ConsoleOutputConfig:
 
 class _LoguruInterceptHandler(logging.Handler):
     """标准 ``logging`` 的 ``Handler``：把 ``LogRecord`` 转成对 loguru 的同级调用。"""
+
     def emit(self, record: logging.LogRecord) -> None:
         """按记录级别与消息调用 loguru；若有 ``exc_info`` 则一并带上。"""
         try:

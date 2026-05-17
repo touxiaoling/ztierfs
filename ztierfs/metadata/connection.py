@@ -33,6 +33,7 @@ class SQLitePragmas:
     自动 checkpoint 页数；`synchronous` 为同步模式；`journal_size_limit` 限制 WAL 日志体量；
     `temp_store` 控制临时表存放位置。
     """
+
     busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS
     cache_size: int = DEFAULT_SQLITE_CACHE_SIZE
     mmap_size: int = DEFAULT_SQLITE_MMAP_SIZE
@@ -102,6 +103,7 @@ class ConnectionPool:
     `release` 归还连接，或阻塞时间超过 `acquire` 的 `timeout` 参数。`close` 后归还的连接会被关闭，
     后续 `acquire` 抛错。
     """
+
     def __init__(
         self,
         path: Path,

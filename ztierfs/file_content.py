@@ -27,6 +27,7 @@ class ChunkRead:
     执行阶段按稀疏语义用零字节填充 ``[start, stop)``，不占块存储、不涉及 refcount。
     ``expected_size`` 为该 chunk 在文件内的有效长度（尾块可小于 ``chunk_size``）。
     """
+
     row: Any | None
     chunk_index: int
     expected_size: int
@@ -41,6 +42,7 @@ class FileReadPlan:
     内联路径时 ``inline_data`` 非空、``chunks`` 为空；分块路径时 ``inline_data`` 为 ``None``，
     ``chunks`` 按文件偏移顺序覆盖 ``[offset, offset+size)`` 与文件末尾的交集。
     """
+
     file_id: int
     chunks: list[ChunkRead]
     inline_data: bytes | None = None
@@ -53,6 +55,7 @@ class PreparedInlineFile:
     ``payload`` 为存入 SQLite 的字节串（可能已是 zstd 压缩包）；``raw_size`` 为解压后的逻辑长度。
     ``clear_chunks`` 为真时，提交前会先删掉 ``file_chunks`` 并递减旧块 refcount。
     """
+
     payload: bytes
     compressed: bool
     raw_size: int
@@ -67,6 +70,7 @@ class PreparedFileWrite:
     清除内联列（从内联迁回分块存储时）。提交时通过 ``set_prepared_chunk`` / 内联路径更新块引用，
     替换旧块会先 ``decrement_block``、新块 ``ensure_prepared_block`` 后 ``attach``，维持 refcount 一致。
     """
+
     file_id: int
     bytes_written: int
     new_size: int

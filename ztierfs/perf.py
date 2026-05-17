@@ -17,6 +17,7 @@ from loguru import logger
 @dataclass
 class PerfCounters:
     """在当前上下文内聚合的性能计数：各标签下的累计纳秒耗时、调用次数与可选的字节量。"""
+
     timings_ns: dict[str, int] = field(default_factory=lambda: defaultdict(int))
     counts: dict[str, int] = field(default_factory=lambda: defaultdict(int))
     bytes: dict[str, int] = field(default_factory=lambda: defaultdict(int))
@@ -78,6 +79,7 @@ def timed(name: str, *, bytes_key: str | None = None, size: int = 0) -> Iterator
 
 class OperationProfiler:
     """跨多次 `record` 合并 `PerfCounters`，按固定间隔将累计结果中耗时最高的若干项输出到日志。"""
+
     def __init__(self, *, interval_seconds: float, top_n: int = 20):
         """`interval_seconds` 控制两次定期日志之间的最小间隔；`top_n` 为每次输出中按总耗时排序取前多少条。"""
         if interval_seconds <= 0:

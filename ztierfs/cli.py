@@ -208,7 +208,9 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_maintenance_args(fsck)
     fsck.set_defaults(handler=_run_fsck_command)
 
-    scrub = subparsers.add_parser("scrub", help="检查一致性并读取校验 inline/热层 payload")
+    scrub = subparsers.add_parser(
+        "scrub", help="检查一致性并读取校验 inline/热层 payload"
+    )
     _add_maintenance_args(scrub)
     scrub.add_argument(
         "--include-cold",
@@ -397,9 +399,7 @@ def _emit_report(
     """按 CLI 约定输出报告：JSON 走稳定 dict，文本走对应 formatter。"""
     if json_output:
         formatter = json_formatter or (lambda value: value.to_dict())
-        _emit_stdout(
-            json.dumps(formatter(report), ensure_ascii=False, sort_keys=True)
-        )
+        _emit_stdout(json.dumps(formatter(report), ensure_ascii=False, sort_keys=True))
     else:
         _emit_stdout(text_formatter(report))
 

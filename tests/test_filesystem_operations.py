@@ -436,9 +436,7 @@ def test_ztierfs_denies_writes_and_metadata_changes_without_permission(
         pytest.skip("root bypasses normal write permission checks")
     other_uid = owner_uid + 10000
     other_gid = owner_gid + 10000
-    fs_impl = make_fs(
-        tmp_path, caller_provider=lambda: (owner_uid, owner_gid, 1234)
-    )
+    fs_impl = make_fs(tmp_path, caller_provider=lambda: (owner_uid, owner_gid, 1234))
 
     with adapted(fs_impl) as fs:
         fh = fs("create", "/readonly.txt", 0o644)

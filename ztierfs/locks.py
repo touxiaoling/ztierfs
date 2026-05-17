@@ -22,6 +22,7 @@ class FileLock:
     偏移，`end` 为闭区间终点，若为 ``None`` 表示锁延伸至文件末尾（与
     ``l_len == 0`` 一致）。
     """
+
     inode_id: int
     owner: int
     pid: int
