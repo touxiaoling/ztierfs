@@ -1,6 +1,6 @@
 [project]
 name = "ztierfs"
-version = "0.2.0"
+version = "0.3.0"
 description = "macOS FUSE filesystem: content-addressed blocks with dedup/zstd compression, and hot/cold tiering"
 readme = "README.md"
 requires-python = ">=3.14"
