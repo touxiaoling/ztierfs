@@ -33,8 +33,7 @@ def collect_stats(
 
     - ``total``：``blocks`` 表行数（内容寻址块记录总数）。
     - ``inline``：``storage_kind = 'inline'`` 的块（小块元数据记在 ``blocks``，载荷可在 SQLite）。
-    - ``inode_inline``：``inode_payloads`` 表 ``COUNT(*)``（inode 侧内联载荷行数，与 ``blocks.inline`` 分列统计）。
-    - ``hot``：``storage_kind = 'tiered'`` 且在 ``block_locations`` 中存在 ``tier = 1`` 的块（与热层位置表关联后的行数意义上的「有热层副本」的块数）。
+    - ``hot``：``storage_kind = 'tiered'`` 且 ``hot_present = 1`` 的块。
     - ``cold``：同上但 ``tier = 2``（冷层）。
     - ``both``：同时关联到 ``tier = 1`` 与 ``tier = 2`` 的 ``tiered`` 块（例如迁移中间态或双副本策略下的块数）。
     - ``compressed``：``compressed = 1`` 的块行数。
@@ -43,11 +42,10 @@ def collect_stats(
 
     - ``logical_file_bytes``：``inodes`` 中 ``kind = 'file'`` 的 ``SUM(size)``，即各普通文件当前逻辑长度之和（稀疏/洞不一定反映在未引用块上）。
     - ``referenced_chunk_bytes``：``file_chunks.size`` 的 ``SUM``，chunk 行声明覆盖的字节总量（与 inode size、块去重关系需分开理解）。
-    - ``unique_raw_bytes``：``blocks.raw_size`` 与 ``inode_payloads.raw_size`` 两段 ``SUM`` 相加，未压缩载荷字节总量（去重后按块/内联存储计）。
-    - ``stored_bytes``：``blocks.stored_size`` 与 ``inode_payloads.stored_size`` 两段 ``SUM`` 相加，实际持久化字节（含压缩等）。
-    - ``inode_inline_stored_bytes``：仅 ``inode_payloads`` 的 ``SUM(stored_size)``。
+    - ``unique_raw_bytes``：``blocks.raw_size`` 的 ``SUM``，未压缩载荷字节总量（去重后按块存储计）。
+    - ``stored_bytes``：``blocks.stored_size`` 的 ``SUM``，实际持久化字节（含压缩等）。
     - ``inline_stored_bytes``：仅 ``blocks`` 且 ``storage_kind = 'inline'`` 的 ``SUM(stored_size)``。
-    - ``hot_stored_bytes`` / ``cold_stored_bytes``：``tiered`` 块按 ``block_locations`` 连接至 ``tier = 1`` 或 ``2`` 后对 ``blocks.stored_size`` 求和（按层统计占用；同一 ``tiered`` 块若在两 tier 均有位置，两段 ``SUM`` 可能各计一份，与 ``both`` 语义一致）。
+    - ``hot_stored_bytes`` / ``cold_stored_bytes``：``tiered`` 块按 ``hot_present`` / ``cold_present`` 对 ``blocks.stored_size`` 求和（同一 ``tiered`` 块若在两 tier 均有位置，两段 ``SUM`` 可能各计一份，与 ``both`` 语义一致）。
     """
     paths = resolve_maintenance_paths(database)
     db_path = paths.database
@@ -69,17 +67,12 @@ def collect_stats(
             "inline": scalar(
                 db, "SELECT COUNT(*) FROM blocks WHERE storage_kind = 'inline'"
             ),
-            "inode_inline": scalar(
-                db,
-                "SELECT COUNT(*) FROM inode_payloads",
-            ),
             "hot": scalar(
                 db,
                 """
                 SELECT COUNT(*)
                 FROM blocks
-                JOIN block_locations ON block_locations.hash = blocks.hash
-                WHERE blocks.storage_kind = 'tiered' AND block_locations.tier = 1
+                WHERE storage_kind = 'tiered' AND hot_present = 1
                 """,
             ),
             "cold": scalar(
@@ -87,8 +80,7 @@ def collect_stats(
                 """
                 SELECT COUNT(*)
                 FROM blocks
-                JOIN block_locations ON block_locations.hash = blocks.hash
-                WHERE blocks.storage_kind = 'tiered' AND block_locations.tier = 2
+                WHERE storage_kind = 'tiered' AND cold_present = 1
                 """,
             ),
             "both": scalar(
@@ -96,11 +88,9 @@ def collect_stats(
                 """
                 SELECT COUNT(*)
                 FROM blocks
-                JOIN block_locations AS hot_locations
-                  ON hot_locations.hash = blocks.hash AND hot_locations.tier = 1
-                JOIN block_locations AS cold_locations
-                  ON cold_locations.hash = blocks.hash AND cold_locations.tier = 2
-                WHERE blocks.storage_kind = 'tiered'
+                WHERE storage_kind = 'tiered'
+                  AND hot_present = 1
+                  AND cold_present = 1
                 """,
             ),
             "compressed": scalar(
@@ -116,21 +106,9 @@ def collect_stats(
             ),
             "unique_raw_bytes": scalar(
                 db, "SELECT COALESCE(SUM(raw_size), 0) FROM blocks"
-            )
-            + scalar(
-                db,
-                "SELECT COALESCE(SUM(raw_size), 0) FROM inode_payloads",
             ),
             "stored_bytes": scalar(
                 db, "SELECT COALESCE(SUM(stored_size), 0) FROM blocks"
-            )
-            + scalar(
-                db,
-                "SELECT COALESCE(SUM(stored_size), 0) FROM inode_payloads",
-            ),
-            "inode_inline_stored_bytes": scalar(
-                db,
-                "SELECT COALESCE(SUM(stored_size), 0) FROM inode_payloads",
             ),
             "inline_stored_bytes": scalar(
                 db,
@@ -141,8 +119,7 @@ def collect_stats(
                 """
                 SELECT COALESCE(SUM(stored_size), 0)
                 FROM blocks
-                JOIN block_locations ON block_locations.hash = blocks.hash
-                WHERE blocks.storage_kind = 'tiered' AND block_locations.tier = 1
+                WHERE storage_kind = 'tiered' AND hot_present = 1
                 """,
             ),
             "cold_stored_bytes": scalar(
@@ -150,8 +127,7 @@ def collect_stats(
                 """
                 SELECT COALESCE(SUM(stored_size), 0)
                 FROM blocks
-                JOIN block_locations ON block_locations.hash = blocks.hash
-                WHERE blocks.storage_kind = 'tiered' AND block_locations.tier = 2
+                WHERE storage_kind = 'tiered' AND cold_present = 1
                 """,
             ),
         }

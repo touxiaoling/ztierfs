@@ -23,8 +23,8 @@ def test_cli_stats_outputs_json(tmp_path, capsys):
     main(["stats", str(fs_impl.database), "--json"])
     output = json.loads(capsys.readouterr().out)
     assert output["inodes"]["files"] == 1
-    assert output["blocks"]["total"] == 0
-    assert output["blocks"]["inode_inline"] == 1
+    assert output["blocks"]["total"] == 1
+    assert output["blocks"]["inline"] == 1
     assert output["blocks"]["hot"] == 0
 
 
@@ -48,7 +48,7 @@ def test_cli_stats_can_write_log_file_without_polluting_json(tmp_path, capsys):
     )
 
     output = json.loads(capsys.readouterr().out)
-    assert output["blocks"]["inode_inline"] == 1
+    assert output["blocks"]["inline"] == 1
     log_text = log_file.read_text(encoding="utf-8")
     assert "收集统计信息" in log_text
 

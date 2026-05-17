@@ -1,4 +1,4 @@
-"""版本化 schema：建表/迁移、配置行与块记录联表查询片段。
+"""版本化 schema：建表/迁移、配置行与块记录查询片段。
 
 **SCHEMA_VERSION 与 user_version**
 
@@ -12,9 +12,8 @@
 
 **BLOCK_RECORD_SELECT**
 
-将 `blocks` 与 `block_locations`（按 tier 区分热/冷）及可选 `block_payloads` 联表，供一次查询块元数据、
-内联载荷与各层是否存在。`block_locations.tier`：1=热层块路径，2=冷层（同一 hash 每层至多一行）。
-结果列 `hot_present`/`cold_present` 由对 tier 1/2 的 LEFT JOIN 是否为 NULL 推导（无行为 0，有为 1）。
+将 `blocks` 与可选 `block_payloads` 联表，供一次查询块元数据、inline 载荷与冷热层 presence。
+`hot_present` / `cold_present` 直接保存在 `blocks` 中；1=热层存在，2=冷层存在。
 """
 
 import os
@@ -24,7 +23,7 @@ from time import time_ns
 
 from .base import MetadataMixinBase
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 CONFIG_VERSION = 1
 
 FILESYSTEM_CONFIG_SELECT = """
@@ -48,14 +47,8 @@ BLOCK_RECORD_SELECT = """
     SELECT
         blocks.hash,
         blocks.storage_kind AS storage,
-        CASE
-            WHEN hot_locations.hash IS NULL THEN 0
-            ELSE 1
-        END AS hot_present,
-        CASE
-            WHEN cold_locations.hash IS NULL THEN 0
-            ELSE 1
-        END AS cold_present,
+        blocks.hot_present,
+        blocks.cold_present,
         blocks.preferred_tier,
         blocks.compressed,
         blocks.raw_size,
@@ -68,10 +61,6 @@ BLOCK_RECORD_SELECT = """
         blocks.cold_verified_ns,
         block_payloads.payload AS inline_payload
     FROM blocks
-    LEFT JOIN block_locations AS hot_locations
-        ON hot_locations.hash = blocks.hash AND hot_locations.tier = 1
-    LEFT JOIN block_locations AS cold_locations
-        ON cold_locations.hash = blocks.hash AND cold_locations.tier = 2
     LEFT JOIN block_payloads ON block_payloads.hash = blocks.hash
 """
 
@@ -108,7 +97,7 @@ class SchemaMixin(MetadataMixinBase):
         return row is not None
 
     def _create_schema(self) -> None:
-        """执行完整 DDL：inode/目录项/块/位置/chunk/xattr/配置表及 `block_records` 视图等。"""
+        """执行完整 DDL：inode/目录项/块/chunk/xattr/配置表及 `block_records` 视图等。"""
         self._db.execute(
             """
             CREATE TABLE IF NOT EXISTS inodes (
@@ -132,17 +121,6 @@ class SchemaMixin(MetadataMixinBase):
         )
         self._db.execute(
             """
-            CREATE TABLE IF NOT EXISTS inode_payloads (
-                inode_id INTEGER PRIMARY KEY REFERENCES inodes(id) ON DELETE CASCADE,
-                payload BLOB NOT NULL,
-                compressed INTEGER NOT NULL CHECK (compressed IN (0, 1)),
-                raw_size INTEGER NOT NULL CHECK (raw_size > 0),
-                stored_size INTEGER NOT NULL CHECK (stored_size > 0)
-            )
-            """
-        )
-        self._db.execute(
-            """
             CREATE TABLE IF NOT EXISTS dir_entries (
                 parent_id INTEGER NOT NULL REFERENCES inodes(id) ON DELETE CASCADE,
                 name TEXT NOT NULL CHECK (length(name) > 0 AND instr(name, '/') = 0),
@@ -160,6 +138,8 @@ class SchemaMixin(MetadataMixinBase):
                 hash TEXT PRIMARY KEY,
                 storage_kind TEXT NOT NULL CHECK (storage_kind IN ('inline', 'tiered')),
                 preferred_tier INTEGER NOT NULL CHECK (preferred_tier IN (0, 1, 2)),
+                hot_present INTEGER NOT NULL DEFAULT 0 CHECK (hot_present IN (0, 1)),
+                cold_present INTEGER NOT NULL DEFAULT 0 CHECK (cold_present IN (0, 1)),
                 compressed INTEGER NOT NULL CHECK (compressed IN (0, 1)),
                 raw_size INTEGER NOT NULL CHECK (raw_size > 0),
                 stored_size INTEGER NOT NULL CHECK (stored_size > 0),
@@ -170,23 +150,11 @@ class SchemaMixin(MetadataMixinBase):
                 last_demoted_ns INTEGER,
                 cold_verified_ns INTEGER,
                 CHECK (
-                    (storage_kind = 'inline' AND preferred_tier = 0)
-                    OR (storage_kind = 'tiered' AND preferred_tier IN (1, 2))
+                    (storage_kind = 'inline' AND preferred_tier = 0 AND hot_present = 0 AND cold_present = 0)
+                    OR (storage_kind = 'tiered' AND preferred_tier IN (1, 2) AND (hot_present = 1 OR cold_present = 1))
                 )
             )
             """
-        )
-        self._db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS block_locations (
-                hash TEXT NOT NULL REFERENCES blocks(hash) ON DELETE CASCADE,
-                tier INTEGER NOT NULL CHECK (tier IN (1, 2)),
-                PRIMARY KEY(hash, tier)
-            )
-            """
-        )
-        self._db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_block_locations_tier_hash ON block_locations(tier, hash)"
         )
         self._db.execute(
             """
@@ -198,7 +166,7 @@ class SchemaMixin(MetadataMixinBase):
         self._db.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_blocks_promoted_cleanup
-            ON blocks(preferred_tier, last_promoted_ns)
+            ON blocks(preferred_tier, hot_present, cold_present, last_promoted_ns)
             WHERE storage_kind = 'tiered' AND preferred_tier = 1 AND last_promoted_ns IS NOT NULL
             """
         )

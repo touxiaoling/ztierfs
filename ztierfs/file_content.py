@@ -1,7 +1,7 @@
 """普通文件字节层：按固定 chunk 切分，读路径上缺失映射视为稀疏零字节，写路径支持局部覆盖与截断。
 
-协调 ``file_chunks``、内容寻址块的引用计数与 ``BlockStore``；小文件可整段内联存 SQLite，
-超过阈值或迁出时再写入块存储；``PreparedBlock`` / ``PreparedFileWrite`` 使编码与 refcount 更新成对发生。
+协调 ``file_chunks``、内容寻址块的引用计数与 ``BlockStore``；小文件可作为 inline block
+存入 SQLite，但文件内容仍统一通过 ``file_chunks -> blocks`` 表达。
 """
 
 import errno
@@ -11,7 +11,6 @@ from dataclasses import dataclass
 from time import time_ns
 from typing import Any
 
-import compression.zstd as zstd
 from loguru import logger
 from macfusepy import FuseOSError
 
@@ -38,52 +37,26 @@ class ChunkRead:
 
 @dataclass(frozen=True)
 class FileReadPlan:
-    """对 ``plan_read`` 结果的封装：要么整文件内联切片，要么按 chunk 列表读块。
-
-    内联路径时 ``inline_data`` 非空、``chunks`` 为空；分块路径时 ``inline_data`` 为 ``None``，
-    ``chunks`` 按文件偏移顺序覆盖 ``[offset, offset+size)`` 与文件末尾的交集。
-    """
+    """对 ``plan_read`` 结果的封装：``chunks`` 按文件偏移顺序覆盖目标区间。"""
 
     file_id: int
     chunks: list[ChunkRead]
-    inline_data: bytes | None = None
-
-
-@dataclass(frozen=True)
-class PreparedInlineFile:
-    """待提交的小文件整文件内联：字节形态与是否压缩已定，供 ``set_prepared_inline_file`` 写入元数据。
-
-    ``payload`` 为存入 SQLite 的字节串（可能已是 zstd 压缩包）；``raw_size`` 为解压后的逻辑长度。
-    ``clear_chunks`` 为真时，提交前会先删掉 ``file_chunks`` 并递减旧块 refcount。
-    """
-
-    payload: bytes
-    compressed: bool
-    raw_size: int
-    clear_chunks: bool
 
 
 @dataclass(frozen=True)
 class PreparedFileWrite:
-    """待提交的写入结果：非空写要么是整文件内联，要么是若干 ``PreparedBlock`` 按 chunk 绑定。
-
-    ``inline_file`` 与 ``chunks`` 互斥（一次提交只走其一）。``clear_inline`` 为真表示在写块之前
-    清除内联列（从内联迁回分块存储时）。提交时通过 ``set_prepared_chunk`` / 内联路径更新块引用，
-    替换旧块会先 ``decrement_block``、新块 ``ensure_prepared_block`` 后 ``attach``，维持 refcount 一致。
-    """
+    """待提交的写入结果：若干 ``PreparedBlock`` 按 chunk 绑定。"""
 
     file_id: int
     bytes_written: int
     new_size: int
-    inline_file: PreparedInlineFile | None
     chunks: list[tuple[int, PreparedBlock]]
-    clear_inline: bool = False
 
 
 class FileContentService:
     """在 ``file_chunks``、块引用计数与 ``BlockStore`` 之间编排普通文件的字节读写。
 
-    负责生成读取计划（含稀疏与内联）、准备压缩/内容寻址块、提交后更新 inode 大小与时间戳；
+    负责生成读取计划（含稀疏）、准备压缩/内容寻址块、提交后更新 inode 大小与时间戳；
     截断与覆盖路径与元数据、块 refcount 在同一调用链上保持一致。
     """
 
@@ -93,18 +66,16 @@ class FileContentService:
         block_store: BlockStore,
         *,
         chunk_size: int,
-        small_file_inline_max: int,
         compression_allowed: Callable[[str], bool],
     ):
-        """绑定元数据、块存储、分块大小、小文件内联上限及按路径是否允许压缩。"""
+        """绑定元数据、块存储、分块大小及按路径是否允许压缩。"""
         self.metadata = metadata
         self.block_store = block_store
         self.chunk_size = chunk_size
-        self.small_file_inline_max = small_file_inline_max
         self.compression_allowed = compression_allowed
 
     def read_file(self, node, size: int, offset: int) -> bytes:
-        """按节点读 ``[offset, offset+size)``：生成计划、读块/内联、更新访问时间与块访问统计。"""
+        """按节点读 ``[offset, offset+size)``：生成计划、读块、更新访问时间与块访问统计。"""
         with self.metadata.read_transaction():
             plan = self.plan_read(node, size, offset)
         data, accesses = self.execute_read_plan(plan)
@@ -126,7 +97,7 @@ class FileContentService:
         return data
 
     def plan_read(self, node, size: int, offset: int) -> FileReadPlan:
-        """构造 ``FileReadPlan``：内联则切片内存字节；否则列出覆盖区间的 chunk 及每段 ``ChunkRead``。
+        """构造 ``FileReadPlan``：列出覆盖区间的 chunk 及每段 ``ChunkRead``。
 
         无映射 chunk 在计划中 ``row`` 为 ``None``（稀疏）；offset 越界或 size<=0 返回空计划。
         """
@@ -147,12 +118,6 @@ class FileContentService:
             return FileReadPlan(file_id=node["id"], chunks=[])
 
         end = min(offset + size, node["size"])
-        if self.has_inline_payload(node):
-            data = self.decode_inline_payload(node)
-            return FileReadPlan(
-                file_id=node["id"], chunks=[], inline_data=data[offset:end]
-            )
-
         chunks: list[ChunkRead] = []
         first_chunk = offset // self.chunk_size
         last_chunk = (end - 1) // self.chunk_size
@@ -184,9 +149,7 @@ class FileContentService:
         return FileReadPlan(file_id=node["id"], chunks=chunks)
 
     def execute_read_plan(self, plan: FileReadPlan) -> tuple[bytes, list[BlockAccess]]:
-        """按计划拼接返回值：内联直接返回；否则对 ``row`` 为 ``None`` 的段输出零填充，有则向 ``BlockStore`` 取快照并切片。"""
-        if plan.inline_data is not None:
-            return plan.inline_data, []
+        """按计划拼接返回值：对 ``row`` 为 ``None`` 的段输出零填充，有则向 ``BlockStore`` 取快照并切片。"""
         chunks: list[bytes] = []
         accesses: list[BlockAccess] = []
         block_reads = [read for read in plan.chunks if read.row is not None]
@@ -231,7 +194,7 @@ class FileContentService:
         if offset < 0:
             raise FuseOSError(errno.EINVAL)
         if not data:
-            return PreparedFileWrite(node["id"], 0, node["size"], None, [])
+            return PreparedFileWrite(node["id"], 0, node["size"], [])
         if node["kind"] != "file":
             raise FuseOSError(errno.EISDIR)
 
@@ -247,34 +210,6 @@ class FileContentService:
             len(data),
             compress,
         )
-        if self.can_store_inline(new_size):
-            if self.has_inline_payload(node):
-                chunk = bytearray(self.decode_inline_payload(node))
-                if len(chunk) < new_size:
-                    chunk.extend(b"\x00" * (new_size - len(chunk)))
-                chunk[offset : offset + len(data)] = data
-                return PreparedFileWrite(
-                    node["id"],
-                    len(data),
-                    new_size,
-                    self.prepare_inline_file(
-                        bytes(chunk), compress, clear_chunks=False
-                    ),
-                    [],
-                )
-            if old_size == 0 and offset == 0:
-                return PreparedFileWrite(
-                    node["id"],
-                    len(data),
-                    new_size,
-                    self.prepare_inline_file(data, compress, clear_chunks=False),
-                    [],
-                )
-
-        inline_data = None
-        if self.has_inline_payload(node):
-            inline_data = self.decode_inline_payload(node)
-
         data_pos = 0
         first_chunk = offset // self.chunk_size
         last_chunk = (offset + len(data) - 1) // self.chunk_size
@@ -284,7 +219,6 @@ class FileContentService:
                 node["id"],
                 len(data),
                 new_size,
-                None,
                 self.block_store.prepare_blocks([(first_chunk, data)], compress),
             )
 
@@ -305,20 +239,12 @@ class FileContentService:
                 pending_chunks.append((chunk_index, source))
                 pending_chunk_indexes.add(chunk_index)
                 continue
-            if inline_data is not None and chunk_index == 0:
-                chunk = bytearray(inline_data[:existing_len])
-            else:
-                chunk = bytearray(
-                    self.read_chunk(node["id"], chunk_index, existing_len)
-                )
+            chunk = bytearray(self.read_chunk(node["id"], chunk_index, existing_len))
             if len(chunk) < chunk_len:
                 chunk.extend(b"\x00" * (chunk_len - len(chunk)))
             chunk[write_start:write_stop] = source
             pending_chunks.append((chunk_index, bytes(chunk)))
             pending_chunk_indexes.add(chunk_index)
-
-        if inline_data is not None and old_size > 0 and 0 not in pending_chunk_indexes:
-            pending_chunks.insert(0, (0, inline_data))
 
         logger.debug(
             "写入文件内容分块完成：inode={}，first_chunk={}，last_chunk={}，pending_chunks={}",
@@ -331,26 +257,19 @@ class FileContentService:
             node["id"],
             len(data),
             new_size,
-            None,
             self.block_store.prepare_blocks(pending_chunks, compress),
-            clear_inline=inline_data is not None,
         )
 
     def commit_prepared_write(self, write: PreparedFileWrite) -> int:
-        """将 ``PreparedFileWrite`` 落库：内联路径写内联列；否则可选清除内联后逐 chunk ``set_prepared_chunk``，最后更新文件大小。"""
+        """将 ``PreparedFileWrite`` 落库：提交 chunk 替换，最后更新文件大小。"""
         if write.bytes_written == 0:
             return 0
-        if write.inline_file is not None:
-            self.set_prepared_inline_file(write.file_id, write.inline_file)
-            return write.bytes_written
-        if write.clear_inline:
-            self.metadata.clear_inline_file(write.file_id)
         self.set_prepared_chunks(write.file_id, write.chunks)
         self.metadata.set_node_size(write.file_id, write.new_size, time_ns())
         return write.bytes_written
 
     def truncate_file(self, file_id: int, path: str, length: int) -> None:
-        """将文件截断到 ``length``：仍满足内联阈值则截断内联；否则先 ``promote_inline_file`` 再删尾部 chunk 或重写最后一个部分 chunk。
+        """将文件截断到 ``length``：删除尾部 chunk 或重写最后一个部分 chunk。
 
         删除 chunk 会递减块 refcount；缩短时在边界块上保留 ``length`` 之前的字节。
         """
@@ -373,18 +292,6 @@ class FileContentService:
             length,
             compress,
         )
-        if self.has_inline_payload(node):
-            data = self.decode_inline_payload(node)
-            if self.can_store_inline(length):
-                self.set_inline_file(
-                    file_id,
-                    data[:length].ljust(length, b"\x00"),
-                    compress,
-                    clear_chunks=False,
-                )
-                return
-            self.promote_inline_file(node, path)
-
         if length == 0:
             self.remove_file_chunks(file_id)
         else:
@@ -468,9 +375,7 @@ class FileContentService:
             )
 
     def remove_file_chunks(self, file_id: int, first_index: int = 0) -> None:
-        """从 ``first_index`` 起删除所有 chunk 记录；若 ``first_index==0`` 同时清除内联列，并对每个被删哈希 ``decrement_block``。"""
-        if first_index == 0:
-            self.metadata.clear_inline_file(file_id)
+        """从 ``first_index`` 起删除所有 chunk 记录，并对每个被删哈希更新 refcount。"""
         deltas = self.metadata.replace_file_chunks(file_id, {}, delete_from=first_index)
         logger.debug(
             "删除文件 chunk 范围：inode={}，first_index={}，refcount_deltas={}",
@@ -478,95 +383,3 @@ class FileContentService:
             first_index,
             len(deltas),
         )
-
-    def can_store_inline(self, size: int) -> bool:
-        """当前配置下给定逻辑大小是否允许仅用内联列存放（受 ``small_file_inline_max`` 与 ``chunk_size`` 约束）。"""
-        return (
-            self.small_file_inline_max > 0
-            and size <= self.small_file_inline_max
-            and size <= self.chunk_size
-        )
-
-    def has_inline_payload(self, node) -> bool:
-        """节点是否在元数据中存有内联文件体（``inline_stored_size`` 非零）。"""
-        return bool(node["inline_stored_size"])
-
-    def set_inline_file(
-        self, file_id: int, data: bytes, compress: bool, *, clear_chunks: bool = True
-    ) -> None:
-        """将原始字节编码为内联并写入；``clear_chunks`` 控制是否先清空分块表。"""
-        self.set_prepared_inline_file(
-            file_id, self.prepare_inline_file(data, compress, clear_chunks=clear_chunks)
-        )
-
-    def prepare_inline_file(
-        self, data: bytes, compress: bool, *, clear_chunks: bool
-    ) -> PreparedInlineFile:
-        """构造 ``PreparedInlineFile``：可选 zstd 压缩至不超过内联上限，否则存明文；记录逻辑 ``raw_size``。"""
-        if not data:
-            return PreparedInlineFile(b"", False, 0, clear_chunks)
-        payload = data
-        compressed = False
-        if compress and len(data) >= self.block_store.compression_min_bytes:
-            packed, was_compressed = self.block_store.encode_block(data, True)
-            if was_compressed and len(packed) <= self.small_file_inline_max:
-                payload = packed
-                compressed = True
-        return PreparedInlineFile(payload, compressed, len(data), clear_chunks)
-
-    def set_prepared_inline_file(
-        self, file_id: int, inline_file: PreparedInlineFile
-    ) -> None:
-        """应用内联写入：空 payload 等价清空文件；否则按需 ``remove_file_chunks`` 再写入内联列与时间戳。"""
-        if not inline_file.payload:
-            self.remove_file_chunks(file_id)
-            self.metadata.set_node_size(file_id, 0, time_ns())
-            return
-        if inline_file.clear_chunks:
-            self.remove_file_chunks(file_id)
-        self.metadata.set_inline_file(
-            file_id,
-            inline_file.payload,
-            compressed=inline_file.compressed,
-            raw_size=inline_file.raw_size,
-            now=time_ns(),
-        )
-
-    def promote_inline_file(self, node, path: str) -> None:
-        """把当前内联文件体迁出到分块存储：解码后清内联列，将数据写入 chunk 0（含压缩策略）。"""
-        data = self.decode_inline_payload(node)
-        self.metadata.clear_inline_file(node["id"])
-        if data:
-            self.set_chunk(node["id"], 0, data, self.compression_allowed(path))
-
-    def decode_inline_payload(self, node) -> bytes:
-        """从元数据行读出内联字节：未压缩则校验长度；压缩则 zstd 解压并校验与 ``node["size"]`` 一致。"""
-        row = self.metadata.inline_payload(node["id"])
-        if row is None:
-            logger.error("inode 内联 payload 缺失：inode={}", node["id"])
-            raise FuseOSError(errno.EIO)
-        payload = bytes(row["payload"])
-        if not row["compressed"]:
-            if len(payload) != row["raw_size"] or len(payload) != node["size"]:
-                logger.error(
-                    "inode 内联 payload 大小不匹配：inode={}，expected={}，actual={}",
-                    node["id"],
-                    node["size"],
-                    len(payload),
-                )
-                raise FuseOSError(errno.EIO)
-            return payload
-        try:
-            data = zstd.decompress(payload)
-        except zstd.ZstdError as exc:
-            logger.error("inode 内联 payload 解压失败：inode={}", node["id"])
-            raise FuseOSError(errno.EIO) from exc
-        if len(data) != row["raw_size"] or len(data) != node["size"]:
-            logger.error(
-                "inode 内联 payload 大小不匹配：inode={}，expected={}，actual={}",
-                node["id"],
-                node["size"],
-                len(data),
-            )
-            raise FuseOSError(errno.EIO)
-        return data

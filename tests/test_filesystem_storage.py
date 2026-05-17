@@ -168,7 +168,7 @@ def test_ztierfs_uses_processed_payload_size_for_inline_threshold(tmp_path):
     assert rows_by_name["photo.jpg"]["storage"] == "tiered"
 
 
-def test_ztierfs_stores_small_files_inline_in_payload_table_and_reopens(tmp_path):
+def test_ztierfs_stores_small_files_as_inline_block_and_reopens(tmp_path):
     fs_impl = make_fs(tmp_path)
     data = b"tiny payload"
 
@@ -177,20 +177,26 @@ def test_ztierfs_stores_small_files_inline_in_payload_table_and_reopens(tmp_path
         fs("write", "/small.txt", data, 0, fh)
         fs("release", "/small.txt", fh)
 
-    inode = rows(
+    block = rows(
         fs_impl,
         """
-        SELECT inodes.size, inode_payloads.payload, inode_payloads.stored_size
+        SELECT inodes.size, file_chunks.chunk_index, file_chunks.size AS chunk_size,
+               block_records.storage, block_records.inline_payload,
+               block_records.stored_size, block_records.hot_present,
+               block_records.cold_present
         FROM inodes
-        JOIN inode_payloads ON inode_payloads.inode_id = inodes.id
+        JOIN file_chunks ON file_chunks.file_id = inodes.id
+        JOIN block_records ON block_records.hash = file_chunks.hash
         WHERE inodes.kind = 'file'
         """,
     )[0]
-    assert inode["size"] == len(data)
-    assert bytes(inode["payload"]) == data
-    assert inode["stored_size"] == len(data)
-    assert rows(fs_impl, "SELECT * FROM file_chunks") == []
-    assert rows(fs_impl, "SELECT * FROM blocks") == []
+    assert block["size"] == len(data)
+    assert block["chunk_index"] == 0
+    assert block["chunk_size"] == len(data)
+    assert block["storage"] == "inline"
+    assert bytes(block["inline_payload"]) == data
+    assert block["stored_size"] == len(data)
+    assert (block["hot_present"], block["cold_present"]) == (0, 0)
 
     reopened = make_fs(tmp_path)
     with adapted(reopened) as fs:
@@ -233,7 +239,7 @@ def test_open_trunc_uses_inode_selected_before_path_replacement(tmp_path, monkey
         assert fs("read", "/target.txt", 3, 0, new_fh) == b"new"
 
 
-def test_ztierfs_inline_file_hardlinks_share_payload_and_xattrs(tmp_path):
+def test_ztierfs_inline_block_hardlinks_share_inode_content_and_xattrs(tmp_path):
     fs_impl = make_fs(tmp_path)
 
     with adapted(fs_impl) as fs:
@@ -254,10 +260,13 @@ def test_ztierfs_inline_file_hardlinks_share_payload_and_xattrs(tmp_path):
         "SELECT DISTINCT inode_id FROM dir_entries WHERE name IN ('file.txt', 'alias.txt')",
     )
     assert len(linked_inodes) == 1
-    assert rows(fs_impl, "SELECT COUNT(*) AS total FROM blocks")[0]["total"] == 0
+    assert rows(fs_impl, "SELECT COUNT(*) AS total FROM blocks")[0]["total"] == 1
+    assert rows(fs_impl, "SELECT COUNT(*) AS total FROM file_chunks")[0]["total"] == 1
 
 
-def test_ztierfs_promotes_inline_file_when_append_crosses_threshold(tmp_path):
+def test_ztierfs_grows_inline_block_to_tiered_block_when_append_crosses_threshold(
+    tmp_path,
+):
     fs_impl = make_fs(tmp_path, inline_max_bytes=16)
     expected = b"small" + b"x" * 20
 
@@ -267,11 +276,12 @@ def test_ztierfs_promotes_inline_file_when_append_crosses_threshold(tmp_path):
         fs("write", "/grows.txt", b"x" * 20, 5, fh)
         assert fs("read", "/grows.txt", len(expected), 0, fh) == expected
 
-    assert rows(fs_impl, "SELECT * FROM inode_payloads") == []
     assert rows(fs_impl, "SELECT COUNT(*) AS total FROM file_chunks")[0]["total"] == 1
 
 
-def test_ztierfs_promotes_inline_file_when_truncate_grows_past_threshold(tmp_path):
+def test_ztierfs_grows_inline_block_to_tiered_block_when_truncate_grows_past_threshold(
+    tmp_path,
+):
     fs_impl = make_fs(tmp_path, inline_max_bytes=8)
 
     with adapted(fs_impl) as fs:
@@ -280,11 +290,10 @@ def test_ztierfs_promotes_inline_file_when_truncate_grows_past_threshold(tmp_pat
         fs("truncate", "/sparse.txt", 12, fh)
         assert fs("read", "/sparse.txt", 12, 0, fh) == b"abc" + b"\x00" * 9
 
-    assert rows(fs_impl, "SELECT * FROM inode_payloads") == []
     assert rows(fs_impl, "SELECT COUNT(*) AS total FROM file_chunks")[0]["total"] == 1
 
 
-def test_ztierfs_clonefile_copies_inline_payload_without_reprocessing_blocks(
+def test_ztierfs_clonefile_copies_inline_block_without_reprocessing_blocks(
     tmp_path, monkeypatch
 ):
     fs_impl = make_fs(tmp_path)
@@ -295,7 +304,7 @@ def test_ztierfs_clonefile_copies_inline_payload_without_reprocessing_blocks(
         fs("setxattr", "/source.txt", "user.note", b"copied", 0, 0)
 
         def fail_prepare_blocks(*args, **kwargs):
-            raise AssertionError("inline clonefile must not reprocess blocks")
+            raise AssertionError("inline block clonefile must not reprocess blocks")
 
         monkeypatch.setattr(fs_impl.block_store, "prepare_blocks", fail_prepare_blocks)
         fs("clonefile", "/source.txt", "/copy.txt")
@@ -304,8 +313,9 @@ def test_ztierfs_clonefile_copies_inline_payload_without_reprocessing_blocks(
         assert fs("read", "/copy.txt", 5, 0, copy_fh) == b"small"
         assert fs("getxattr", "/copy.txt", "user.note", 0) == b"copied"
 
-    assert rows(fs_impl, "SELECT COUNT(*) AS total FROM file_chunks")[0]["total"] == 0
-    assert rows(fs_impl, "SELECT COUNT(*) AS total FROM blocks")[0]["total"] == 0
+    assert rows(fs_impl, "SELECT COUNT(*) AS total FROM file_chunks")[0]["total"] == 2
+    assert rows(fs_impl, "SELECT COUNT(*) AS total FROM blocks")[0]["total"] == 1
+    assert rows(fs_impl, "SELECT refcount FROM blocks")[0]["refcount"] == 2
 
 
 def test_ztierfs_internal_write_merge_does_not_flush_read_stats(tmp_path):
@@ -639,15 +649,10 @@ def test_ztierfs_recovers_when_block_metadata_points_to_missing_tier(tmp_path):
         with connect_sqlite(fs_impl.database) as db:
             db.execute(
                 """
-                UPDATE blocks SET preferred_tier = 2 WHERE hash = ?
+                UPDATE blocks
+                SET preferred_tier = 2, hot_present = 0, cold_present = 1
+                WHERE hash = ?
                 """,
-                (digest,),
-            )
-            db.execute(
-                "DELETE FROM block_locations WHERE hash = ? AND tier = 1", (digest,)
-            )
-            db.execute(
-                "INSERT OR IGNORE INTO block_locations (hash, tier) VALUES (?, 2)",
                 (digest,),
             )
         fs_impl.block_store._read_cache.clear()
@@ -708,10 +713,13 @@ def test_ztierfs_reads_hot_fallback_when_cold_preferred_unavailable(
         cold_path.write_bytes(hot_path.read_bytes())
         with connect_sqlite(fs_impl.database) as db:
             db.execute(
-                "INSERT OR IGNORE INTO block_locations (hash, tier) VALUES (?, 2)",
+                """
+                UPDATE blocks
+                SET preferred_tier = 2, cold_present = 1
+                WHERE hash = ?
+                """,
                 (digest,),
             )
-            db.execute("UPDATE blocks SET preferred_tier = 2 WHERE hash = ?", (digest,))
         fs_impl.block_store._read_cache.clear()
         fs_impl.block_store._read_cache_size = 0
 

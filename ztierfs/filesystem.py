@@ -229,7 +229,6 @@ class ZTierFS(
             self.metadata,
             self.block_store,
             chunk_size=chunk_size,
-            small_file_inline_max=inline_max_bytes,
             compression_allowed=self._compression_allowed,
         )
 

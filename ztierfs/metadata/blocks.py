@@ -1,7 +1,4 @@
-"""blocks / block_locations / block_payloads 上的 refcount 与冷热层（tier）信息。
-
-block_locations.tier 约定：1 表示热层，2 表示冷层；inline 块不走冷热复制路径。
-"""
+"""blocks / block_payloads 上的 refcount 与冷热层（tier）信息。"""
 
 import sqlite3
 
@@ -47,17 +44,13 @@ class BlockMetadataMixin(MetadataMixinBase):
         return self._db.execute(
             """
             SELECT
-                blocks.refcount,
-                blocks.storage_kind AS storage,
-                CASE WHEN hot_locations.hash IS NULL THEN 0 ELSE 1 END AS hot_present,
-                CASE WHEN cold_locations.hash IS NULL THEN 0 ELSE 1 END AS cold_present,
-                blocks.preferred_tier
+                refcount,
+                storage_kind AS storage,
+                hot_present,
+                cold_present,
+                preferred_tier
             FROM blocks
-            LEFT JOIN block_locations AS hot_locations
-              ON hot_locations.hash = blocks.hash AND hot_locations.tier = 1
-            LEFT JOIN block_locations AS cold_locations
-              ON cold_locations.hash = blocks.hash AND cold_locations.tier = 2
-            WHERE blocks.hash = ?
+            WHERE hash = ?
             """,
             (digest,),
         ).fetchone()
@@ -78,9 +71,9 @@ class BlockMetadataMixin(MetadataMixinBase):
             """
             INSERT INTO blocks (
                 hash, storage_kind, preferred_tier, compressed, raw_size, stored_size,
-                refcount, atime_ns, read_count
+                refcount, atime_ns, read_count, hot_present, cold_present
             )
-            VALUES (?, ?, ?, ?, ?, ?, 0, ?, 0)
+            VALUES (?, ?, ?, ?, ?, ?, 0, ?, 0, ?, ?)
             """,
             (
                 digest,
@@ -90,6 +83,8 @@ class BlockMetadataMixin(MetadataMixinBase):
                 raw_size,
                 stored_size,
                 now,
+                0 if is_inline else 1,
+                0,
             ),
         )
         if is_inline:
@@ -99,11 +94,6 @@ class BlockMetadataMixin(MetadataMixinBase):
                 VALUES (?, ?)
                 """,
                 (digest, inline_payload),
-            )
-        else:
-            self._db.execute(
-                "INSERT INTO block_locations (hash, tier) VALUES (?, 1)",
-                (digest,),
             )
 
     def increment_block_refcount(self, digest: str) -> None:
@@ -147,17 +137,13 @@ class BlockMetadataMixin(MetadataMixinBase):
         rows = self._db.execute(
             f"""
             SELECT
-                blocks.hash,
-                blocks.refcount,
-                blocks.storage_kind AS storage,
-                CASE WHEN hot_locations.hash IS NULL THEN 0 ELSE 1 END AS hot_present,
-                CASE WHEN cold_locations.hash IS NULL THEN 0 ELSE 1 END AS cold_present
+                hash,
+                refcount,
+                storage_kind AS storage,
+                hot_present,
+                cold_present
             FROM blocks
-            LEFT JOIN block_locations AS hot_locations
-              ON hot_locations.hash = blocks.hash AND hot_locations.tier = 1
-            LEFT JOIN block_locations AS cold_locations
-              ON cold_locations.hash = blocks.hash AND cold_locations.tier = 2
-            WHERE blocks.hash IN ({placeholders})
+            WHERE hash IN ({placeholders})
             """,
             negative_digests,
         ).fetchall()
@@ -215,17 +201,17 @@ class BlockMetadataMixin(MetadataMixinBase):
     ) -> None:
         """更新块在冷热层的物理存在标记及 blocks 表中的冷热迁移动态字段。
 
-        hot_present / cold_present 为 True 时在对应 tier（1=热，2=冷）插入
-        block_locations 行，为 False 时删除；不传则不改该行。
-        preferred_tier、last_promoted_ns、last_demoted_ns、cold_verified_ns 仅更新
-        blocks 表中已给出的列；若本次调用未产生任何 blocks 列赋值则直接返回。
+        hot_present / cold_present 不传则不改；preferred_tier、last_promoted_ns、
+        last_demoted_ns、cold_verified_ns 仅更新已给出的列；若本次调用未产生任何赋值则直接返回。
         """
         assignments: list[str] = []
         values: list[int | str | None] = []
         if hot_present is not None:
-            self._set_block_location(digest, 1, hot_present)
+            assignments.append("hot_present = ?")
+            values.append(int(hot_present))
         if cold_present is not None:
-            self._set_block_location(digest, 2, cold_present)
+            assignments.append("cold_present = ?")
+            values.append(int(cold_present))
         if preferred_tier is not None:
             assignments.append("preferred_tier = ?")
             values.append(preferred_tier)
@@ -246,27 +232,13 @@ class BlockMetadataMixin(MetadataMixinBase):
             values,
         )
 
-    def _set_block_location(self, digest: str, tier: int, present: bool) -> None:
-        """按 tier（1 热 / 2 冷）插入或删除 block_locations 一行。"""
-        if present:
-            self._db.execute(
-                "INSERT OR IGNORE INTO block_locations (hash, tier) VALUES (?, ?)",
-                (digest, tier),
-            )
-        else:
-            self._db.execute(
-                "DELETE FROM block_locations WHERE hash = ? AND tier = ?",
-                (digest, tier),
-            )
-
     def hot_tier_stored_size(self) -> int:
         """处理 hot tier stored size。"""
         return self._db.execute(
             """
             SELECT COALESCE(SUM(stored_size), 0)
             FROM blocks
-            JOIN block_locations ON block_locations.hash = blocks.hash
-            WHERE blocks.storage_kind = 'tiered' AND block_locations.tier = 1
+            WHERE storage_kind = 'tiered' AND hot_present = 1
             """
         ).fetchone()[0]
 
@@ -291,18 +263,12 @@ class BlockMetadataMixin(MetadataMixinBase):
             SELECT
                 blocks.hash,
                 blocks.stored_size,
-                CASE
-                    WHEN cold_locations.hash IS NULL THEN 0
-                    ELSE 1
-                END AS cold_present,
+                blocks.cold_present,
                 COALESCE(MIN(file_chunks.chunk_index), 2147483647) AS first_chunk_index
             FROM blocks
-            JOIN block_locations AS hot_locations
-              ON hot_locations.hash = blocks.hash AND hot_locations.tier = 1
-            LEFT JOIN block_locations AS cold_locations
-              ON cold_locations.hash = blocks.hash AND cold_locations.tier = 2
             LEFT JOIN file_chunks ON file_chunks.hash = blocks.hash
             WHERE blocks.storage_kind = 'tiered'
+              AND blocks.hot_present = 1
               AND blocks.atime_ns <= ?
               AND NOT EXISTS (
                   SELECT 1
@@ -326,11 +292,9 @@ class BlockMetadataMixin(MetadataMixinBase):
             """
             SELECT blocks.hash
             FROM blocks
-            JOIN block_locations AS hot_locations
-              ON hot_locations.hash = blocks.hash AND hot_locations.tier = 1
-            JOIN block_locations AS cold_locations
-              ON cold_locations.hash = blocks.hash AND cold_locations.tier = 2
             WHERE blocks.storage_kind = 'tiered'
+              AND blocks.hot_present = 1
+              AND blocks.cold_present = 1
               AND blocks.preferred_tier = 1
               AND blocks.last_promoted_ns IS NOT NULL
               AND blocks.last_promoted_ns <= ?

@@ -99,7 +99,7 @@ class FileOpsMixin(FileSystemMixinBase):
         return 0
 
     def _remove_entry_node(self, node) -> None:
-        """删除目录项，必要时同步回收无链接且未打开的 inode payload。"""
+        """删除目录项，必要时同步回收无链接且未打开的 inode 内容。"""
         now = time_ns()
         remaining = self.metadata.remove_entry(
             node["parent_id"], node["name"], node["id"], now
@@ -128,6 +128,6 @@ class FileOpsMixin(FileSystemMixinBase):
         if node["kind"] == "file":
             self.file_content.remove_file_chunks(node["id"])
         logger.debug(
-            "删除 inode payload 和元数据：inode={}，kind={}", node["id"], node["kind"]
+            "删除 inode 内容和元数据：inode={}，kind={}", node["id"], node["kind"]
         )
         self.metadata.delete_node(node["id"])

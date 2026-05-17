@@ -145,7 +145,7 @@ uv run python -m ztierfs scrub /tmp/ztierfs-metadata.sqlite3 --include-cold
 uv run python -m ztierfs stats /tmp/ztierfs-metadata.sqlite3 --json
 ```
 
-`cleanup` 删除已经提升到热层、并且超过保留时间的冷层副本。它适合定期运行，用来把 rclone 冷层的删除操作从读路径上移走。冷层临时不可访问时会跳过对应副本并保留 `block_locations` 元数据，输出中的 `skipped_cold_copies` 表示本次未处理的冷层副本数量：
+`cleanup` 删除已经提升到热层、并且超过保留时间的冷层副本。它适合定期运行，用来把 rclone 冷层的删除操作从读路径上移走。冷层临时不可访问时会跳过对应副本并保留 `blocks.cold_present` 元数据，输出中的 `skipped_cold_copies` 表示本次未处理的冷层副本数量：
 
 ```bash
 uv run python -m ztierfs cleanup /tmp/ztierfs-metadata.sqlite3 --age 86400
@@ -181,14 +181,12 @@ SQLite 表：
 - `inodes`：文件、目录和符号链接的 POSIX 元数据。
 - `dir_entries`：目录项到 inode 的映射，用于支持 hardlink。
 - `inode_xattrs`：挂在 inode 上的扩展属性。
-- `inode_payloads`：小到不需要分块的小文件直接以 inode 级 payload 存入 SQLite。
-- `blocks`：块元数据、首选层级、压缩状态、大小、引用计数、访问时间、读取频率和迁移时间。
-- `block_locations`：tiered 块在热层和冷层的实际副本位置。
+- `blocks`：块元数据、首选层级、冷热层 presence、压缩状态、大小、引用计数、访问时间、读取频率和迁移时间。
 - `block_payloads`：inline 块的 payload，直接存入 SQLite。
 - `file_chunks`：从 `file_id`（文件 inode）+ `chunk_index` 到块 `hash` 和 `size` 的映射。
 - `filesystem_config`：记录热层和冷层的绝对路径，便于维护命令只凭数据库定位整套存储。
 
-块记录有两种存储形态：`inline` 块的 payload 直接关联到 `block_payloads`，不参与冷层降级；`tiered` 块的文件路径由 SHA-256 digest 派生，按 `aa/bb/<sha256>` 分桶保存在热层或冷层。`block_records` view 会把块元数据、层级副本和 inline payload 聚合成维护工具使用的统一视图。
+所有非空普通文件内容都通过 `file_chunks -> blocks` 表达；小文件也会建立 chunk 映射，只是目标块可为 `inline`。块记录有两种存储形态：`inline` 块的 payload 直接关联到 `block_payloads`，不参与冷层降级，且 `preferred_tier = 0`、`hot_present = 0`、`cold_present = 0`；`tiered` 块的文件路径由 SHA-256 digest 派生，按 `aa/bb/<sha256>` 分桶保存在热层或冷层，冷热副本 presence 直接记录在 `blocks.hot_present` 和 `blocks.cold_present`。`block_records` view 会把块元数据和 inline payload 聚合成维护工具使用的统一视图。
 
 ## 开发说明
 

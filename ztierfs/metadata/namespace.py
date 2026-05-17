@@ -1,13 +1,10 @@
 """命名空间元数据的 SQL 辅助：路径解析、`dir_entries` 与 `NODE_SELECT` 上的 inode 行。
 
-`NODE_SELECT` 在 `inodes` 上左联 `inode_payloads`，为每条 inode 额外选出内联小文件的
-`inline_compressed`、`inline_stored_size`（无内联则 COALESCE 为 0）。凡通过本模块中基于
-`NODE_SELECT` 的查询取到的「节点行」，其列集一致，便于上层与 `inode_payloads` / 块引用
-对照。macOS 回收站布局：根下按需创建 `.Trashes`（权限类 1777、属主 root）及
+`NODE_SELECT` 统一返回 inode 行，便于上层 child/children 等接口共享列集。macOS 回收站布局：
+根下按需创建 `.Trashes`（权限类 1777、属主 root）及
 `.Trashes/<uid>/`（属主为当前用户）；详见 `ensure_trash_directories`。
 
-内联 payload 直接保存在 SQLite。`link_node` 仅增加目录项与 `nlink`，不复制 payload；
-`move_entry` 只改目录项路径，不改变 inode 与 payload 绑定。
+文件内容统一由 `file_chunks -> blocks` 表达；`link_node` 与 `move_entry` 只改变目录项和链接计数。
 """
 
 import errno
@@ -33,14 +30,7 @@ class NamespaceMixin(MetadataMixinBase):
     等接口返回结构一致。
     """
 
-    NODE_SELECT = """
-        SELECT
-            inodes.*,
-            COALESCE(inode_payloads.compressed, 0) AS inline_compressed,
-            COALESCE(inode_payloads.stored_size, 0) AS inline_stored_size
-        FROM inodes
-        LEFT JOIN inode_payloads ON inode_payloads.inode_id = inodes.id
-    """
+    NODE_SELECT = "SELECT inodes.* FROM inodes"
 
     def get_node(self, path: str) -> sqlite3.Row:
         """按路径解析 inode；不存在则抛出 ENOENT。返回行为 `NODE_SELECT` 结果集结构。"""
@@ -100,18 +90,6 @@ class NamespaceMixin(MetadataMixinBase):
             """,
             (node_id, node_id),
         ).fetchone()
-
-    def inline_payload(self, node_id: int) -> sqlite3.Row | None:
-        """读 `inode_payloads` 内联 payload 行。"""
-        row = self._db.execute(
-            """
-            SELECT payload, compressed, raw_size, stored_size
-            FROM inode_payloads
-            WHERE inode_id = ?
-            """,
-            (node_id,),
-        ).fetchone()
-        return row
 
     def child_dir_count(self, parent_id: int) -> int:
         """统计父目录下子项中 kind 为目录的个数。"""
@@ -280,7 +258,7 @@ class NamespaceMixin(MetadataMixinBase):
         size: int,
         now: int,
     ) -> int:
-        """克隆普通文件 inode：复制 `inode_payloads`、`file_chunks`（并递增块引用计数）、`inode_xattrs`，并在 `parent_id` 下新建目录项。"""
+        """克隆普通文件 inode：复制 `file_chunks`（并递增块引用计数）和 `inode_xattrs`，并在 `parent_id` 下新建目录项。"""
         cursor = self._db.execute(
             """
             INSERT INTO inodes
@@ -297,17 +275,6 @@ class NamespaceMixin(MetadataMixinBase):
         self._db.execute(
             "INSERT INTO dir_entries (parent_id, name, inode_id) VALUES (?, ?, ?)",
             (parent_id, name, inode_id),
-        )
-        self._db.execute(
-            """
-            INSERT INTO inode_payloads (
-                inode_id, payload, compressed, raw_size, stored_size
-            )
-            SELECT ?, payload, compressed, raw_size, stored_size
-            FROM inode_payloads
-            WHERE inode_id = ?
-            """,
-            (inode_id, source_id),
         )
         self._db.execute(
             """
@@ -346,7 +313,7 @@ class NamespaceMixin(MetadataMixinBase):
         return inode_id
 
     def link_node(self, parent_id: int, name: str, inode_id: int, now: int) -> None:
-        """为已有 inode 增加一条硬链接目录项，并将该 inode 的 `nlink` 加一（不复制 inline payload）。"""
+        """为已有 inode 增加一条硬链接目录项，并将该 inode 的 `nlink` 加一。"""
         self._db.execute(
             "INSERT INTO dir_entries (parent_id, name, inode_id) VALUES (?, ?, ?)",
             (parent_id, name, inode_id),
@@ -357,7 +324,7 @@ class NamespaceMixin(MetadataMixinBase):
         )
 
     def reset_file_node(self, node_id: int, mode: int, now: int) -> None:
-        """将文件 inode 截断语义落到元数据：`size` 置 0、更新时间戳，并清空内联内容。"""
+        """将文件 inode 截断语义落到元数据：`size` 置 0、更新时间戳。"""
         self._db.execute(
             """
             UPDATE inodes
@@ -366,14 +333,13 @@ class NamespaceMixin(MetadataMixinBase):
             """,
             (mode, now, now, node_id),
         )
-        self.clear_inline_file(node_id)
 
     def touch_node_atime(self, node_id: int, now: int) -> None:
         """仅更新 inode 的访问时间 `atime_ns`。"""
         self._db.execute("UPDATE inodes SET atime_ns = ? WHERE id = ?", (now, node_id))
 
     def set_node_size(self, node_id: int, size: int, now: int) -> None:
-        """设置逻辑文件长度并更新 mtime/ctime；随后清空内联文件状态（与块文件路径分工一致）。"""
+        """设置逻辑文件长度并更新 mtime/ctime。"""
         self._db.execute(
             """
             UPDATE inodes
@@ -381,53 +347,6 @@ class NamespaceMixin(MetadataMixinBase):
             WHERE id = ?
             """,
             (size, now, now, node_id),
-        )
-        self.clear_inline_file(node_id)
-
-    def set_inline_file(
-        self,
-        node_id: int,
-        data: bytes,
-        *,
-        compressed: bool,
-        raw_size: int,
-        now: int,
-    ) -> None:
-        """写入小文件内联：更新 inode `size` 与时间戳；在 `inode_payloads` 中记录 payload。"""
-        self._db.execute(
-            """
-            UPDATE inodes
-            SET size = ?, mtime_ns = ?, ctime_ns = ?
-            WHERE id = ?
-            """,
-            (raw_size, now, now, node_id),
-        )
-        self._db.execute(
-            """
-            INSERT INTO inode_payloads (
-                inode_id, payload, compressed, raw_size, stored_size
-            )
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(inode_id) DO UPDATE SET
-                payload = excluded.payload,
-                compressed = excluded.compressed,
-                raw_size = excluded.raw_size,
-                stored_size = excluded.stored_size
-            """,
-            (
-                node_id,
-                data,
-                int(compressed),
-                raw_size,
-                len(data),
-            ),
-        )
-
-    def clear_inline_file(self, node_id: int) -> None:
-        """删除 `inode_payloads` 行。"""
-        self._db.execute(
-            "DELETE FROM inode_payloads WHERE inode_id = ?",
-            (node_id,),
         )
 
     def delete_node(self, node_id: int) -> None:

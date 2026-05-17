@@ -18,7 +18,7 @@ from .paths import block_path
 class CleanupReport:
     """copy-up 后将冷层多余副本清理完毕后的计数汇总。
 
-    ``removed``：已成功删除冷层块文件，并从 ``block_locations`` 中移除 tier 2 记录的数量。
+    ``removed``：已成功删除冷层块文件，并清除 ``blocks.cold_present`` 的数量。
     ``skipped``：因冷层路径暂时不可用或删除失败而跳过、未改对应元数据的数量。
     """
 
@@ -35,9 +35,9 @@ def cleanup_promoted_cold_copies(
 ) -> CleanupReport:
     """在块已 copy-up 到热层且元数据首选热层后，按「提升」龄删除冷层上冗余副本并收紧位置记录。
 
-    仅针对 ``storage_kind`` 为分层块、热冷两层均有 ``block_locations``、``preferred_tier`` 为热层、
+    仅针对 ``storage_kind`` 为分层块、热冷两层均存在、``preferred_tier`` 为热层、
     且 ``last_promoted_ns`` 不晚于当前时刻减去 ``min_age_seconds`` 的条目：尝试删除冷层上的块文件，
-    成功则删除该行在 ``block_locations`` 中 tier 2 的记录。若冷层路径探测或删除因暂时不可用失败，
+    成功则清除该块 ``cold_present``。若冷层路径探测或删除因暂时不可用失败，
     则跳过该项（不计入删除），对应元数据保持不变。
 
     ``database`` 由 ``resolve_maintenance_paths`` 解析为数据库与冷热层根路径。
@@ -68,11 +68,9 @@ def cleanup_promoted_cold_copies(
                 """
                 SELECT blocks.hash
                 FROM blocks
-                JOIN block_locations AS hot_locations
-                  ON hot_locations.hash = blocks.hash AND hot_locations.tier = 1
-                JOIN block_locations AS cold_locations
-                  ON cold_locations.hash = blocks.hash AND cold_locations.tier = 2
                 WHERE blocks.storage_kind = 'tiered'
+                  AND blocks.hot_present = 1
+                  AND blocks.cold_present = 1
                   AND blocks.preferred_tier = 1
                   AND blocks.last_promoted_ns IS NOT NULL
                   AND blocks.last_promoted_ns <= ?
@@ -103,7 +101,7 @@ def cleanup_promoted_cold_copies(
                     )
                     continue
                 db.execute(
-                    "DELETE FROM block_locations WHERE hash = ? AND tier = 2",
+                    "UPDATE blocks SET cold_present = 0 WHERE hash = ?",
                     (row["hash"],),
                 )
                 removed += 1

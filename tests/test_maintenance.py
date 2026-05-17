@@ -30,12 +30,14 @@ def _make_cold_only_block(fs_impl, data: bytes = b"hello") -> tuple[str, bytes, 
     cold_path.parent.mkdir(parents=True, exist_ok=True)
     hot_path.replace(cold_path)
     with connect_sqlite(fs_impl.database) as db:
-        db.execute("DELETE FROM block_locations WHERE hash = ? AND tier = 1", (digest,))
         db.execute(
-            "INSERT OR IGNORE INTO block_locations (hash, tier) VALUES (?, 2)",
+            """
+            UPDATE blocks
+            SET hot_present = 0, cold_present = 1, preferred_tier = 2
+            WHERE hash = ?
+            """,
             (digest,),
         )
-        db.execute("UPDATE blocks SET preferred_tier = 2 WHERE hash = ?", (digest,))
     return digest, data, cold_path
 
 
@@ -149,17 +151,20 @@ def test_fsck_reports_missing_inline_payload_record(tmp_path):
     assert not report.issues[0].repaired
 
 
-def test_fsck_reports_missing_inode_payload_record(tmp_path):
+def test_fsck_reports_missing_file_chunks_for_non_empty_file(tmp_path):
     fs_impl = make_fs(tmp_path)
     with adapted(fs_impl) as fs:
         fh = fs("create", "/note.txt", 0o644)
         fs("write", "/note.txt", b"hello", 0, fh)
 
     with connect_sqlite(fs_impl.database) as db:
-        db.execute("DELETE FROM inode_payloads")
+        db.execute("UPDATE inodes SET size = 5 WHERE kind = 'file'")
+        db.execute("DELETE FROM file_chunks")
+        db.execute("DELETE FROM blocks")
+        db.execute("DELETE FROM block_payloads")
 
     report = run_fsck(fs_impl.database, repair=True)
-    assert [issue.code for issue in report.issues] == ["missing_inode_payload"]
+    assert [issue.code for issue in report.issues] == ["missing_file_chunks"]
     assert not report.issues[0].repaired
 
 
@@ -298,7 +303,7 @@ def test_scrub_repairs_bad_hot_copy_when_cold_copy_is_good(tmp_path):
     hot_path.write_bytes(b"x" * stored_size)
     with connect_sqlite(fs_impl.database) as db:
         db.execute(
-            "INSERT OR IGNORE INTO block_locations (hash, tier) VALUES (?, 2)",
+            "UPDATE blocks SET cold_present = 1 WHERE hash = ?",
             (digest,),
         )
 
@@ -371,15 +376,14 @@ def test_stats_reports_storage_summary(tmp_path):
     stats = collect_stats(fs_impl.database)
     data = stats.to_dict()
     assert data["inodes"]["files"] == 1
-    assert data["chunks"]["file_chunks"] == 0
-    assert data["blocks"]["total"] == 0
-    assert data["blocks"]["inline"] == 0
-    assert data["blocks"]["inode_inline"] == 1
+    assert data["chunks"]["file_chunks"] == 1
+    assert data["blocks"]["total"] == 1
+    assert data["blocks"]["inline"] == 1
     assert data["blocks"]["hot"] == 0
     assert data["blocks"]["cold"] == 0
     assert data["blocks"]["both"] == 0
     assert data["storage"]["logical_file_bytes"] == 5
-    assert data["storage"]["inode_inline_stored_bytes"] == 5
+    assert data["storage"]["inline_stored_bytes"] == 5
 
 
 def test_cleanup_removes_old_promoted_cold_copy(tmp_path):
@@ -396,13 +400,11 @@ def test_cleanup_removes_old_promoted_cold_copy(tmp_path):
     with connect_sqlite(fs_impl.database) as db:
         db.execute(
             """
-            UPDATE blocks SET preferred_tier = 1, last_promoted_ns = ? WHERE hash = ?
+            UPDATE blocks
+            SET preferred_tier = 1, cold_present = 1, last_promoted_ns = ?
+            WHERE hash = ?
             """,
             (time_ns() - 10_000_000_000, digest),
-        )
-        db.execute(
-            "INSERT OR IGNORE INTO block_locations (hash, tier) VALUES (?, 2)",
-            (digest,),
         )
 
     report = cleanup_promoted_cold_copies(
@@ -430,12 +432,12 @@ def test_cleanup_skips_cold_copy_when_cold_tier_unavailable(tmp_path, monkeypatc
     cold_path.write_bytes(hot_path.read_bytes())
     with connect_sqlite(fs_impl.database) as db:
         db.execute(
-            "UPDATE blocks SET preferred_tier = 1, last_promoted_ns = ? WHERE hash = ?",
+            """
+            UPDATE blocks
+            SET preferred_tier = 1, cold_present = 1, last_promoted_ns = ?
+            WHERE hash = ?
+            """,
             (time_ns() - 10_000_000_000, digest),
-        )
-        db.execute(
-            "INSERT OR IGNORE INTO block_locations (hash, tier) VALUES (?, 2)",
-            (digest,),
         )
 
     _make_path_stat_unavailable(monkeypatch, cold_path)
@@ -591,42 +593,6 @@ def test_fsck_repairs_inline_payload_table_corruption(tmp_path):
     }
     assert all(issue.repaired for issue in report.issues)
     assert rows(fs_impl, "SELECT * FROM block_payloads") == []
-
-
-def test_fsck_repairs_inode_payload_table_corruption(tmp_path):
-    fs_impl = make_fs(tmp_path)
-    with adapted(fs_impl) as fs:
-        fs("mkdir", "/docs", 0o755)
-
-    orphan_inode = 999
-    directory_inode = rows(
-        fs_impl, "SELECT inode_id FROM dir_entries WHERE name = 'docs'"
-    )[0]["inode_id"]
-    with connect_sqlite(fs_impl.database) as db:
-        db.execute("PRAGMA foreign_keys=OFF")
-        db.execute(
-            """
-            INSERT INTO inode_payloads (inode_id, payload, compressed, raw_size, stored_size)
-            VALUES (?, ?, 0, 6, 6)
-            """,
-            (orphan_inode, b"orphan"),
-        )
-        db.execute(
-            """
-            INSERT INTO inode_payloads (inode_id, payload, compressed, raw_size, stored_size)
-            VALUES (?, ?, 0, 10, 10)
-            """,
-            (directory_inode, b"unexpected"),
-        )
-
-    report = run_fsck(fs_impl.database, repair=True)
-
-    assert {issue.code for issue in report.issues} == {
-        "orphan_inode_payload",
-        "unexpected_inode_payload",
-    }
-    assert all(issue.repaired for issue in report.issues)
-    assert rows(fs_impl, "SELECT * FROM inode_payloads") == []
 
 
 @pytest.mark.parametrize(

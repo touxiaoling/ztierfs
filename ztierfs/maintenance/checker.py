@@ -1,7 +1,7 @@
 """维护侧一致性检查：用 SQLite 元数据对照磁盘上的块文件与内联载荷。
 
 **fsck（`run_fsck`）**：在元数据与路径探测层面核对引用计数、块记录与 `file_chunks`、
-冷热层上块文件是否存在、`blocks` 与 `block_locations` 是否一致、目录项与 chunk
+冷热层上块文件是否存在、`blocks` presence 是否一致、目录项与 chunk
 关系等；不读取整块 payload 做解压与逐字节校验（内联块仅检查是否有对应行/可读路径）。
 
 **scrub（`run_scrub`）**：在 fsck 相同流程之后，对 inode 内联数据、内联块和热层块文件执行读盘、
@@ -322,58 +322,26 @@ class Checker:
     def _check_inline_payload_records(
         self, db: sqlite3.Connection, *, has_block_records: bool
     ) -> None:
-        """检查 `inode_payloads` 与 inode 类型一致性、`block_payloads` 与 `blocks.storage` 一致性。
+        """检查 `block_payloads` 与 `blocks.storage` 一致性。
 
-        当库中尚无任一块元数据时，额外查找「size>0 却无 chunk 且无内联」的文件 inode，
-        报告 `missing_inode_payload`。
+        当库中尚无任一块元数据时，额外查找「size>0 却无 chunk」的文件 inode，
+        报告 `missing_file_chunks`。
         """
-        for row in db.execute(
-            """
-            SELECT inode_payloads.inode_id, inodes.kind
-            FROM inode_payloads
-            LEFT JOIN inodes ON inodes.id = inode_payloads.inode_id
-            """
-        ).fetchall():
-            if row["kind"] is None:
-                self._issue(
-                    "orphan_inode_payload",
-                    "inode inline payload exists without inode metadata",
-                    {"inode": row["inode_id"]},
-                    repairable=True,
-                    repair=lambda inode=row["inode_id"]: db.execute(
-                        "DELETE FROM inode_payloads WHERE inode_id = ?",
-                        (inode,),
-                    ),
-                )
-            elif row["kind"] != "file":
-                self._issue(
-                    "unexpected_inode_payload",
-                    "non-file inode has an inline payload",
-                    {"inode": row["inode_id"], "kind": row["kind"]},
-                    repairable=True,
-                    repair=lambda inode=row["inode_id"]: db.execute(
-                        "DELETE FROM inode_payloads WHERE inode_id = ?",
-                        (inode,),
-                    ),
-                )
-
         if not has_block_records:
             for row in db.execute(
                 """
                 SELECT inodes.id, inodes.size
                 FROM inodes
-                LEFT JOIN inode_payloads ON inode_payloads.inode_id = inodes.id
                 WHERE inodes.kind = 'file'
                   AND inodes.size > 0
-                  AND inode_payloads.inode_id IS NULL
                   AND NOT EXISTS (
                       SELECT 1 FROM file_chunks WHERE file_chunks.file_id = inodes.id
                   )
                 """
             ).fetchall():
                 self._issue(
-                    "missing_inode_payload",
-                    "non-empty file has neither chunk metadata nor inline payload",
+                    "missing_file_chunks",
+                    "non-empty file has no chunk metadata",
                     {"inode": row["id"], "size": row["size"]},
                 )
 
@@ -530,61 +498,11 @@ class Checker:
     def _scrub_block_payloads(
         self, db: sqlite3.Connection, blocks: dict[str, sqlite3.Row]
     ) -> None:
-        """scrub 阶段：读取 inode 内联与块级内联/分层文件中的 payload，校验压缩与 `stored_size`/`raw_size`/`size`。
+        """scrub 阶段：读取块级内联/分层文件中的 payload，校验压缩与 `stored_size`/`raw_size`/`size`。
 
         读盘时区分路径缺失（`PathMissing`）与暂时不可读（`PathUnavailable`）；后者记入
         `block_payload_unavailable` 而非当作内容损坏。冷层块默认跳过，除非 `include_cold` 为真。
         """
-        for row in db.execute(
-            """
-            SELECT inodes.id, inodes.size, inode_payloads.payload,
-                   inode_payloads.compressed, inode_payloads.raw_size,
-                   inode_payloads.stored_size
-            FROM inode_payloads
-            JOIN inodes ON inodes.id = inode_payloads.inode_id
-            """
-        ).fetchall():
-            payload = self._inline_payload_bytes(
-                row, issue_context={"inode": row["id"]}
-            )
-            if payload is None:
-                self._issue(
-                    "missing_inode_payload",
-                    "inode inline payload cannot be read",
-                    {"inode": row["id"]},
-                )
-                continue
-            if len(payload) != row["stored_size"]:
-                self._issue(
-                    "inode_payload_stored_size_mismatch",
-                    "inode inline payload size does not match metadata stored_size",
-                    {
-                        "inode": row["id"],
-                        "expected": row["stored_size"],
-                        "actual": len(payload),
-                    },
-                )
-                continue
-            try:
-                data = zstd.decompress(payload) if row["compressed"] else payload
-            except zstd.ZstdError as exc:
-                self._issue(
-                    "corrupt_inode_payload",
-                    "inode inline payload cannot be decoded",
-                    {"inode": row["id"], "error": str(exc)},
-                )
-                continue
-            if len(data) != row["raw_size"] or len(data) != row["size"]:
-                self._issue(
-                    "inode_payload_raw_size_mismatch",
-                    "inode inline payload raw size does not match metadata",
-                    {
-                        "inode": row["id"],
-                        "expected": row["size"],
-                        "actual": len(data),
-                    },
-                )
-
         for digest, row in blocks.items():
             if row["storage"] == "inline":
                 payload = self._inline_payload_bytes(
@@ -857,7 +775,7 @@ class Checker:
         cold: bool,
         preferred_tier: int,
     ) -> None:
-        """用磁盘上 hot/cold 实际存在情况重写 `block_locations`，并更新 `preferred_tier`。"""
+        """用磁盘上 hot/cold 实际存在情况重写 presence，并更新 `preferred_tier`。"""
         logger.info(
             "修复块位置元数据：hash={}，hot={}，cold={}，preferred_tier={}",
             digest[:12],
@@ -865,20 +783,13 @@ class Checker:
             cold,
             preferred_tier,
         )
-        for tier, present in ((1, hot), (2, cold)):
-            if present:
-                db.execute(
-                    "INSERT OR IGNORE INTO block_locations (hash, tier) VALUES (?, ?)",
-                    (digest, tier),
-                )
-            else:
-                db.execute(
-                    "DELETE FROM block_locations WHERE hash = ? AND tier = ?",
-                    (digest, tier),
-                )
         db.execute(
-            "UPDATE blocks SET preferred_tier = ? WHERE hash = ?",
-            (preferred_tier, digest),
+            """
+            UPDATE blocks
+            SET hot_present = ?, cold_present = ?, preferred_tier = ?
+            WHERE hash = ?
+            """,
+            (int(hot), int(cold), preferred_tier, digest),
         )
 
     def _repair_hot_presence(
@@ -887,18 +798,12 @@ class Checker:
         digest: str,
         hot: bool,
     ) -> None:
-        """在冷层暂时不可核实场景下，仅同步热层（tier=1）在 `block_locations` 中的存在性。"""
+        """在冷层暂时不可核实场景下，仅同步热层 presence。"""
         logger.info("修复热层块位置元数据：hash={}，hot={}", digest[:12], hot)
-        if hot:
-            db.execute(
-                "INSERT OR IGNORE INTO block_locations (hash, tier) VALUES (?, 1)",
-                (digest,),
-            )
-        else:
-            db.execute(
-                "DELETE FROM block_locations WHERE hash = ? AND tier = 1",
-                (digest,),
-            )
+        db.execute(
+            "UPDATE blocks SET hot_present = ? WHERE hash = ?",
+            (int(hot), digest),
+        )
 
     def _remove_bad_block_copy(
         self, db: sqlite3.Connection, digest: str, tier: int
@@ -906,9 +811,10 @@ class Checker:
         """Drop one corrupted redundant copy from metadata and disk."""
         logger.info("删除损坏冗余块副本：hash={}，tier={}", digest[:12], tier)
         self._unlink_block_file(digest, tier)
+        presence_column = "hot_present" if tier == 1 else "cold_present"
         db.execute(
-            "DELETE FROM block_locations WHERE hash = ? AND tier = ?",
-            (digest, tier),
+            f"UPDATE blocks SET {presence_column} = 0 WHERE hash = ?",
+            (digest,),
         )
         alternate_tier = 2 if tier == 1 else 1
         db.execute(

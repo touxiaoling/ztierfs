@@ -20,8 +20,6 @@ class MetadataOpsMixin(FileSystemMixinBase):
     def _allocated_bytes_from_node(self, node) -> int:
         """估算用于 `st_blocks` 的已分配字节数。"""
         if node["kind"] == "file":
-            if node["inline_stored_size"]:
-                return int(node["inline_stored_size"])
             return self.metadata.file_allocated_size(node["id"])
         return int(node["size"])
 

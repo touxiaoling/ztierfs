@@ -1,6 +1,6 @@
 """内容寻址块存储（tier1=热层，tier2=冷层）。
 
-负责 zstd 压缩、按内容摘要在各 tier 目录下的原子写入、与 SQLite `blocks`/`block_locations`
+负责 zstd 压缩、按内容摘要在各 tier 目录下的原子写入、与 SQLite `blocks`
 元数据协同（引用计数、存在性、preferred_tier）。包含读 LRU 缓存、异步 prepare、热→冷降级与读冷层时的
 copy-up，以及在元数据与物理文件不一致时的有限自修复。
 
