@@ -19,12 +19,7 @@ def scalar(db, sql: str) -> int:
 
 
 def collect_stats(
-    path: str | Path,
-    tier2: str | Path | None = None,
-    database: str | Path | None = None,
-    *,
-    allow_config_mismatch: bool = False,
-    update_config: bool = False,
+    database: str | Path,
 ) -> StatsReport:
     """解析维护路径并打开元数据库，用聚合查询填充 `StatsReport`。
 
@@ -54,13 +49,7 @@ def collect_stats(
     - ``inline_stored_bytes``：仅 ``blocks`` 且 ``storage_kind = 'inline'`` 的 ``SUM(stored_size)``。
     - ``hot_stored_bytes`` / ``cold_stored_bytes``：``tiered`` 块按 ``block_locations`` 连接至 ``tier = 1`` 或 ``2`` 后对 ``blocks.stored_size`` 求和（按层统计占用；同一 ``tiered`` 块若在两 tier 均有位置，两段 ``SUM`` 可能各计一份，与 ``both`` 语义一致）。
     """
-    paths = resolve_maintenance_paths(
-        path,
-        tier2,
-        database,
-        allow_config_mismatch=allow_config_mismatch,
-        update_config=update_config,
-    )
+    paths = resolve_maintenance_paths(database)
     db_path = paths.database
     logger.info(
         "收集统计信息：database={}，tier1={}，tier2={}",

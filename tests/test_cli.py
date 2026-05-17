@@ -38,9 +38,6 @@ def test_cli_stats_can_write_log_file_without_polluting_json(tmp_path, capsys):
     main(
         [
             "stats",
-            str(fs_impl.tier1),
-            str(fs_impl.tier2),
-            "--database",
             str(fs_impl.database),
             "--json",
             "--log-level",
@@ -67,9 +64,6 @@ def test_cli_fsck_returns_nonzero_for_unrepaired_issue(tmp_path, capsys):
         main(
             [
                 "fsck",
-                str(fs_impl.tier1),
-                str(fs_impl.tier2),
-                "--database",
                 str(fs_impl.database),
             ]
         )
@@ -87,9 +81,6 @@ def test_cli_fsck_repair_exits_successfully(tmp_path, capsys):
     main(
         [
             "fsck",
-            str(fs_impl.tier1),
-            str(fs_impl.tier2),
-            "--database",
             str(fs_impl.database),
             "--repair",
         ]
@@ -291,9 +282,6 @@ def test_cli_cleanup_outputs_json(tmp_path, capsys):
     main(
         [
             "cleanup",
-            str(fs_impl.tier1),
-            str(fs_impl.tier2),
-            "--database",
             str(fs_impl.database),
             "--age",
             "0",

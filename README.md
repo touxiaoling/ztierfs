@@ -91,7 +91,7 @@ uv run python -m ztierfs mount /tmp/ztierfs-hot /tmp/ztierfs-cold /tmp/ztierfs-m
 - `--protected-prefix-chunks`：每个文件开头保留在热层的块数量，默认 `2`。这让大文件从头读取时能快速返回头部，同时给 rclone 冷层预读留出时间。
 - `--min-hot-age`：块至少多久未读后才允许降级，单位秒，默认 `86400`。
 - `--cold-copy-cleanup-age`：冷层块 copy-up 回热层后，冷层副本至少保留多久再允许 `cleanup` 删除，单位秒，默认 `0`。`cleanup` 需要手动调用，因此默认不会自动删除冷层副本。
-- `--update-config`：允许用本次挂载/维护命令的显式热/冷层路径重写数据库中记录的本机存储配置。
+- `--update-config`：允许用本次挂载命令的热/冷层路径重写数据库中记录的本机存储配置。
 
 分块与压缩：
 
@@ -151,15 +151,7 @@ uv run python -m ztierfs stats /tmp/ztierfs-metadata.sqlite3 --json
 uv run python -m ztierfs cleanup /tmp/ztierfs-metadata.sqlite3 --age 86400
 ```
 
-如果数据库中的路径配置损坏，或整套存储目录被手工移动，可以继续使用救援形式显式传入热层、冷层和数据库：
-
-```bash
-uv run python -m ztierfs fsck /new/ztierfs-hot /new/ztierfs-cold \
-  --database /tmp/ztierfs-metadata.sqlite3 \
-  --update-config
-```
-
-显式热/冷层与数据库记录不一致时默认会报错。确认只想临时按显式路径检查而不改写数据库时，可加 `--allow-config-mismatch`；确认要把数据库配置更新到新位置时，使用 `--update-config`。挂载命令同样会校验同一个数据库不能用不同热/冷层打开，除非显式传入 `--update-config`。
+如果整套存储目录被手工移动，先用新的热/冷层路径挂载一次并显式传 `--update-config`，让数据库中的本机路径配置更新到新位置；之后维护命令仍只需要传 SQLite 元数据库路径。挂载命令会校验同一个数据库不能用不同热/冷层打开，除非显式传入 `--update-config`。
 
 所有命令的日志默认写到 stderr，命令结果继续写 stdout，因此 `--json` 输出可以直接交给脚本解析。需要保留诊断日志时，可以为维护命令同样添加 `--log-file /path/to/ztierfs.log`，必要时再配合 `--log-level DEBUG`。
 

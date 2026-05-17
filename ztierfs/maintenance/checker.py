@@ -40,45 +40,29 @@ from .reports import CheckReport, Issue
 
 
 def run_fsck(
-    path: str | Path,
-    tier2: str | Path | None = None,
-    database: str | Path | None = None,
+    database: str | Path,
     *,
     repair: bool = False,
-    allow_config_mismatch: bool = False,
-    update_config: bool = False,
 ) -> CheckReport:
     """执行 fsck：元数据与存在性/引用一致性检查，不启用逐块内容校验（`scrub=False`）。"""
     return Checker(
-        path,
-        tier2,
         database,
         repair=repair,
         scrub=False,
-        allow_config_mismatch=allow_config_mismatch,
-        update_config=update_config,
     ).run()
 
 
 def run_scrub(
-    path: str | Path,
-    tier2: str | Path | None = None,
-    database: str | Path | None = None,
+    database: str | Path,
     *,
     repair: bool = False,
-    allow_config_mismatch: bool = False,
-    update_config: bool = False,
     include_cold: bool = False,
 ) -> CheckReport:
     """执行 scrub：在 fsck 基础上对内联与热层 payload 做读盘与解压后的尺寸校验；`include_cold` 为真时也读取冷层。"""
     return Checker(
-        path,
-        tier2,
         database,
         repair=repair,
         scrub=True,
-        allow_config_mismatch=allow_config_mismatch,
-        update_config=update_config,
         include_cold=include_cold,
     ).run()
 
@@ -91,24 +75,14 @@ class Checker:
 
     def __init__(
         self,
-        path: str | Path,
-        tier2: str | Path | None,
         database: str | Path | None,
         *,
         repair: bool,
         scrub: bool,
-        allow_config_mismatch: bool,
-        update_config: bool,
         include_cold: bool = False,
     ):
         """保存 tier1/tier2、数据库，以及是否修复、是否 scrub / cold scrub 的标志。"""
-        paths = resolve_maintenance_paths(
-            path,
-            tier2,
-            database,
-            allow_config_mismatch=allow_config_mismatch,
-            update_config=update_config,
-        )
+        paths = resolve_maintenance_paths(database)
         self.tier1 = paths.tier1
         self.tier2 = paths.tier2
         self.database = paths.database

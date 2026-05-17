@@ -56,12 +56,12 @@ def test_fsck_reports_clean_filesystem(tmp_path):
         fh = fs("create", "/note.txt", 0o644)
         fs("write", "/note.txt", b"hello", 0, fh)
 
-    report = run_fsck(fs_impl.tier1, fs_impl.tier2, fs_impl.database)
+    report = run_fsck(fs_impl.database)
     assert report.ok
     assert report.issues == []
 
 
-def test_fsck_can_resolve_storage_paths_from_database(tmp_path):
+def test_fsck_uses_database_storage_config(tmp_path):
     fs_impl = make_fs(tmp_path)
     with adapted(fs_impl) as fs:
         fh = fs("create", "/note.txt", 0o644)
@@ -69,32 +69,6 @@ def test_fsck_can_resolve_storage_paths_from_database(tmp_path):
 
     report = run_fsck(fs_impl.database)
     assert report.ok
-
-
-def test_explicit_maintenance_paths_must_match_database_config(tmp_path):
-    fs_impl = make_fs(tmp_path)
-    fs_impl.close()
-
-    with pytest.raises(ValueError, match="do not match database config"):
-        run_fsck(tmp_path / "other-hot", tmp_path / "other-cold", fs_impl.database)
-
-
-def test_update_config_rehomes_database_storage_paths(tmp_path):
-    fs_impl = make_fs(tmp_path)
-    fs_impl.close()
-    new_hot = tmp_path / "new-hot"
-    new_cold = tmp_path / "new-cold"
-    new_hot.mkdir()
-    new_cold.mkdir()
-
-    report = run_fsck(new_hot, new_cold, fs_impl.database, update_config=True)
-
-    assert report.ok
-    config = rows(
-        fs_impl, "SELECT hot_tier_path, cold_tier_path FROM filesystem_config"
-    )[0]
-    assert config["hot_tier_path"] == str(new_hot.resolve())
-    assert config["cold_tier_path"] == str(new_cold.resolve())
 
 
 def test_fsck_repairs_block_refcount_mismatch(tmp_path):
@@ -107,11 +81,11 @@ def test_fsck_repairs_block_refcount_mismatch(tmp_path):
     with connect_sqlite(fs_impl.database) as db:
         db.execute("UPDATE blocks SET refcount = 99 WHERE hash = ?", (digest,))
 
-    report = run_fsck(fs_impl.tier1, fs_impl.tier2, fs_impl.database, repair=True)
+    report = run_fsck(fs_impl.database, repair=True)
     assert [issue.code for issue in report.issues] == ["refcount_mismatch"]
     assert report.issues[0].repaired
     assert rows(fs_impl, "SELECT refcount FROM blocks")[0]["refcount"] == 1
-    assert run_fsck(fs_impl.tier1, fs_impl.tier2, fs_impl.database).ok
+    assert run_fsck(fs_impl.database).ok
 
 
 def test_fsck_repairs_block_presence_mismatch(tmp_path):
@@ -126,7 +100,7 @@ def test_fsck_repairs_block_presence_mismatch(tmp_path):
     cold_path.parent.mkdir(parents=True, exist_ok=True)
     hot_path.replace(cold_path)
 
-    report = run_fsck(fs_impl.tier1, fs_impl.tier2, fs_impl.database, repair=True)
+    report = run_fsck(fs_impl.database, repair=True)
     assert [issue.code for issue in report.issues] == [
         "block_presence_mismatch",
         "preferred_tier_missing",
@@ -150,7 +124,7 @@ def test_fsck_repairs_unreferenced_block_record_and_file(tmp_path):
     with connect_sqlite(fs_impl.database) as db:
         db.execute("DELETE FROM file_chunks")
 
-    report = run_fsck(fs_impl.tier1, fs_impl.tier2, fs_impl.database, repair=True)
+    report = run_fsck(fs_impl.database, repair=True)
     assert {issue.code for issue in report.issues} == {
         "refcount_mismatch",
         "unreferenced_block_record",
@@ -170,7 +144,7 @@ def test_fsck_reports_missing_inline_payload_record(tmp_path):
     with connect_sqlite(fs_impl.database) as db:
         db.execute("DELETE FROM block_payloads WHERE hash = ?", (digest,))
 
-    report = run_fsck(fs_impl.tier1, fs_impl.tier2, fs_impl.database, repair=True)
+    report = run_fsck(fs_impl.database, repair=True)
     assert [issue.code for issue in report.issues] == ["missing_inline_payload"]
     assert not report.issues[0].repaired
 
@@ -184,7 +158,7 @@ def test_fsck_reports_missing_inode_payload_record(tmp_path):
     with connect_sqlite(fs_impl.database) as db:
         db.execute("DELETE FROM inode_payloads")
 
-    report = run_fsck(fs_impl.tier1, fs_impl.tier2, fs_impl.database, repair=True)
+    report = run_fsck(fs_impl.database, repair=True)
     assert [issue.code for issue in report.issues] == ["missing_inode_payload"]
     assert not report.issues[0].repaired
 
@@ -196,7 +170,7 @@ def test_fsck_repairs_orphan_disk_block(tmp_path):
     orphan.parent.mkdir(parents=True, exist_ok=True)
     orphan.write_bytes(b"orphan")
 
-    report = run_fsck(fs_impl.tier1, fs_impl.tier2, fs_impl.database, repair=True)
+    report = run_fsck(fs_impl.database, repair=True)
     assert [issue.code for issue in report.issues] == ["orphan_block_file"]
     assert report.issues[0].repaired
     assert not orphan.exists()
@@ -211,7 +185,7 @@ def test_fsck_does_not_repair_missing_referenced_block_file(tmp_path):
     digest = rows(fs_impl, "SELECT hash FROM blocks")[0]["hash"]
     block_path(fs_impl.tier1, fs_impl.tier2, digest, 1).unlink()
 
-    report = run_fsck(fs_impl.tier1, fs_impl.tier2, fs_impl.database, repair=True)
+    report = run_fsck(fs_impl.database, repair=True)
     assert [issue.code for issue in report.issues] == ["missing_block_file"]
     assert not report.issues[0].repaired
     assert report.has_unrepaired
@@ -241,7 +215,7 @@ def test_fsck_repair_skips_cold_unavailable_metadata_changes(tmp_path, monkeypat
     _digest, _data, cold_path = _make_cold_only_block(fs_impl)
     _make_path_stat_unavailable(monkeypatch, cold_path)
 
-    report = run_fsck(fs_impl.tier1, fs_impl.tier2, fs_impl.database, repair=True)
+    report = run_fsck(fs_impl.database, repair=True)
 
     codes = {issue.code for issue in report.issues}
     assert "block_payload_unavailable" in codes
@@ -268,9 +242,7 @@ def test_scrub_reports_cold_download_failure_as_unavailable(tmp_path, monkeypatc
 
     monkeypatch.setattr(checker_module, "read_path_bytes", read_or_unavailable)
 
-    report = run_scrub(
-        fs_impl.tier1, fs_impl.tier2, fs_impl.database, include_cold=True
-    )
+    report = run_scrub(fs_impl.database, include_cold=True)
     codes = {issue.code for issue in report.issues}
 
     assert "block_payload_unavailable" in codes
@@ -292,7 +264,7 @@ def test_scrub_skips_cold_payloads_by_default(tmp_path, monkeypatch):
 
     monkeypatch.setattr(checker_module, "read_path_bytes", fail_if_cold_read)
 
-    report = run_scrub(fs_impl.tier1, fs_impl.tier2, fs_impl.database)
+    report = run_scrub(fs_impl.database)
 
     assert report.ok
 
@@ -306,7 +278,7 @@ def test_scrub_reports_corrupt_compressed_block(tmp_path):
     digest = rows(fs_impl, "SELECT hash FROM blocks WHERE compressed = 1")[0]["hash"]
     block_path(fs_impl.tier1, fs_impl.tier2, digest, 1).write_bytes(b"not-zstd")
 
-    report = run_scrub(fs_impl.tier1, fs_impl.tier2, fs_impl.database)
+    report = run_scrub(fs_impl.database)
     assert "corrupt_block_payload" in {issue.code for issue in report.issues}
 
 
@@ -316,7 +288,7 @@ def test_stats_reports_storage_summary(tmp_path):
         fh = fs("create", "/note.txt", 0o644)
         fs("write", "/note.txt", b"hello", 0, fh)
 
-    stats = collect_stats(fs_impl.tier1, fs_impl.tier2, fs_impl.database)
+    stats = collect_stats(fs_impl.database)
     data = stats.to_dict()
     assert data["inodes"]["files"] == 1
     assert data["chunks"]["file_chunks"] == 0
@@ -354,8 +326,6 @@ def test_cleanup_removes_old_promoted_cold_copy(tmp_path):
         )
 
     report = cleanup_promoted_cold_copies(
-        fs_impl.tier1,
-        fs_impl.tier2,
         fs_impl.database,
         min_age_seconds=1,
     )
@@ -391,8 +361,6 @@ def test_cleanup_skips_cold_copy_when_cold_tier_unavailable(tmp_path, monkeypatc
     _make_path_stat_unavailable(monkeypatch, cold_path)
 
     report = cleanup_promoted_cold_copies(
-        fs_impl.tier1,
-        fs_impl.tier2,
         fs_impl.database,
         min_age_seconds=1,
     )
@@ -493,7 +461,7 @@ def test_fsck_reports_chunk_and_directory_metadata_corruption(
                 (parent_id,),
             )
 
-    report = run_fsck(fs_impl.tier1, fs_impl.tier2, fs_impl.database)
+    report = run_fsck(fs_impl.database)
 
     assert expected_code in {issue.code for issue in report.issues}
 
@@ -507,7 +475,7 @@ def test_fsck_repairs_nlink_mismatch(tmp_path):
     with connect_sqlite(fs_impl.database) as db:
         db.execute("UPDATE inodes SET nlink = 99 WHERE kind = 'file'")
 
-    report = run_fsck(fs_impl.tier1, fs_impl.tier2, fs_impl.database, repair=True)
+    report = run_fsck(fs_impl.database, repair=True)
 
     assert [issue.code for issue in report.issues] == ["nlink_mismatch"]
     assert report.issues[0].repaired
@@ -535,7 +503,7 @@ def test_fsck_repairs_inline_payload_table_corruption(tmp_path):
             (digest, b"unexpected"),
         )
 
-    report = run_fsck(fs_impl.tier1, fs_impl.tier2, fs_impl.database, repair=True)
+    report = run_fsck(fs_impl.database, repair=True)
 
     assert {issue.code for issue in report.issues} == {
         "orphan_inline_payload",
@@ -571,7 +539,7 @@ def test_fsck_repairs_inode_payload_table_corruption(tmp_path):
             (directory_inode, b"unexpected"),
         )
 
-    report = run_fsck(fs_impl.tier1, fs_impl.tier2, fs_impl.database, repair=True)
+    report = run_fsck(fs_impl.database, repair=True)
 
     assert {issue.code for issue in report.issues} == {
         "orphan_inode_payload",
@@ -597,6 +565,6 @@ def test_scrub_reports_payload_size_mismatches(tmp_path, sql, expected_code):
     with connect_sqlite(fs_impl.database) as db:
         db.execute(sql)
 
-    report = run_scrub(fs_impl.tier1, fs_impl.tier2, fs_impl.database)
+    report = run_scrub(fs_impl.database)
 
     assert expected_code in {issue.code for issue in report.issues}

@@ -218,18 +218,14 @@ def _build_parser() -> argparse.ArgumentParser:
     scrub.set_defaults(handler=_run_scrub_command)
 
     stats = subparsers.add_parser("stats", help="输出文件系统统计信息")
-    _add_maintenance_storage_args(stats)
-    _add_database_arg(stats)
+    _add_maintenance_database_arg(stats)
     _add_logging_args(stats)
-    _add_config_override_args(stats)
     stats.add_argument("--json", action="store_true", help="以 JSON 输出")
     stats.set_defaults(handler=_run_stats_command)
 
     cleanup = subparsers.add_parser("cleanup", help="整理已提升块遗留的冷层副本")
-    _add_maintenance_storage_args(cleanup)
-    _add_database_arg(cleanup)
+    _add_maintenance_database_arg(cleanup)
     _add_logging_args(cleanup)
-    _add_config_override_args(cleanup)
     cleanup.add_argument(
         "--age",
         type=int,
@@ -247,17 +243,9 @@ def _add_tier_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("tier2", help="第二层冷块目录")
 
 
-def _add_maintenance_storage_args(parser: argparse.ArgumentParser) -> None:
-    """注册维护子命令的位置参数：元数据路径，及可选的冷层路径（救援/显式层路径）。"""
-    parser.add_argument(
-        "path",
-        help="SQLite 元数据文件；也可作为救援形式传热层目录并同时传 cold-tier",
-    )
-    parser.add_argument(
-        "tier2",
-        nargs="?",
-        help="救援形式下的第二层冷块目录；省略时 path 解释为 SQLite 元数据文件",
-    )
+def _add_maintenance_database_arg(parser: argparse.ArgumentParser) -> None:
+    """注册维护子命令的唯一入口：SQLite 元数据库路径。"""
+    parser.add_argument("database", help="SQLite 元数据文件")
 
 
 def _add_database_arg(parser: argparse.ArgumentParser) -> None:
@@ -267,26 +255,10 @@ def _add_database_arg(parser: argparse.ArgumentParser) -> None:
 
 def _add_maintenance_args(parser: argparse.ArgumentParser) -> None:
     """组合存储路径、数据库、日志、配置覆盖，以及 ``fsck``/``scrub`` 的 ``--repair``/``--json``。"""
-    _add_maintenance_storage_args(parser)
-    _add_database_arg(parser)
+    _add_maintenance_database_arg(parser)
     _add_logging_args(parser)
-    _add_config_override_args(parser)
     parser.add_argument("--repair", action="store_true", help="执行确定安全的自动修复")
     parser.add_argument("--json", action="store_true", help="以 JSON 输出")
-
-
-def _add_config_override_args(parser: argparse.ArgumentParser) -> None:
-    """注册与数据库记录不一致时的 ``--allow-config-mismatch`` 与路径重写 ``--update-config``。"""
-    parser.add_argument(
-        "--allow-config-mismatch",
-        action="store_true",
-        help="救援形式下允许显式热/冷层与数据库记录不一致，且不改写数据库配置",
-    )
-    parser.add_argument(
-        "--update-config",
-        action="store_true",
-        help="救援或迁移时用显式热/冷层重写数据库中的本机存储路径配置",
-    )
 
 
 def _add_logging_args(
@@ -369,12 +341,8 @@ def _run_fsck_command(args: argparse.Namespace) -> None:
     """运行 ``run_fsck``，按文本或 JSON 输出报告；存在未自动修复项时以退出码 1 结束。"""
     logger.info("开始执行 fsck：repair={}", args.repair)
     report = run_fsck(
-        args.path,
-        args.tier2,
         args.database,
         repair=args.repair,
-        allow_config_mismatch=args.allow_config_mismatch,
-        update_config=args.update_config,
     )
     _emit_check_report(report, json_output=args.json)
 
@@ -383,12 +351,8 @@ def _run_scrub_command(args: argparse.Namespace) -> None:
     """运行 ``run_scrub``（读校验块内容），输出与退出约定同 ``_run_fsck_command``。"""
     logger.info("开始执行 scrub：repair={}", args.repair)
     report = run_scrub(
-        args.path,
-        args.tier2,
         args.database,
         repair=args.repair,
-        allow_config_mismatch=args.allow_config_mismatch,
-        update_config=args.update_config,
         include_cold=args.include_cold,
     )
     _emit_check_report(report, json_output=args.json)
@@ -397,58 +361,66 @@ def _run_scrub_command(args: argparse.Namespace) -> None:
 def _run_stats_command(args: argparse.Namespace) -> None:
     """调用 ``collect_stats``，以可读摘要或 JSON 打印统计（块、 inode、层占用等由实现决定）。"""
     logger.info("开始收集文件系统统计信息")
-    report = collect_stats(
-        args.path,
-        args.tier2,
-        args.database,
-        allow_config_mismatch=args.allow_config_mismatch,
-        update_config=args.update_config,
-    )
-    if args.json:
-        _emit_stdout(json.dumps(report.to_dict(), ensure_ascii=False, sort_keys=True))
-    else:
-        _emit_stdout(stats_to_text(report))
+    report = collect_stats(args.database)
+    _emit_report(report, json_output=args.json, text_formatter=stats_to_text)
 
 
 def _run_cleanup_command(args: argparse.Namespace) -> None:
     """调用 ``cleanup_promoted_cold_copies``，按 ``--age`` 等条件删除过期的冷层残留副本并汇报数量。"""
     logger.info("开始清理已提升块遗留的冷层副本：min_age_seconds={}", args.age)
     report = cleanup_promoted_cold_copies(
-        args.path,
-        args.tier2,
         args.database,
         min_age_seconds=args.age,
-        allow_config_mismatch=args.allow_config_mismatch,
-        update_config=args.update_config,
     )
-    if args.json:
-        _emit_stdout(
-            json.dumps(
-                {
-                    "removed_cold_copies": report.removed,
-                    "skipped_cold_copies": report.skipped,
-                    "removed_pending_deletions": report.pending_removed,
-                    "skipped_pending_deletions": report.pending_skipped,
-                },
-                sort_keys=True,
-            )
-        )
-    else:
-        _emit_stdout(
-            f"cleanup: removed {report.removed} promoted cold copy/copies, "
-            f"skipped {report.skipped}, removed {report.pending_removed} pending deletion(s), "
-            f"skipped {report.pending_skipped}"
-        )
+    _emit_report(
+        report,
+        json_output=args.json,
+        json_formatter=_cleanup_report_to_dict,
+        text_formatter=_cleanup_report_to_text,
+    )
 
 
 def _emit_check_report(report, *, json_output: bool) -> None:
     """输出 fsck/scrub 报告（文本或 JSON）；若报告中仍有未修复问题则 ``SystemExit(1)``。"""
-    if json_output:
-        _emit_stdout(json.dumps(report.to_dict(), ensure_ascii=False, sort_keys=True))
-    else:
-        _emit_stdout(report_to_text(report))
+    _emit_report(report, json_output=json_output, text_formatter=report_to_text)
     if report.has_unrepaired:
         raise SystemExit(1)
+
+
+def _emit_report(
+    report,
+    *,
+    json_output: bool,
+    text_formatter,
+    json_formatter=None,
+) -> None:
+    """按 CLI 约定输出报告：JSON 走稳定 dict，文本走对应 formatter。"""
+    if json_output:
+        formatter = json_formatter or (lambda value: value.to_dict())
+        _emit_stdout(
+            json.dumps(formatter(report), ensure_ascii=False, sort_keys=True)
+        )
+    else:
+        _emit_stdout(text_formatter(report))
+
+
+def _cleanup_report_to_dict(report) -> dict[str, int]:
+    """将 cleanup 报告转为 CLI JSON 字段，保持既有输出契约。"""
+    return {
+        "removed_cold_copies": report.removed,
+        "skipped_cold_copies": report.skipped,
+        "removed_pending_deletions": report.pending_removed,
+        "skipped_pending_deletions": report.pending_skipped,
+    }
+
+
+def _cleanup_report_to_text(report) -> str:
+    """将 cleanup 报告转为既有文本摘要。"""
+    return (
+        f"cleanup: removed {report.removed} promoted cold copy/copies, "
+        f"skipped {report.skipped}, removed {report.pending_removed} pending deletion(s), "
+        f"skipped {report.pending_skipped}"
+    )
 
 
 def _emit_stdout(text: str) -> None:

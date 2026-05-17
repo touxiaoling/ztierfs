@@ -31,7 +31,7 @@ def _write_committed_file(fs_impl, path="/file.jpg", data=None):
 
 
 def _assert_fsck_ok(fs_impl):
-    report = run_fsck(fs_impl.tier1, fs_impl.tier2, fs_impl.database, repair=True)
+    report = run_fsck(fs_impl.database, repair=True)
     assert report.issues == []
 
 
@@ -57,7 +57,7 @@ def test_write_crash_after_block_file_before_metadata_commit_is_repairable_orpha
     assert rows(fs_impl, "SELECT * FROM blocks") == []
     assert any((tmp_path / "hot" / "blocks").glob("*/*/*"))
 
-    report = run_fsck(fs_impl.tier1, fs_impl.tier2, fs_impl.database, repair=True)
+    report = run_fsck(fs_impl.database, repair=True)
 
     assert [issue.code for issue in report.issues] == ["orphan_block_file"]
     assert report.issues[0].repaired
@@ -102,7 +102,7 @@ def test_demote_crash_after_hot_unlink_before_metadata_commit_is_repaired(
     assert not block_path(fs_impl.tier1, fs_impl.tier2, digest, 1).exists()
     assert block_path(fs_impl.tier1, fs_impl.tier2, digest, 2).exists()
 
-    report = run_fsck(fs_impl.tier1, fs_impl.tier2, fs_impl.database, repair=True)
+    report = run_fsck(fs_impl.database, repair=True)
 
     assert {issue.code for issue in report.issues} == {
         "block_presence_mismatch",
@@ -157,7 +157,7 @@ def test_crash_after_block_delete_before_metadata_commit_reports_missing_referen
         fh = fs("open", "/victim.jpg", os.O_RDONLY)
         assert fs("read", "/victim.jpg", len(original_data), 0, fh) == original_data
 
-    report = run_fsck(fs_impl.tier1, fs_impl.tier2, fs_impl.database, repair=True)
+    report = run_fsck(fs_impl.database, repair=True)
 
     assert not report.has_unrepaired
 
@@ -325,7 +325,7 @@ def test_cross_block_overwrite_crash_leaves_old_file_and_repairable_orphans(
         fh = fs("open", "/movie.jpg", os.O_RDONLY)
         assert fs("read", "/movie.jpg", len(original), 0, fh) == original
 
-    report = run_fsck(fs_impl.tier1, fs_impl.tier2, fs_impl.database, repair=True)
+    report = run_fsck(fs_impl.database, repair=True)
     assert {issue.code for issue in report.issues} == {"orphan_block_file"}
     assert all(issue.repaired for issue in report.issues)
 
@@ -380,7 +380,7 @@ def test_copy_up_crash_after_hot_copy_before_metadata_commit_is_repaired(
     assert block_path(fs_impl.tier1, fs_impl.tier2, digest, 1).exists()
     assert block_path(fs_impl.tier1, fs_impl.tier2, digest, 2).exists()
 
-    report = run_fsck(fs_impl.tier1, fs_impl.tier2, fs_impl.database, repair=True)
+    report = run_fsck(fs_impl.database, repair=True)
     assert [issue.code for issue in report.issues] == ["block_presence_mismatch"]
     assert report.issues[0].repaired
 
@@ -456,7 +456,7 @@ def test_cleanup_crash_after_cold_unlink_before_metadata_commit_is_repaired(
     assert block_path(fs_impl.tier1, fs_impl.tier2, digest, 1).exists()
     assert not block_path(fs_impl.tier1, fs_impl.tier2, digest, 2).exists()
 
-    report = run_fsck(fs_impl.tier1, fs_impl.tier2, fs_impl.database, repair=True)
+    report = run_fsck(fs_impl.database, repair=True)
     assert [issue.code for issue in report.issues] == ["block_presence_mismatch"]
     assert report.issues[0].repaired
 
@@ -536,7 +536,7 @@ def test_hardlink_last_unlink_crash_after_block_delete_reports_missing_block(
         fh = fs("open", "/linked.jpg", os.O_RDONLY)
         assert fs("read", "/linked.jpg", len(data), 0, fh) == data
 
-    report = run_fsck(fs_impl.tier1, fs_impl.tier2, fs_impl.database, repair=True)
+    report = run_fsck(fs_impl.database, repair=True)
     assert report.ok
 
 
@@ -558,8 +558,6 @@ def test_last_unlink_commit_queues_block_delete_for_cleanup(tmp_path, monkeypatc
     ]
 
     report = cleanup_promoted_cold_copies(
-        fs_impl.tier1,
-        fs_impl.tier2,
         fs_impl.database,
         min_age_seconds=0,
     )

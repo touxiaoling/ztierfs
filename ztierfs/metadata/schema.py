@@ -27,6 +27,23 @@ from .base import MetadataMixinBase
 SCHEMA_VERSION = 7
 CONFIG_VERSION = 1
 
+FILESYSTEM_CONFIG_SELECT = """
+    SELECT hot_tier_path, cold_tier_path
+    FROM filesystem_config
+    WHERE id = 1
+"""
+
+FILESYSTEM_CONFIG_UPSERT = """
+    INSERT INTO filesystem_config (
+        id, config_version, hot_tier_path, cold_tier_path
+    )
+    VALUES (1, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+        config_version = excluded.config_version,
+        hot_tier_path = excluded.hot_tier_path,
+        cold_tier_path = excluded.cold_tier_path
+"""
+
 BLOCK_RECORD_SELECT = """
     SELECT
         blocks.hash,
@@ -268,13 +285,7 @@ class SchemaMixin(MetadataMixinBase):
 
     def filesystem_config(self):
         """读取 `filesystem_config` 单行（id=1）：热/冷路径配置。"""
-        return self._db.execute(
-            """
-            SELECT hot_tier_path, cold_tier_path
-            FROM filesystem_config
-            WHERE id = 1
-            """
-        ).fetchone()
+        return self._db.execute(FILESYSTEM_CONFIG_SELECT).fetchone()
 
     def set_filesystem_config(
         self,
@@ -284,16 +295,7 @@ class SchemaMixin(MetadataMixinBase):
     ) -> None:
         """写入或更新挂载配置（upsert id=1），`config_version` 使用模块常量 `CONFIG_VERSION`。"""
         self._db.execute(
-            """
-            INSERT INTO filesystem_config (
-                id, config_version, hot_tier_path, cold_tier_path
-            )
-            VALUES (1, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                config_version = excluded.config_version,
-                hot_tier_path = excluded.hot_tier_path,
-                cold_tier_path = excluded.cold_tier_path
-            """,
+            FILESYSTEM_CONFIG_UPSERT,
             (
                 CONFIG_VERSION,
                 hot_tier_path,

@@ -1,8 +1,8 @@
-"""离线维护入口：fsck/scrub、统计报表、冷层晋升副本清理，以及块与数据库路径辅助。"""
+"""离线维护入口：fsck/scrub、统计报表、冷层晋升副本清理，以及块路径辅助。"""
 
 from .checker import run_fsck, run_scrub
 from .cleanup import CleanupReport, cleanup_promoted_cold_copies
-from .paths import block_path, default_database
+from .paths import block_path
 from .reports import CheckReport, Issue, StatsReport, report_to_text, stats_to_text
 from .stats import collect_stats
 
@@ -14,7 +14,6 @@ __all__ = [
     "block_path",
     "cleanup_promoted_cold_copies",
     "collect_stats",
-    "default_database",
     "report_to_text",
     "run_fsck",
     "run_scrub",

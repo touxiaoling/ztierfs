@@ -28,13 +28,9 @@ class CleanupReport:
 
 
 def cleanup_promoted_cold_copies(
-    path: str | Path,
-    tier2: str | Path | None = None,
-    database: str | Path | None = None,
+    database: str | Path,
     *,
     min_age_seconds: int,
-    allow_config_mismatch: bool = False,
-    update_config: bool = False,
 ) -> CleanupReport:
     """在块已 copy-up 到热层且元数据首选热层后，按「提升」龄删除冷层上冗余副本并收紧位置记录。
 
@@ -43,17 +39,10 @@ def cleanup_promoted_cold_copies(
     成功则删除该行在 ``block_locations`` 中 tier 2 的记录。若冷层路径探测或删除因暂时不可用失败，
     则跳过该项（不计入删除），对应元数据保持不变。
 
-    ``path`` / ``tier2`` / ``database`` 由 ``resolve_maintenance_paths`` 解析为数据库与冷热层根路径；
-    ``allow_config_mismatch`` 与 ``update_config`` 的含义与同函数的 CLI 维护路径解析一致。
+    ``database`` 由 ``resolve_maintenance_paths`` 解析为数据库与冷热层根路径。
     """
     cutoff_ns = time_ns() - min_age_seconds * 1_000_000_000
-    paths = resolve_maintenance_paths(
-        path,
-        tier2,
-        database,
-        allow_config_mismatch=allow_config_mismatch,
-        update_config=update_config,
-    )
+    paths = resolve_maintenance_paths(database)
     db_path = paths.database
     tier1_path = paths.tier1
     tier2_path = paths.tier2
