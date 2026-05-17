@@ -195,26 +195,22 @@ class BlockStore:
             self._cache_put(row["hash"], data)
             return data[:expected_size].ljust(expected_size, b"\x00"), access
 
-        path, tier, repair = self._read_path(row, repair_metadata=False)
         cached = self._cache_get(row["hash"])
         if cached is not None:
+            tier = self._metadata_preferred_tier(row)
             logger.debug(
                 "读取块缓存命中：hash={}，raw_size={}", row["hash"][:12], len(cached)
             )
-            hp_flag = repair.get("hot_present")
-            cp_flag = repair.get("cold_present")
             access = BlockAccess(
                 digest=row["hash"],
                 tier=tier,
                 stored_size=row["stored_size"],
-                hot_present=hp_flag if type(hp_flag) is bool else None,
-                cold_present=cp_flag if type(cp_flag) is bool else None,
-                preferred_tier=repair.get("preferred_tier"),
             )
             if self.should_copy_up_from_cold(row, tier):
                 self.schedule_cold_copy_up(row["hash"], row["stored_size"])
             return cached[:expected_size].ljust(expected_size, b"\x00"), access
 
+        path, tier, repair = self._read_path(row, repair_metadata=False)
         try:
             with timed(
                 "block_io.read",
@@ -831,94 +827,173 @@ class BlockStore:
             logger.debug("清理提升后遗留冷层副本：hash={}", row["hash"][:12])
         return removed
 
+    def _metadata_preferred_tier(self, row) -> int:
+        """仅按 SQLite preferred/presence 选择预计读取层；缓存命中时避免磁盘探测。"""
+        if row["preferred_tier"] == 2 and row["cold_present"]:
+            return 2
+        if row["preferred_tier"] == 1 and row["hot_present"]:
+            return 1
+        if row["hot_present"]:
+            return 1
+        return 2
+
     def _read_path(
         self, row, *, repair_metadata: bool = True
     ) -> tuple[Path, int, dict[str, bool | int]]:
-        """根据 SQLite 存在位与磁盘探测选择实际读路径与 ``tier``，并在不一致时 **有限自修复**。
-
-        ``repair_metadata`` 为真时可写回 ``hot_present`` / ``cold_present`` / ``preferred_tier``。
-        返回的 ``dict`` 供构造 ``BlockAccess`` 上的可选修正字段。冷层临时不可用且无热副本时抛 ``EIO``。
-        """
+        """优先相信 SQLite 首选层；读失败后再探测 fallback 并返回可延迟提交的 presence 修正。"""
         digest = row["hash"]
-        hot_path = self.block_path(digest, 1)
-        cold_path = self.block_path(digest, 2)
-        hot_probe = probe_path(hot_path) if row["hot_present"] else None
-        cold_probe = probe_path(cold_path) if row["cold_present"] else None
-        hot_exists = (
-            bool(row["hot_present"]) and hot_probe is not None and hot_probe.present
-        )
-        cold_unavailable = cold_probe is not None and cold_probe.unavailable
-        if cold_unavailable:
-            assert cold_probe is not None
-            if not hot_exists:
-                logger.warning(
-                    "冷层块临时不可用：hash={}，path={}，error={}",
-                    digest[:12],
-                    cold_path,
-                    cold_probe.error,
-                )
-                raise FuseOSError(errno.EIO)
-            cold_exists = False
-        else:
-            cold_exists = (
-                bool(row["cold_present"])
-                and cold_probe is not None
-                and cold_probe.present
-            )
+        preferred_tier = self._metadata_preferred_tier(row)
+        preferred_path = self.block_path(digest, preferred_tier)
+        alternate_tier = 2 if preferred_tier == 1 else 1
+        alternate_path = self.block_path(digest, alternate_tier)
         repair: dict[str, bool | int] = {}
 
-        if not hot_exists and not cold_exists:
-            hot_probe = probe_path(hot_path)
-            cold_probe = probe_path(cold_path)
-            hot_exists = hot_probe.present
-            if cold_probe.unavailable:
-                logger.warning(
-                    "冷层块临时不可用：hash={}，path={}，error={}",
-                    digest[:12],
-                    cold_path,
-                    cold_probe.error,
-                )
-                raise FuseOSError(errno.EIO)
-            cold_exists = cold_probe.present
-            if hot_exists or cold_exists:
-                preferred = 1 if hot_exists else 2
-                repair = {
-                    "hot_present": hot_exists,
-                    "cold_present": cold_exists,
-                    "preferred_tier": preferred,
-                }
-                logger.warning(
-                    "块元数据位置缺失但磁盘存在副本，准备修复：hash={}，hot={}，cold={}",
-                    digest[:12],
-                    hot_exists,
-                    cold_exists,
-                )
-                if repair_metadata:
-                    self.metadata.set_block_presence(digest, **repair)
-            else:
-                logger.error("块元数据引用的 payload 缺失：hash={}", digest[:12])
-                raise FuseOSError(errno.EIO)
-
-        if cold_unavailable and hot_exists:
+        try:
+            preferred_probe = probe_path(preferred_path)
+        except OSError as exc:
             logger.warning(
-                "块首选冷层临时不可用，临时改读热层且不修复元数据：hash={}", digest[:12]
+                "块首选层探测失败：hash={}，tier={}，path={}，error={}",
+                digest[:12],
+                preferred_tier,
+                preferred_path,
+                exc,
             )
-            return hot_path, 1, repair
-        if row["preferred_tier"] == 1 and hot_exists:
-            return hot_path, 1, repair
-        if row["preferred_tier"] == 2 and cold_exists:
-            return cold_path, 2, repair
-        if hot_exists:
-            repair["preferred_tier"] = 1
+            preferred_probe = None
+
+        if preferred_probe is not None and preferred_probe.present:
+            return preferred_path, preferred_tier, repair
+
+        if preferred_probe is not None and preferred_probe.unavailable:
+            logger.warning(
+                "块首选层临时不可用：hash={}，tier={}，path={}，error={}",
+                digest[:12],
+                preferred_tier,
+                preferred_path,
+                preferred_probe.error,
+            )
+            alternate_probe = self._probe_declared_alternate(
+                row, alternate_tier, alternate_path
+            )
+            if alternate_probe is not None and alternate_probe.present:
+                logger.warning(
+                    "块首选层临时不可用，临时改读另一层且不修复元数据：hash={}，tier={}",
+                    digest[:12],
+                    alternate_tier,
+                )
+                return alternate_path, alternate_tier, repair
+            raise FuseOSError(errno.EIO)
+
+        missing_tiers = {preferred_tier}
+        alternate_probe = self._probe_declared_alternate(
+            row, alternate_tier, alternate_path
+        )
+        if alternate_probe is not None:
+            if alternate_probe.present:
+                if preferred_tier == 1:
+                    repair = {
+                        "hot_present": False,
+                        "preferred_tier": alternate_tier,
+                    }
+                else:
+                    repair = {
+                        "cold_present": False,
+                        "preferred_tier": alternate_tier,
+                    }
+                if repair_metadata:
+                    self.metadata.set_block_presence(
+                        digest,
+                        hot_present=False if preferred_tier == 1 else None,
+                        cold_present=False if preferred_tier == 2 else None,
+                        preferred_tier=alternate_tier,
+                    )
+                logger.warning(
+                    "块首选层缺失，改用另一层：hash={}，missing_tier={}，read_tier={}",
+                    digest[:12],
+                    preferred_tier,
+                    alternate_tier,
+                )
+                return alternate_path, alternate_tier, repair
+            if alternate_probe.unavailable:
+                logger.warning(
+                    "块备用层临时不可用：hash={}，tier={}，path={}，error={}",
+                    digest[:12],
+                    alternate_tier,
+                    alternate_path,
+                    alternate_probe.error,
+                )
+                raise FuseOSError(errno.EIO)
+            missing_tiers.add(alternate_tier)
+
+        full_probe = self._probe_all_tiers(digest)
+        hot_probe = full_probe[1]
+        cold_probe = full_probe[2]
+        if cold_probe.unavailable and not hot_probe.present:
+            logger.warning(
+                "冷层块临时不可用：hash={}，path={}，error={}",
+                digest[:12],
+                self.block_path(digest, 2),
+                cold_probe.error,
+            )
+            raise FuseOSError(errno.EIO)
+
+        hot_exists = hot_probe.present
+        cold_exists = cold_probe.present
+        if hot_exists or cold_exists:
+            repaired_preferred = 1 if hot_exists else 2
+            repair = {
+                "hot_present": hot_exists,
+                "preferred_tier": repaired_preferred,
+            }
+            if not cold_probe.unavailable:
+                repair["cold_present"] = cold_exists
+            logger.warning(
+                "块元数据位置与磁盘不一致，准备修复：hash={}，hot={}，cold={}",
+                digest[:12],
+                hot_exists,
+                cold_exists,
+            )
             if repair_metadata:
-                self.metadata.set_block_presence(digest, preferred_tier=1)
-            logger.warning("块首选层缺失，改用热层：hash={}", digest[:12])
-            return hot_path, 1, repair
-        repair["preferred_tier"] = 2
+                self.metadata.set_block_presence(
+                    digest,
+                    hot_present=hot_exists,
+                    cold_present=None if cold_probe.unavailable else cold_exists,
+                    preferred_tier=repaired_preferred,
+                )
+            return (
+                self.block_path(digest, repaired_preferred),
+                repaired_preferred,
+                repair,
+            )
+
+        hot_present = False if 1 in missing_tiers else None
+        cold_present = False if 2 in missing_tiers else None
+        if hot_present is not None:
+            repair["hot_present"] = hot_present
+        if cold_present is not None:
+            repair["cold_present"] = cold_present
         if repair_metadata:
-            self.metadata.set_block_presence(digest, preferred_tier=2)
-        logger.warning("块首选层缺失，改用冷层：hash={}", digest[:12])
-        return cold_path, 2, repair
+            self.metadata.set_block_presence(
+                digest,
+                hot_present=hot_present,
+                cold_present=cold_present,
+            )
+        logger.error("块元数据引用的 payload 缺失：hash={}", digest[:12])
+        raise FuseOSError(errno.EIO)
+
+    def _probe_declared_alternate(self, row, tier: int, path: Path):
+        """仅在 metadata 声明备用层存在时探测，避免正常读固定 probe 双层。"""
+        if tier == 1 and not row["hot_present"]:
+            return None
+        if tier == 2 and not row["cold_present"]:
+            return None
+        return probe_path(path)
+
+    def _probe_all_tiers(self, digest: str):
+        """首选层和声明备用层都不可读时，完整探测两层用于 presence 修正。"""
+        return {
+            1: probe_path(self.block_path(digest, 1)),
+            2: probe_path(self.block_path(digest, 2)),
+        }
 
     def fsync_dir(self, path: Path) -> None:
         """在支持 ``O_DIRECTORY`` 的平台上对目录 fd 执行 ``fsync``，巩固 **rename 落盘** 的目录项持久化。"""

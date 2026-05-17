@@ -104,12 +104,24 @@ class FileContentService:
 
     def read_file(self, node, size: int, offset: int) -> bytes:
         """按节点读 ``[offset, offset+size)``：生成计划、读块/内联、更新访问时间与块访问统计。"""
-        plan = self.plan_read(node, size, offset)
+        with self.metadata.read_transaction():
+            plan = self.plan_read(node, size, offset)
         data, accesses = self.execute_read_plan(plan)
+        if not data:
+            return data
         now = time_ns()
-        self.metadata.touch_node_atime(node["id"], now)
-        for access in accesses:
-            self.block_store.record_block_access(access, now)
+        should_flush = self.metadata.defer_node_atime(node["id"], now)
+        if accesses:
+            should_flush = (
+                self.block_store.record_block_accesses(accesses, now) or should_flush
+            )
+        if should_flush:
+            with self.metadata.transaction():
+                for access in accesses:
+                    self.block_store.record_block_presence(access, now)
+        if self.block_store.take_demotion_request():
+            with self.metadata.transaction():
+                self.block_store.demote_cold_blocks()
         return data
 
     def plan_read(self, node, size: int, offset: int) -> FileReadPlan:

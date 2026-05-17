@@ -2,6 +2,8 @@
 
 import sqlite3
 
+from typing import TYPE_CHECKING
+
 from .base import MetadataMixinBase
 from .schema import BLOCK_RECORD_SELECT
 
@@ -13,6 +15,10 @@ class ChunkMetadataMixin(MetadataMixinBase):
     单独的 DELETE/UPDATE `file_chunks` 不会自动维护块的引用计数；新增引用时应使用
     `attach_file_chunk_to_block`，移除映射后须在别处对已失效 digest 调用 `decrement_block_refcount`。
     """
+
+    if TYPE_CHECKING:
+
+        def increment_block_refcount(self, digest: str) -> None: ...
 
     def chunk_block(self, file_id: int, chunk_index: int) -> sqlite3.Row | None:
         """返回指定文件、序号对应 chunk 的映射行，并 JOIN 出该 digest 的完整块记录列。"""

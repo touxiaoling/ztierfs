@@ -75,7 +75,7 @@ class Checker:
 
     def __init__(
         self,
-        database: str | Path | None,
+        database: str | Path,
         *,
         repair: bool,
         scrub: bool,

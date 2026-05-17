@@ -405,6 +405,34 @@ def test_ztierfs_defers_read_access_stats_until_flush(tmp_path):
         )
 
 
+def test_file_content_read_file_batches_access_stats_until_commit(tmp_path):
+    fs_impl = make_fs(tmp_path, chunk_size=1024, inline_max_bytes=0)
+    data = bytes(range(256)) * 8
+
+    with adapted(fs_impl) as fs:
+        fh = fs("create", "/stats.jpg", 0o644)
+        fs("write", "/stats.jpg", data, 0, fh)
+        with fs_impl.metadata.read_transaction():
+            node = fs_impl.metadata.get_node("/stats.jpg")
+
+        assert fs_impl.file_content.read_file(node, len(data), 0) == data
+        assert (
+            rows(fs_impl, "SELECT COALESCE(SUM(read_count), 0) AS reads FROM blocks")[
+                0
+            ]["reads"]
+            == 0
+        )
+
+        fs("flush", "/stats.jpg", fh)
+
+    assert (
+        rows(fs_impl, "SELECT COALESCE(SUM(read_count), 0) AS reads FROM blocks")[0][
+            "reads"
+        ]
+        == 2
+    )
+
+
 def test_ztierfs_reads_multi_chunk_plan_in_parallel(tmp_path, monkeypatch):
     fs_impl = make_fs(tmp_path, inline_max_bytes=0)
     data = bytes(range(256)) * 8
@@ -622,6 +650,8 @@ def test_ztierfs_recovers_when_block_metadata_points_to_missing_tier(tmp_path):
                 "INSERT OR IGNORE INTO block_locations (hash, tier) VALUES (?, 2)",
                 (digest,),
             )
+        fs_impl.block_store._read_cache.clear()
+        fs_impl.block_store._read_cache_size = 0
 
         assert fs("read", "/file.bin", len(data), 0, fh) == data
         with connect_sqlite(fs_impl.database) as db:
@@ -634,3 +664,74 @@ def test_ztierfs_recovers_when_block_metadata_points_to_missing_tier(tmp_path):
                 (digest,),
             ).fetchone()
             assert row == (1, 0, 1)
+
+
+def test_ztierfs_normal_hot_read_does_not_probe_cold_tier(tmp_path, monkeypatch):
+    fs_impl = make_fs(tmp_path, inline_max_bytes=0)
+    data = b"hot block" * 128
+
+    import ztierfs.block_store as block_store_module
+
+    original_probe_path = block_store_module.probe_path
+
+    with adapted(fs_impl) as fs:
+        fh = fs("create", "/hot.jpg", 0o644)
+        fs("write", "/hot.jpg", data, 0, fh)
+        digest = rows(fs_impl, "SELECT hash FROM blocks")[0]["hash"]
+        cold_path = fs_impl.block_store.block_path(digest, 2)
+        fs_impl.block_store._read_cache.clear()
+        fs_impl.block_store._read_cache_size = 0
+
+        def fail_cold_probe(path):
+            if path == cold_path:
+                raise AssertionError("normal hot read must not probe cold tier")
+            return original_probe_path(path)
+
+        monkeypatch.setattr(block_store_module, "probe_path", fail_cold_probe)
+
+        assert fs("read", "/hot.jpg", len(data), 0, fh) == data
+
+
+def test_ztierfs_reads_hot_fallback_when_cold_preferred_unavailable(
+    tmp_path, monkeypatch
+):
+    fs_impl = make_fs(tmp_path, inline_max_bytes=0)
+    data = b"dual tier" * 128
+
+    with adapted(fs_impl) as fs:
+        fh = fs("create", "/dual.jpg", 0o644)
+        fs("write", "/dual.jpg", data, 0, fh)
+        digest = rows(fs_impl, "SELECT hash FROM blocks")[0]["hash"]
+        hot_path = fs_impl.block_store.block_path(digest, 1)
+        cold_path = fs_impl.block_store.block_path(digest, 2)
+        cold_path.parent.mkdir(parents=True, exist_ok=True)
+        cold_path.write_bytes(hot_path.read_bytes())
+        with connect_sqlite(fs_impl.database) as db:
+            db.execute(
+                "INSERT OR IGNORE INTO block_locations (hash, tier) VALUES (?, 2)",
+                (digest,),
+            )
+            db.execute("UPDATE blocks SET preferred_tier = 2 WHERE hash = ?", (digest,))
+        fs_impl.block_store._read_cache.clear()
+        fs_impl.block_store._read_cache_size = 0
+
+        from ztierfs.tier_access import PathProbe
+
+        import ztierfs.block_store as block_store_module
+
+        original_probe_path = block_store_module.probe_path
+
+        def cold_unavailable_probe(path):
+            if path == cold_path:
+                return PathProbe("unavailable", errno=5, error="cold unavailable")
+            return original_probe_path(path)
+
+        monkeypatch.setattr(block_store_module, "probe_path", cold_unavailable_probe)
+
+        assert fs("read", "/dual.jpg", len(data), 0, fh) == data
+
+    row = rows(
+        fs_impl,
+        "SELECT hot_present, cold_present, preferred_tier FROM block_records",
+    )[0]
+    assert (row["hot_present"], row["cold_present"], row["preferred_tier"]) == (1, 1, 2)
