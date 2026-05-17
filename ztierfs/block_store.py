@@ -155,6 +155,7 @@ class BlockStore:
         if self.metadata.has_deferred_accesses():
             with self.metadata.transaction():
                 pass
+        self.drain_pending_deletions()
         executor = self._prepare_executor
         if executor is not None:
             logger.debug("关闭块准备线程池")
@@ -517,7 +518,7 @@ class BlockStore:
             return self.encode_block(data, compress)
 
     def decrement_block(self, digest: str) -> None:
-        """引用计数递减；降至零时删除 SQLite 块行并在 **tier 存储** 上 ``delete_block_file``。"""
+        """引用计数递减；降至零时删除 SQLite 块行并把物理 payload 登记到提交后 GC 队列。"""
         row = self.metadata.block_refcount_and_presence(digest)
         if row is None:
             logger.warning("递减块引用时未找到块记录：hash={}", digest[:12])
@@ -533,7 +534,11 @@ class BlockStore:
             return
         self.metadata.delete_block(digest)
         if row["storage"] == "tiered":
-            self.delete_block_file(digest)
+            now = time_ns()
+            if row["hot_present"]:
+                self.metadata.enqueue_pending_block_file_deletion(digest, 1, now)
+            if row["cold_present"]:
+                self.metadata.enqueue_pending_block_file_deletion(digest, 2, now)
         logger.debug(
             "删除最后一个块引用：hash={}，storage={}", digest[:12], row["storage"]
         )
@@ -665,6 +670,45 @@ class BlockStore:
                     digest[:12],
                     candidate_tier,
                 )
+
+    def drain_pending_deletions(self, *, limit: int = 256) -> int:
+        """Delete queued physical payloads after their metadata transaction has committed."""
+        removed = 0
+        while True:
+            with self.metadata.read_transaction():
+                rows = self.metadata.pending_deletions(limit)
+            if not rows:
+                return removed
+            for row in rows:
+                now = time_ns()
+                try:
+                    if row["kind"] == "block_file":
+                        deleted_or_missing = not unlink_path(
+                            self.block_path(row["digest"], row["tier"])
+                        )
+                    else:
+                        self.metadata.payload_store.delete(row["payload_key"])
+                        deleted_or_missing = True
+                except PathUnavailable:
+                    logger.warning(
+                        "待 GC 块文件暂时不可用：id={}，hash={}，tier={}",
+                        row["id"],
+                        str(row["digest"])[:12],
+                        row["tier"],
+                    )
+                    with self.metadata.transaction():
+                        self.metadata.defer_pending_deletion(row["id"], now)
+                    continue
+                except OSError:
+                    logger.exception("待 GC payload 删除失败：id={}", row["id"])
+                    with self.metadata.transaction():
+                        self.metadata.defer_pending_deletion(row["id"], now)
+                    continue
+                with self.metadata.transaction():
+                    self.metadata.remove_pending_deletion(row["id"])
+                removed += 1
+                if deleted_or_missing:
+                    logger.debug("待 GC payload 已清理：id={}，kind={}", row["id"], row["kind"])
 
     def copy_block(self, digest: str, source_tier: int, target_tier: int) -> None:
         """跨层 **原子复制**：``shutil.copyfile`` 至临时文件、读 ``fsync``、``replace`` 落位、目录 ``fsync``。

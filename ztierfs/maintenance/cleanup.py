@@ -7,6 +7,7 @@ from time import time_ns
 
 from loguru import logger
 
+from ztierfs.payload_store import FileKVPayloadStore
 from ztierfs.metadata import open_database
 from ztierfs.tier_access import PathUnavailable, probe_path, unlink_path
 
@@ -23,6 +24,8 @@ class CleanupReport:
     """
     removed: int = 0
     skipped: int = 0
+    pending_removed: int = 0
+    pending_skipped: int = 0
 
 
 def cleanup_promoted_cold_copies(
@@ -57,6 +60,8 @@ def cleanup_promoted_cold_copies(
     tier2_path = paths.tier2
     removed = 0
     skipped = 0
+    pending_removed = 0
+    pending_skipped = 0
     logger.info(
         "开始维护清理冷层副本：database={}，tier1={}，tier2={}，min_age_seconds={}",
         db_path,
@@ -67,6 +72,9 @@ def cleanup_promoted_cold_copies(
     with closing(open_database(db_path)) as db:
         db.execute("BEGIN IMMEDIATE")
         try:
+            pending_removed, pending_skipped = _drain_pending_deletions(
+                db, tier1_path, tier2_path, paths.payload_store_path
+            )
             rows = db.execute(
                 """
                 SELECT blocks.hash
@@ -118,4 +126,55 @@ def cleanup_promoted_cold_copies(
         else:
             db.execute("COMMIT")
     logger.info("维护清理完成：removed={}，skipped={}", removed, skipped)
-    return CleanupReport(removed=removed, skipped=skipped)
+    return CleanupReport(
+        removed=removed,
+        skipped=skipped,
+        pending_removed=pending_removed,
+        pending_skipped=pending_skipped,
+    )
+
+
+def _drain_pending_deletions(
+    db,
+    tier1_path: Path,
+    tier2_path: Path,
+    payload_store_path: Path | None,
+) -> tuple[int, int]:
+    """Best-effort drain of physical deletes that were committed before a crash."""
+    try:
+        rows = db.execute(
+            """
+            SELECT id, kind, digest, tier, payload_key
+            FROM pending_deletions
+            ORDER BY id
+            """
+        ).fetchall()
+    except Exception as exc:
+        if "no such table: pending_deletions" in str(exc):
+            return 0, 0
+        raise
+
+    payload_store = (
+        FileKVPayloadStore(payload_store_path) if payload_store_path is not None else None
+    )
+    removed = 0
+    skipped = 0
+    for row in rows:
+        try:
+            if row["kind"] == "block_file":
+                unlink_path(block_path(tier1_path, tier2_path, row["digest"], row["tier"]))
+            elif payload_store is not None:
+                payload_store.delete(row["payload_key"])
+            else:
+                skipped += 1
+                continue
+        except PathUnavailable:
+            skipped += 1
+            continue
+        except OSError:
+            logger.exception("维护清理待 GC payload 失败：id={}", row["id"])
+            skipped += 1
+            continue
+        db.execute("DELETE FROM pending_deletions WHERE id = ?", (row["id"],))
+        removed += 1
+    return removed, skipped

@@ -79,5 +79,13 @@ class MetadataMixinBase:
         raise NotImplementedError
 
     def clear_inline_file(self, node_id: int) -> None:
-        """删除该 inode 的 `inode_payloads` 行，并视情况移除外置 payload 中的对象。"""
+        """删除该 inode 的 `inode_payloads` 行，并视情况把外置 payload 加入待 GC 队列。"""
+        raise NotImplementedError
+
+    def enqueue_pending_block_file_deletion(self, digest: str, tier: int, now: int) -> None:
+        """登记一个提交后可删除的 tier 块文件。"""
+        raise NotImplementedError
+
+    def enqueue_pending_payload_deletion(self, payload_key: str, now: int) -> None:
+        """登记一个提交后可删除的外置 payload 对象。"""
         raise NotImplementedError

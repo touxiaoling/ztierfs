@@ -253,6 +253,36 @@ class SchemaMixin(MetadataMixinBase):
             )
             """
         )
+        self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending_deletions (
+                id INTEGER PRIMARY KEY,
+                kind TEXT NOT NULL CHECK (kind IN ('block_file', 'payload_store')),
+                digest TEXT,
+                tier INTEGER CHECK (tier IN (1, 2)),
+                payload_key TEXT,
+                enqueued_ns INTEGER NOT NULL,
+                CHECK (
+                    (kind = 'block_file' AND digest IS NOT NULL AND tier IS NOT NULL AND payload_key IS NULL)
+                    OR (kind = 'payload_store' AND digest IS NULL AND tier IS NULL AND payload_key IS NOT NULL)
+                )
+            )
+            """
+        )
+        self._db.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_deletions_block_file
+            ON pending_deletions(kind, digest, tier)
+            WHERE kind = 'block_file'
+            """
+        )
+        self._db.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_deletions_payload_store
+            ON pending_deletions(kind, payload_key)
+            WHERE kind = 'payload_store'
+            """
+        )
 
     def _ensure_root(self) -> None:
         """确保 inode `id=1` 的根目录存在（`INSERT OR IGNORE`）。"""

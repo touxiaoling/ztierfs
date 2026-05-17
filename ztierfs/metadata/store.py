@@ -24,7 +24,7 @@
 import sqlite3
 import threading
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -40,6 +40,7 @@ from .access_stats import (
 from .blocks import BlockMetadataMixin
 from .chunks import ChunkMetadataMixin
 from .connection import ConnectionPool, ReadWriteLock, SQLitePragmas
+from .gc import GarbageCollectionMixin
 from .namespace import NamespaceMixin
 from .schema import SCHEMA_VERSION, SchemaMixin
 from ztierfs.payload_store import NullPayloadStore, PayloadStore
@@ -50,6 +51,7 @@ class MetadataStore(
     NamespaceMixin,
     ChunkMetadataMixin,
     BlockMetadataMixin,
+    GarbageCollectionMixin,
     AccessStatsMixin,
 ):
     """组合各 mixin 后的对外 API；通过 `_db` 的访问须在已打开的 `read_transaction` 或 `write_transaction` 内（含嵌套时复用同一连接）。
@@ -74,6 +76,8 @@ class MetadataStore(
         self._pool = ConnectionPool(path, pragmas=pragmas)
         self._rwlock = ReadWriteLock()
         self._local = threading.local()
+        self._after_commit_hooks: list[Callable[[], None]] = []
+        self._running_after_commit_hooks = False
         self._deferred_access_lock = threading.Lock()
         self._deferred_node_atimes: dict[int, int] = {}
         self._deferred_block_accesses: dict[str, BlockAccessStats] = {}
@@ -101,6 +105,10 @@ class MetadataStore(
             return
         with self.transaction():
             pass
+
+    def add_after_commit_hook(self, hook: Callable[[], None]) -> None:
+        """Register a best-effort callback to run after successful outer write commits."""
+        self._after_commit_hooks.append(hook)
 
     @contextmanager
     def transaction(self) -> Iterator[None]:
@@ -136,6 +144,7 @@ class MetadataStore(
         lock_context = (
             self._rwlock.read_lock() if readonly else self._rwlock.write_lock()
         )
+        run_after_commit_hooks = False
         with lock_context, self._pool.connection() as db:
             self._local.db = db
             self._local.readonly = readonly
@@ -157,9 +166,15 @@ class MetadataStore(
                 raise
             else:
                 db.execute("COMMIT")
+                if not readonly:
+                    self._local.db = None
+                    self._local.readonly = False
+                    run_after_commit_hooks = True
             finally:
                 self._local.db = None
                 self._local.readonly = False
+        if run_after_commit_hooks:
+            self._run_after_commit_hooks()
 
     @property
     def _db(self) -> sqlite3.Connection:
@@ -168,6 +183,19 @@ class MetadataStore(
         if db is None:
             raise RuntimeError("metadata access requires an active transaction")
         return db
+
+    def _run_after_commit_hooks(self) -> None:
+        if self._running_after_commit_hooks or not self._after_commit_hooks:
+            return
+        self._running_after_commit_hooks = True
+        try:
+            for hook in self._after_commit_hooks:
+                try:
+                    hook()
+                except Exception:
+                    logger.exception("after-commit hook failed")
+        finally:
+            self._running_after_commit_hooks = False
 
     def setup(self) -> None:
         """持写锁从池中取连接，WAL 与 schema/根节点初始化在单次 `BEGIN IMMEDIATE`…`COMMIT` 中完成；不经过本类可嵌套事务的 `_transaction` 包装。"""

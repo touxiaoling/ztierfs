@@ -6,7 +6,7 @@ import pytest
 from macfusepy import FuseOSError
 
 from ztierfs.block_store import TieringPolicy
-from ztierfs.maintenance import block_path, run_fsck
+from ztierfs.maintenance import block_path, cleanup_promoted_cold_copies, run_fsck
 
 from .helpers import adapted, connect_sqlite, make_fs, rows
 
@@ -127,15 +127,13 @@ def test_crash_after_block_delete_before_metadata_commit_reports_missing_referen
     fs_impl = make_fs(tmp_path, inline_max_bytes=0)
     original_data = _write_committed_file(fs_impl, "/victim.jpg")
     digest = _single_block_digest(fs_impl)
-    original_delete_block_file = fs_impl.block_store.delete_block_file
+    original_delete_block = fs_impl.metadata.delete_block
 
-    def delete_block_file_then_crash(*args, **kwargs):
-        original_delete_block_file(*args, **kwargs)
-        raise SimulatedCrash("crash after block file delete before transaction commit")
+    def delete_block_then_crash(*args, **kwargs):
+        original_delete_block(*args, **kwargs)
+        raise SimulatedCrash("crash after block tombstone before transaction commit")
 
-    monkeypatch.setattr(
-        fs_impl.block_store, "delete_block_file", delete_block_file_then_crash
-    )
+    monkeypatch.setattr(fs_impl.metadata, "delete_block", delete_block_then_crash)
 
     with pytest.raises(SimulatedCrash):
         with adapted(fs_impl) as fs:
@@ -152,23 +150,16 @@ def test_crash_after_block_delete_before_metadata_commit_reports_missing_referen
                 fs("release", "/source.jpg", source)
                 fs("rename", "/source.jpg", "/victim.jpg", 0)
 
-    assert not block_path(fs_impl.tier1, fs_impl.tier2, digest, 1).exists()
+    assert block_path(fs_impl.tier1, fs_impl.tier2, digest, 1).exists()
 
     reopened = make_fs(tmp_path, inline_max_bytes=0)
     with adapted(reopened) as fs:
         fh = fs("open", "/victim.jpg", os.O_RDONLY)
-        with pytest.raises(FuseOSError) as exc:
-            fs("read", "/victim.jpg", len(original_data), 0, fh)
-        assert exc.value.errno == errno.EIO
+        assert fs("read", "/victim.jpg", len(original_data), 0, fh) == original_data
 
     report = run_fsck(fs_impl.tier1, fs_impl.tier2, fs_impl.database, repair=True)
 
-    issues = {issue.code: issue for issue in report.issues}
-    assert "missing_block_file" in issues
-    assert not issues["missing_block_file"].repaired
-    if operation == "overwrite":
-        assert issues["orphan_block_file"].repaired
-    assert report.has_unrepaired
+    assert not report.has_unrepaired
 
 
 def test_hardlink_unlink_crash_after_entry_remove_rolls_back_metadata(
@@ -520,13 +511,11 @@ def test_hardlink_last_unlink_crash_after_block_delete_reports_missing_block(
 ):
     fs_impl = make_fs(tmp_path, inline_max_bytes=0)
     data = bytes(range(256)) * 4
-    original_delete_block_file = fs_impl.block_store.delete_block_file
+    original_delete_block = fs_impl.metadata.delete_block
 
-    def delete_block_file_then_crash(*args, **kwargs):
-        original_delete_block_file(*args, **kwargs)
-        raise SimulatedCrash(
-            "crash after last hardlink block file delete before commit"
-        )
+    def delete_block_then_crash(*args, **kwargs):
+        original_delete_block(*args, **kwargs)
+        raise SimulatedCrash("crash after last hardlink block tombstone before commit")
 
     with adapted(fs_impl) as fs:
         fh = fs("create", "/original.jpg", 0o644)
@@ -536,23 +525,45 @@ def test_hardlink_last_unlink_crash_after_block_delete_reports_missing_block(
         fs("unlink", "/original.jpg")
 
         digest = _single_block_digest(fs_impl)
-        monkeypatch.setattr(
-            fs_impl.block_store, "delete_block_file", delete_block_file_then_crash
-        )
+        monkeypatch.setattr(fs_impl.metadata, "delete_block", delete_block_then_crash)
         with pytest.raises(SimulatedCrash):
             fs("unlink", "/linked.jpg")
 
-    assert not block_path(fs_impl.tier1, fs_impl.tier2, digest, 1).exists()
+    assert block_path(fs_impl.tier1, fs_impl.tier2, digest, 1).exists()
 
     reopened = make_fs(tmp_path, inline_max_bytes=0)
     with adapted(reopened) as fs:
         fh = fs("open", "/linked.jpg", os.O_RDONLY)
-        with pytest.raises(FuseOSError) as exc:
-            fs("read", "/linked.jpg", len(data), 0, fh)
-        assert exc.value.errno == errno.EIO
+        assert fs("read", "/linked.jpg", len(data), 0, fh) == data
 
     report = run_fsck(fs_impl.tier1, fs_impl.tier2, fs_impl.database, repair=True)
-    issues = {issue.code: issue for issue in report.issues}
-    assert "missing_block_file" in issues
-    assert not issues["missing_block_file"].repaired
-    assert report.has_unrepaired
+    assert report.ok
+
+
+def test_last_unlink_commit_queues_block_delete_for_cleanup(tmp_path, monkeypatch):
+    fs_impl = make_fs(tmp_path, inline_max_bytes=0)
+    _write_committed_file(fs_impl, "/victim.jpg")
+    digest = _single_block_digest(fs_impl)
+    fs_impl.metadata._after_commit_hooks.clear()
+    monkeypatch.setattr(fs_impl.block_store, "drain_pending_deletions", lambda **_kwargs: 0)
+
+    with adapted(fs_impl) as fs:
+        fs("unlink", "/victim.jpg")
+
+    path = block_path(fs_impl.tier1, fs_impl.tier2, digest, 1)
+    assert path.exists()
+    pending = rows(fs_impl, "SELECT kind, digest, tier FROM pending_deletions")
+    assert [(row["kind"], row["digest"], row["tier"]) for row in pending] == [
+        ("block_file", digest, 1)
+    ]
+
+    report = cleanup_promoted_cold_copies(
+        fs_impl.tier1,
+        fs_impl.tier2,
+        fs_impl.database,
+        min_age_seconds=0,
+    )
+
+    assert report.pending_removed == 1
+    assert not path.exists()
+    assert rows(fs_impl, "SELECT * FROM pending_deletions") == []

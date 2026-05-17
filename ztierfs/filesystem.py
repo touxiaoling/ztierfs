@@ -241,6 +241,7 @@ class ZTierFS(
             inline_max_bytes=inline_max_bytes,
             read_cache_bytes=read_cache_bytes,
         )
+        self.metadata.add_after_commit_hook(self.block_store.drain_pending_deletions)
         self.file_content = FileContentService(
             self.metadata,
             self.block_store,

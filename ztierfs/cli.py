@@ -434,13 +434,17 @@ def _run_cleanup_command(args: argparse.Namespace) -> None:
                 {
                     "removed_cold_copies": report.removed,
                     "skipped_cold_copies": report.skipped,
+                    "removed_pending_deletions": report.pending_removed,
+                    "skipped_pending_deletions": report.pending_skipped,
                 },
                 sort_keys=True,
             )
         )
     else:
         _emit_stdout(
-            f"cleanup: removed {report.removed} promoted cold copy/copies, skipped {report.skipped}"
+            f"cleanup: removed {report.removed} promoted cold copy/copies, "
+            f"skipped {report.skipped}, removed {report.pending_removed} pending deletion(s), "
+            f"skipped {report.pending_skipped}"
         )
 
 

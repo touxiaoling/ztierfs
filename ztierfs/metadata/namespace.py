@@ -470,7 +470,7 @@ class NamespaceMixin(MetadataMixinBase):
         )
 
     def clear_inline_file(self, node_id: int) -> None:
-        """删除 `inode_payloads` 行；若曾使用外部存储则 `payload_store.delete` 对应键。"""
+        """删除 `inode_payloads` 行；若曾使用外部存储则把对象登记到提交后 GC 队列。"""
         row = self._db.execute(
             """
             SELECT payload_store, payload_key
@@ -484,7 +484,7 @@ class NamespaceMixin(MetadataMixinBase):
             (node_id,),
         )
         if row is not None and row["payload_store"] != "sqlite":
-            self.payload_store.delete(row["payload_key"])
+            self.enqueue_pending_payload_deletion(row["payload_key"], time_ns())
 
     def delete_node(self, node_id: int) -> None:
         """从 `inodes` 表删除一行（调用方需已处理目录项与孤儿约束）。"""

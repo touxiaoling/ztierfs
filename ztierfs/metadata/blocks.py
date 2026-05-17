@@ -4,6 +4,7 @@ block_locations.tier 约定：1 表示热层，2 表示冷层；inline 块不走
 """
 
 import sqlite3
+from time import time_ns
 
 from .base import MetadataMixinBase
 from .schema import BLOCK_RECORD_SELECT
@@ -117,7 +118,7 @@ class BlockMetadataMixin(MetadataMixinBase):
         )
 
     def delete_block(self, digest: str) -> None:
-        """删除block。"""
+        """删除 block 元数据；外置 inline payload 只登记到提交后 GC 队列。"""
         row = self._db.execute(
             """
             SELECT payload_store, payload_key
@@ -128,7 +129,7 @@ class BlockMetadataMixin(MetadataMixinBase):
         ).fetchone()
         self._db.execute("DELETE FROM blocks WHERE hash = ?", (digest,))
         if row is not None and row["payload_store"] != "sqlite":
-            self.payload_store.delete(row["payload_key"])
+            self.enqueue_pending_payload_deletion(row["payload_key"], time_ns())
 
     def inline_block_payload(self, digest: str) -> bytes | None:
         """处理 inline block payload。"""
