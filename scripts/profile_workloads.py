@@ -75,20 +75,6 @@ def small_file_read(root: Path, profile: cProfile.Profile) -> None:
             fs("read", path, len(payload), 0, fh)
 
 
-def small_file_read_filekv(root: Path, profile: cProfile.Profile) -> None:
-    fs_impl = make_fs(root, payload_store="filekv")
-    payload = b"small payload"
-    with profiled_adapter(fs_impl, profile) as fs:
-        handles = []
-        for index in range(500):
-            path = f"/small-filekv-{index}.txt"
-            fh = fs("create", path, 0o644)
-            fs("write", path, payload, 0, fh)
-            handles.append((path, fh))
-        for path, fh in handles:
-            fs("read", path, len(payload), 0, fh)
-
-
 def metadata_walk(root: Path, profile: cProfile.Profile) -> None:
     fs_impl = make_fs(root)
     with profiled_adapter(fs_impl, profile) as fs:
@@ -208,7 +194,6 @@ WORKLOADS: dict[str, Callable[[Path, cProfile.Profile], None]] = {
     "small-file-create": small_file_create,
     "small-file-create-no-inline": small_file_create_no_inline,
     "small-file-read": small_file_read,
-    "small-file-read-filekv": small_file_read_filekv,
     "large-sequential-write": large_sequential_write,
     "metadata-walk": metadata_walk,
     "sequential-block-read": sequential_block_read,

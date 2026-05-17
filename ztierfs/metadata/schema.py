@@ -24,7 +24,7 @@ from time import time_ns
 
 from .base import MetadataMixinBase
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 CONFIG_VERSION = 1
 
 BLOCK_RECORD_SELECT = """
@@ -49,9 +49,7 @@ BLOCK_RECORD_SELECT = """
         blocks.last_promoted_ns,
         blocks.last_demoted_ns,
         blocks.cold_verified_ns,
-        block_payloads.payload AS inline_payload,
-        block_payloads.payload_store AS inline_payload_store,
-        block_payloads.payload_key AS inline_payload_key
+        block_payloads.payload AS inline_payload
     FROM blocks
     LEFT JOIN block_locations AS hot_locations
         ON hot_locations.hash = blocks.hash AND hot_locations.tier = 1
@@ -119,16 +117,10 @@ class SchemaMixin(MetadataMixinBase):
             """
             CREATE TABLE IF NOT EXISTS inode_payloads (
                 inode_id INTEGER PRIMARY KEY REFERENCES inodes(id) ON DELETE CASCADE,
-                payload BLOB,
-                payload_store TEXT NOT NULL DEFAULT 'sqlite',
-                payload_key TEXT,
+                payload BLOB NOT NULL,
                 compressed INTEGER NOT NULL CHECK (compressed IN (0, 1)),
                 raw_size INTEGER NOT NULL CHECK (raw_size > 0),
-                stored_size INTEGER NOT NULL CHECK (stored_size > 0),
-                CHECK (
-                    (payload_store = 'sqlite' AND payload IS NOT NULL AND payload_key IS NULL)
-                    OR (payload_store != 'sqlite' AND payload IS NULL AND payload_key IS NOT NULL)
-                )
+                stored_size INTEGER NOT NULL CHECK (stored_size > 0)
             )
             """
         )
@@ -197,13 +189,7 @@ class SchemaMixin(MetadataMixinBase):
             """
             CREATE TABLE IF NOT EXISTS block_payloads (
                 hash TEXT PRIMARY KEY REFERENCES blocks(hash) ON DELETE CASCADE,
-                payload BLOB,
-                payload_store TEXT NOT NULL DEFAULT 'sqlite',
-                payload_key TEXT,
-                CHECK (
-                    (payload_store = 'sqlite' AND payload IS NOT NULL AND payload_key IS NULL)
-                    OR (payload_store != 'sqlite' AND payload IS NULL AND payload_key IS NOT NULL)
-                )
+                payload BLOB NOT NULL
             )
             """
         )
@@ -243,13 +229,7 @@ class SchemaMixin(MetadataMixinBase):
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 config_version INTEGER NOT NULL,
                 hot_tier_path TEXT NOT NULL,
-                cold_tier_path TEXT NOT NULL,
-                payload_store TEXT NOT NULL CHECK (payload_store IN ('sqlite', 'filekv')),
-                payload_store_path TEXT,
-                CHECK (
-                    (payload_store = 'sqlite' AND payload_store_path IS NULL)
-                    OR (payload_store = 'filekv' AND payload_store_path IS NOT NULL)
-                )
+                cold_tier_path TEXT NOT NULL
             )
             """
         )
@@ -257,15 +237,11 @@ class SchemaMixin(MetadataMixinBase):
             """
             CREATE TABLE IF NOT EXISTS pending_deletions (
                 id INTEGER PRIMARY KEY,
-                kind TEXT NOT NULL CHECK (kind IN ('block_file', 'payload_store')),
-                digest TEXT,
-                tier INTEGER CHECK (tier IN (1, 2)),
-                payload_key TEXT,
+                kind TEXT NOT NULL CHECK (kind = 'block_file'),
+                digest TEXT NOT NULL,
+                tier INTEGER NOT NULL CHECK (tier IN (1, 2)),
                 enqueued_ns INTEGER NOT NULL,
-                CHECK (
-                    (kind = 'block_file' AND digest IS NOT NULL AND tier IS NOT NULL AND payload_key IS NULL)
-                    OR (kind = 'payload_store' AND digest IS NULL AND tier IS NULL AND payload_key IS NOT NULL)
-                )
+                CHECK (kind = 'block_file')
             )
             """
         )
@@ -274,13 +250,6 @@ class SchemaMixin(MetadataMixinBase):
             CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_deletions_block_file
             ON pending_deletions(kind, digest, tier)
             WHERE kind = 'block_file'
-            """
-        )
-        self._db.execute(
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_deletions_payload_store
-            ON pending_deletions(kind, payload_key)
-            WHERE kind = 'payload_store'
             """
         )
 
@@ -298,10 +267,10 @@ class SchemaMixin(MetadataMixinBase):
         )
 
     def filesystem_config(self):
-        """读取 `filesystem_config` 单行（id=1）：热/冷路径与 payload 存储配置。"""
+        """读取 `filesystem_config` 单行（id=1）：热/冷路径配置。"""
         return self._db.execute(
             """
-            SELECT hot_tier_path, cold_tier_path, payload_store, payload_store_path
+            SELECT hot_tier_path, cold_tier_path
             FROM filesystem_config
             WHERE id = 1
             """
@@ -312,28 +281,22 @@ class SchemaMixin(MetadataMixinBase):
         *,
         hot_tier_path: str,
         cold_tier_path: str,
-        payload_store: str,
-        payload_store_path: str | None,
     ) -> None:
         """写入或更新挂载配置（upsert id=1），`config_version` 使用模块常量 `CONFIG_VERSION`。"""
         self._db.execute(
             """
             INSERT INTO filesystem_config (
-                id, config_version, hot_tier_path, cold_tier_path, payload_store, payload_store_path
+                id, config_version, hot_tier_path, cold_tier_path
             )
-            VALUES (1, ?, ?, ?, ?, ?)
+            VALUES (1, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 config_version = excluded.config_version,
                 hot_tier_path = excluded.hot_tier_path,
-                cold_tier_path = excluded.cold_tier_path,
-                payload_store = excluded.payload_store,
-                payload_store_path = excluded.payload_store_path
+                cold_tier_path = excluded.cold_tier_path
             """,
             (
                 CONFIG_VERSION,
                 hot_tier_path,
                 cold_tier_path,
-                payload_store,
-                payload_store_path,
             ),
         )

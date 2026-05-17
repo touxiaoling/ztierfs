@@ -4,11 +4,12 @@
 冷热层上块文件是否存在、`blocks` 与 `block_locations` 是否一致、目录项与 chunk
 关系等；不读取整块 payload 做解压与逐字节校验（内联块仅检查是否有对应行/可读路径）。
 
-**scrub（`run_scrub`）**：在 fsck 相同流程之后，对 inode 内联数据与块文件执行读盘、
-按需 zstd 解压，并核对 `stored_size`/`raw_size` 等，用于发现静默损坏或尺寸不一致。
+**scrub（`run_scrub`）**：在 fsck 相同流程之后，对 inode 内联数据、内联块和热层块文件执行读盘、
+按需 zstd 解压，并核对 `stored_size`/`raw_size` 等。冷层块文件默认不读取；需要完整读取冷层时
+显式传 `include_cold=True`。
 
 **修复（`repair=True`）**：以 `BEGIN IMMEDIATE` 开启写事务，仅对标记为可修复的问题
-执行回调 SQL/删文件；冷层或外置载荷路径**暂时不可用**（`PathUnavailable`、探测为
+执行回调 SQL/删文件；冷层路径**暂时不可用**（`PathUnavailable`、探测为
 `unavailable`）时，不把「无法核实」当成「缺失」去删无引用块等破坏性操作；真正路径
 不存在（`PathMissing`）才按缺失处理。
 """
@@ -67,8 +68,9 @@ def run_scrub(
     repair: bool = False,
     allow_config_mismatch: bool = False,
     update_config: bool = False,
+    include_cold: bool = False,
 ) -> CheckReport:
-    """执行 scrub：在 fsck 基础上对块与内联 payload 做读盘与解压后的尺寸校验（`scrub=True`）。"""
+    """执行 scrub：在 fsck 基础上对内联与热层 payload 做读盘与解压后的尺寸校验；`include_cold` 为真时也读取冷层。"""
     return Checker(
         path,
         tier2,
@@ -77,6 +79,7 @@ def run_scrub(
         scrub=True,
         allow_config_mismatch=allow_config_mismatch,
         update_config=update_config,
+        include_cold=include_cold,
     ).run()
 
 
@@ -96,8 +99,9 @@ class Checker:
         scrub: bool,
         allow_config_mismatch: bool,
         update_config: bool,
+        include_cold: bool = False,
     ):
-        """保存 tier1/tier2、数据库与外置 payload 根路径，以及是否修复、是否 scrub 的标志。"""
+        """保存 tier1/tier2、数据库，以及是否修复、是否 scrub / cold scrub 的标志。"""
         paths = resolve_maintenance_paths(
             path,
             tier2,
@@ -108,9 +112,9 @@ class Checker:
         self.tier1 = paths.tier1
         self.tier2 = paths.tier2
         self.database = paths.database
-        self.payload_store_path = paths.payload_store_path
         self.repair = repair
         self.scrub = scrub
+        self.include_cold = include_cold
         self.issues: list[Issue] = []
 
     def run(self) -> CheckReport:
@@ -544,12 +548,11 @@ class Checker:
         """scrub 阶段：读取 inode 内联与块级内联/分层文件中的 payload，校验压缩与 `stored_size`/`raw_size`/`size`。
 
         读盘时区分路径缺失（`PathMissing`）与暂时不可读（`PathUnavailable`）；后者记入
-        `block_payload_unavailable` 而非当作内容损坏。
+        `block_payload_unavailable` 而非当作内容损坏。冷层块默认跳过，除非 `include_cold` 为真。
         """
         for row in db.execute(
             """
             SELECT inodes.id, inodes.size, inode_payloads.payload,
-                   inode_payloads.payload_store, inode_payloads.payload_key,
                    inode_payloads.compressed, inode_payloads.raw_size,
                    inode_payloads.stored_size
             FROM inode_payloads
@@ -615,6 +618,7 @@ class Checker:
             paths = [
                 (tier, block_path(self.tier1, self.tier2, digest, tier))
                 for tier in (1, 2)
+                if tier == 1 or self.include_cold
                 if self._payload_path_available(digest, tier)
             ]
             for tier, path in paths:
@@ -656,46 +660,9 @@ class Checker:
     def _inline_payload_bytes(
         self, row: sqlite3.Row, *, issue_context: dict[str, Any]
     ) -> bytes | None:
-        """从内联行读取 payload：`sqlite` 列直接返回字节；外置 store 则按 key 拼路径读文件。
-
-        读失败时根据 `issue_context` 上报 `payload_store_unavailable` 并返回 None。
-        """
-        store = (
-            row["payload_store"]
-            if "payload_store" in row.keys()
-            else row["inline_payload_store"]
-        )
+        """从内联行读取 SQLite payload。"""
         payload = row["payload"] if "payload" in row.keys() else row["inline_payload"]
-        key = (
-            row["payload_key"]
-            if "payload_key" in row.keys()
-            else row["inline_payload_key"]
-        )
-        if store == "sqlite":
-            return bytes(payload) if payload is not None else None
-        if key is None:
-            return None
-        path = self._external_payload_path(key)
-        try:
-            return path.read_bytes()
-        except OSError as exc:
-            self._issue(
-                "payload_store_unavailable",
-                "external inline payload cannot be read",
-                {
-                    **issue_context,
-                    "payload_store": store,
-                    "payload_key": key,
-                    "error": str(exc),
-                },
-            )
-            return None
-
-    def _external_payload_path(self, key: str) -> Path:
-        """将外置 payload 的 key 规范化为相对 `payload_store_path`（缺省为 tier1 下 `payload-kv`）的分片路径。"""
-        safe = key.replace("/", "_")
-        root = self.payload_store_path or self.tier1 / "payload-kv"
-        return root / safe[:2] / safe[2:4] / safe
+        return bytes(payload) if payload is not None else None
 
     def _scrub_payload(
         self,

@@ -199,58 +199,37 @@ def test_ztierfs_stores_small_files_inline_in_payload_table_and_reopens(tmp_path
         assert fs("read", "/small.txt", len(data), 0, fh) == data
 
 
-def test_ztierfs_stores_small_files_in_filekv_payload_store_and_reopens(tmp_path):
-    fs_impl = make_fs(tmp_path, payload_store="filekv")
-    data = b"tiny payload"
+def test_open_trunc_uses_inode_selected_before_path_replacement(tmp_path, monkeypatch):
+    fs_impl = make_fs(tmp_path)
 
     with adapted(fs_impl) as fs:
-        fh = fs("create", "/small.txt", 0o644)
-        fs("write", "/small.txt", data, 0, fh)
-        fs("release", "/small.txt", fh)
+        fh = fs("create", "/target.txt", 0o644)
+        fs("write", "/target.txt", b"old", 0, fh)
+        fs("release", "/target.txt", fh)
 
-    inode = rows(
-        fs_impl,
-        """
-        SELECT payload, payload_store, payload_key, stored_size
-        FROM inode_payloads
-        """,
-    )[0]
-    assert inode["payload"] is None
-    assert inode["payload_store"] == "filekv"
-    assert inode["payload_key"].startswith("inode/")
-    assert inode["stored_size"] == len(data)
+        replacement = fs("create", "/replacement.txt", 0o644)
+        fs("write", "/replacement.txt", b"new", 0, replacement)
+        fs("release", "/replacement.txt", replacement)
 
-    reopened = make_fs(tmp_path, payload_store="filekv")
-    with adapted(reopened) as fs:
-        fh = fs("open", "/small.txt", os.O_RDONLY)
-        assert fs("read", "/small.txt", len(data), 0, fh) == data
+        original_content_lock = fs_impl._content_lock
+        replaced = False
 
+        def content_lock_after_path_replacement(inode_id):
+            nonlocal replaced
+            if not replaced:
+                replaced = True
+                fs("rename", "/target.txt", "/old-name.txt", 0)
+                fs("rename", "/replacement.txt", "/target.txt", 0)
+            return original_content_lock(inode_id)
 
-def test_ztierfs_stores_inline_blocks_in_filekv_payload_store(tmp_path):
-    fs_impl = make_fs(
-        tmp_path,
-        inline_max_bytes=64,
-        compression_min_bytes=0,
-        payload_store="filekv",
-    )
-    data = b"a" * 1024
+        monkeypatch.setattr(fs_impl, "_content_lock", content_lock_after_path_replacement)
+        opened = fs_impl._open("/target.txt", os.O_RDWR | os.O_TRUNC)
+        fs("release", "/old-name.txt", opened)
 
-    with adapted(fs_impl) as fs:
-        fh = fs("create", "/small.txt", 0o644)
-        fs("write", "/small.txt", data, 0, fh)
-        assert fs("read", "/small.txt", len(data), 0, fh) == data
-
-    block = rows(
-        fs_impl,
-        """
-        SELECT storage, inline_payload, inline_payload_store, inline_payload_key
-        FROM block_records
-        """,
-    )[0]
-    assert block["storage"] == "inline"
-    assert block["inline_payload"] is None
-    assert block["inline_payload_store"] == "filekv"
-    assert block["inline_payload_key"].startswith("block/")
+        old_fh = fs("open", "/old-name.txt", os.O_RDONLY)
+        new_fh = fs("open", "/target.txt", os.O_RDONLY)
+        assert fs("read", "/old-name.txt", 3, 0, old_fh) == b""
+        assert fs("read", "/target.txt", 3, 0, new_fh) == b"new"
 
 
 def test_ztierfs_inline_file_hardlinks_share_payload_and_xattrs(tmp_path):

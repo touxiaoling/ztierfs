@@ -175,10 +175,6 @@ class BlockStore:
         """
         if row["storage"] == "inline":
             inline_payload = row["inline_payload"]
-            if inline_payload is None and row["inline_payload_store"] != "sqlite":
-                inline_payload = self.metadata.payload_store.get(
-                    row["inline_payload_key"]
-                )
             if inline_payload is None:
                 logger.error("内联块缺少 payload：hash={}", row["hash"])
                 raise FuseOSError(errno.EIO)
@@ -686,9 +682,6 @@ class BlockStore:
                         deleted_or_missing = not unlink_path(
                             self.block_path(row["digest"], row["tier"])
                         )
-                    else:
-                        self.metadata.payload_store.delete(row["payload_key"])
-                        deleted_or_missing = True
                 except PathUnavailable:
                     logger.warning(
                         "待 GC 块文件暂时不可用：id={}，hash={}，tier={}",

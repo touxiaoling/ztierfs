@@ -80,8 +80,10 @@ class FileOpsMixin(FileSystemMixinBase):
             inode_id = node["id"]
         if flags & os.O_TRUNC:
             with self._content_lock(inode_id), self.metadata.transaction():
-                node = self.metadata.get_node(path)
-                self.file_content.truncate_file(node["id"], path, 0)
+                node = self.metadata.node_by_id(inode_id)
+                if node is None:
+                    raise FuseOSError(errno.ENOENT)
+                self.file_content.truncate_file(inode_id, self._name_for_inode(node), 0)
                 logger.debug("打开时截断文件：path={}，inode={}", path, inode_id)
         return self.handles.new(inode_id, self._lock_owner())
 

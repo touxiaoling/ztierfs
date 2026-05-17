@@ -158,17 +158,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="SQLite synchronous 模式，默认 NORMAL；FULL 更保守，OFF 仅用于明确性能取舍",
     )
     mount.add_argument(
-        "--payload-store",
-        choices=["sqlite", "filekv"],
-        default="sqlite",
-        help="小文件和内联块 payload 的存储后端，默认 sqlite",
-    )
-    mount.add_argument(
-        "--payload-store-path",
-        default=None,
-        help="filekv payload store 路径，默认放在热层 payload-kv 目录",
-    )
-    mount.add_argument(
         "--update-config",
         action="store_true",
         help="允许用本次挂载参数重写数据库中的本机存储路径配置",
@@ -219,8 +208,13 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_maintenance_args(fsck)
     fsck.set_defaults(handler=_run_fsck_command)
 
-    scrub = subparsers.add_parser("scrub", help="检查一致性并读取校验块 payload")
+    scrub = subparsers.add_parser("scrub", help="检查一致性并读取校验 inline/热层 payload")
     _add_maintenance_args(scrub)
+    scrub.add_argument(
+        "--include-cold",
+        action="store_true",
+        help="同时读取冷层块 payload；远程冷层可能因此下载完整冷层数据",
+    )
     scrub.set_defaults(handler=_run_scrub_command)
 
     stats = subparsers.add_parser("stats", help="输出文件系统统计信息")
@@ -351,8 +345,6 @@ def _run_mount(args: argparse.Namespace) -> None:
         readahead_blocks=args.readahead_blocks,
         readahead_workers=args.readahead_workers,
         sqlite_synchronous=args.sqlite_synchronous,
-        payload_store=args.payload_store,
-        payload_store_path=args.payload_store_path,
         update_config=args.update_config,
         profile_interval_seconds=args.profile_interval,
     )
@@ -397,6 +389,7 @@ def _run_scrub_command(args: argparse.Namespace) -> None:
         repair=args.repair,
         allow_config_mismatch=args.allow_config_mismatch,
         update_config=args.update_config,
+        include_cold=args.include_cold,
     )
     _emit_check_report(report, json_output=args.json)
 

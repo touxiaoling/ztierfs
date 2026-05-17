@@ -7,7 +7,6 @@ from time import time_ns
 
 from loguru import logger
 
-from ztierfs.payload_store import FileKVPayloadStore
 from ztierfs.metadata import open_database
 from ztierfs.tier_access import PathUnavailable, probe_path, unlink_path
 
@@ -73,7 +72,7 @@ def cleanup_promoted_cold_copies(
         db.execute("BEGIN IMMEDIATE")
         try:
             pending_removed, pending_skipped = _drain_pending_deletions(
-                db, tier1_path, tier2_path, paths.payload_store_path
+                db, tier1_path, tier2_path
             )
             rows = db.execute(
                 """
@@ -138,13 +137,12 @@ def _drain_pending_deletions(
     db,
     tier1_path: Path,
     tier2_path: Path,
-    payload_store_path: Path | None,
 ) -> tuple[int, int]:
     """Best-effort drain of physical deletes that were committed before a crash."""
     try:
         rows = db.execute(
             """
-            SELECT id, kind, digest, tier, payload_key
+            SELECT id, kind, digest, tier
             FROM pending_deletions
             ORDER BY id
             """
@@ -154,20 +152,11 @@ def _drain_pending_deletions(
             return 0, 0
         raise
 
-    payload_store = (
-        FileKVPayloadStore(payload_store_path) if payload_store_path is not None else None
-    )
     removed = 0
     skipped = 0
     for row in rows:
         try:
-            if row["kind"] == "block_file":
-                unlink_path(block_path(tier1_path, tier2_path, row["digest"], row["tier"]))
-            elif payload_store is not None:
-                payload_store.delete(row["payload_key"])
-            else:
-                skipped += 1
-                continue
+            unlink_path(block_path(tier1_path, tier2_path, row["digest"], row["tier"]))
         except PathUnavailable:
             skipped += 1
             continue

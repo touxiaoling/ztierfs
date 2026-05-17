@@ -50,17 +50,13 @@ def test_benchmark_small_file_create_adapter(tmp_path, benchmark):
     _assert_no_refcount_drift(fs_impl)
 
 
-@pytest.mark.parametrize(
-    ("inline_max_bytes", "payload_store"),
-    [(0, "sqlite"), (128 * 1024, "sqlite"), (128 * 1024, "filekv")],
-)
+@pytest.mark.parametrize("inline_max_bytes", [0, 128 * 1024])
 def test_benchmark_small_file_create_storage_matrix(
-    tmp_path, benchmark, inline_max_bytes, payload_store
+    tmp_path, benchmark, inline_max_bytes
 ):
     fs_impl = make_fs(
         tmp_path,
         inline_max_bytes=inline_max_bytes,
-        payload_store=payload_store,
     )
     counter = 0
 
@@ -97,28 +93,6 @@ def test_benchmark_small_file_read_adapter(tmp_path, benchmark):
                 assert fs("read", path, len(payload), 0, fh) == payload
 
         benchmark.pedantic(read_batch, rounds=5, iterations=1)
-
-
-@pytest.mark.parametrize("payload_store", ["sqlite", "filekv"])
-def test_benchmark_small_file_read_payload_store_matrix(
-    tmp_path, benchmark, payload_store
-):
-    fs_impl = make_fs(tmp_path, payload_store=payload_store)
-    payload = b"small payload"
-
-    with adapted(fs_impl) as fs:
-        handles = []
-        for index in range(96):
-            path = f"/payload-{index}.txt"
-            fh = fs("create", path, 0o644)
-            fs("write", path, payload, 0, fh)
-            handles.append((path, fh))
-
-        def read_batch():
-            for path, fh in handles:
-                assert fs("read", path, len(payload), 0, fh) == payload
-
-        benchmark.pedantic(read_batch, rounds=3, iterations=1)
 
 
 def test_benchmark_readdir_with_attrs_adapter(tmp_path, benchmark):

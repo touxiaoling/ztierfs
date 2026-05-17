@@ -22,28 +22,17 @@ class GarbageCollectionMixin(MetadataMixinBase):
         self._db.execute(
             """
             INSERT OR IGNORE INTO pending_deletions
-                (kind, digest, tier, payload_key, enqueued_ns)
-            VALUES ('block_file', ?, ?, NULL, ?)
+                (kind, digest, tier, enqueued_ns)
+            VALUES ('block_file', ?, ?, ?)
             """,
             (digest, tier, now),
-        )
-
-    def enqueue_pending_payload_deletion(self, payload_key: str, now: int) -> None:
-        """Queue an external payload-store object for deletion after commit."""
-        self._db.execute(
-            """
-            INSERT OR IGNORE INTO pending_deletions
-                (kind, digest, tier, payload_key, enqueued_ns)
-            VALUES ('payload_store', NULL, NULL, ?, ?)
-            """,
-            (payload_key, now),
         )
 
     def pending_deletions(self, limit: int = 256) -> list[sqlite3.Row]:
         """Return queued physical deletions in FIFO order."""
         return self._db.execute(
             """
-            SELECT id, kind, digest, tier, payload_key, enqueued_ns
+            SELECT id, kind, digest, tier, enqueued_ns
             FROM pending_deletions
             ORDER BY id
             LIMIT ?

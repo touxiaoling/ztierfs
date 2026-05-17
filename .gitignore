@@ -295,3 +295,4 @@ Backups.backupdb
 MobileBackups.trash
 tmbootpicker.efi
 /debug_*
+/docs/

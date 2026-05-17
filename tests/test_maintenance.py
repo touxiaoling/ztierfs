@@ -97,45 +97,6 @@ def test_update_config_rehomes_database_storage_paths(tmp_path):
     assert config["cold_tier_path"] == str(new_cold.resolve())
 
 
-def test_scrub_reads_filekv_inode_payloads(tmp_path):
-    fs_impl = make_fs(tmp_path, payload_store="filekv")
-    with adapted(fs_impl) as fs:
-        fh = fs("create", "/note.txt", 0o644)
-        fs("write", "/note.txt", b"hello", 0, fh)
-
-    report = run_scrub(fs_impl.tier1, fs_impl.tier2, fs_impl.database)
-    assert report.ok
-
-
-def test_scrub_reports_missing_filekv_inode_payload(tmp_path):
-    fs_impl = make_fs(tmp_path, payload_store="filekv")
-    with adapted(fs_impl) as fs:
-        fh = fs("create", "/note.txt", 0o644)
-        fs("write", "/note.txt", b"hello", 0, fh)
-
-    key = rows(fs_impl, "SELECT payload_key FROM inode_payloads")[0]["payload_key"]
-    safe = key.replace("/", "_")
-    (fs_impl.tier1 / "payload-kv" / safe[:2] / safe[2:4] / safe).unlink()
-
-    report = run_scrub(fs_impl.tier1, fs_impl.tier2, fs_impl.database)
-    assert any(issue.code == "payload_store_unavailable" for issue in report.issues)
-
-
-def test_scrub_reads_filekv_inline_block_payloads(tmp_path):
-    fs_impl = make_fs(
-        tmp_path,
-        inline_max_bytes=64,
-        compression_min_bytes=0,
-        payload_store="filekv",
-    )
-    with adapted(fs_impl) as fs:
-        fh = fs("create", "/note.txt", 0o644)
-        fs("write", "/note.txt", b"a" * 1024, 0, fh)
-
-    report = run_scrub(fs_impl.tier1, fs_impl.tier2, fs_impl.database)
-    assert report.ok
-
-
 def test_fsck_repairs_block_refcount_mismatch(tmp_path):
     fs_impl = make_fs(tmp_path, inline_max_bytes=0)
     with adapted(fs_impl) as fs:
@@ -307,11 +268,33 @@ def test_scrub_reports_cold_download_failure_as_unavailable(tmp_path, monkeypatc
 
     monkeypatch.setattr(checker_module, "read_path_bytes", read_or_unavailable)
 
-    report = run_scrub(fs_impl.tier1, fs_impl.tier2, fs_impl.database)
+    report = run_scrub(
+        fs_impl.tier1, fs_impl.tier2, fs_impl.database, include_cold=True
+    )
     codes = {issue.code for issue in report.issues}
 
     assert "block_payload_unavailable" in codes
     assert "corrupt_block_payload" not in codes
+
+
+def test_scrub_skips_cold_payloads_by_default(tmp_path, monkeypatch):
+    fs_impl = make_fs(tmp_path, inline_max_bytes=0)
+    _digest, _data, cold_path = _make_cold_only_block(fs_impl, data=b"a" * 1024)
+
+    import ztierfs.maintenance.checker as checker_module
+
+    original_read = checker_module.read_path_bytes
+
+    def fail_if_cold_read(path):
+        if path == cold_path:
+            raise AssertionError("default scrub must not read cold payloads")
+        return original_read(path)
+
+    monkeypatch.setattr(checker_module, "read_path_bytes", fail_if_cold_read)
+
+    report = run_scrub(fs_impl.tier1, fs_impl.tier2, fs_impl.database)
+
+    assert report.ok
 
 
 def test_scrub_reports_corrupt_compressed_block(tmp_path):

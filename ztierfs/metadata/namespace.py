@@ -6,17 +6,13 @@
 对照。macOS 回收站布局：根下按需创建 `.Trashes`（权限类 1777、属主 root）及
 `.Trashes/<uid>/`（属主为当前用户）；详见 `ensure_trash_directories`。
 
-涉及 `payload_store` 的路径：`inline_payload` 在非 `sqlite` 存储时按 `payload_key` 读对象；
-`set_inline_file` / `clear_inline_file` 与 SQL 行同步写入或删除外部对象。`clone_file_node`
-在复制非 sqlite 内联时会为新 inode 写入新的 `payload_key` 并 `put` 副本，避免与源 inode
-共享键；`link_node` 仅增加目录项与 `nlink`，不复制 payload；`move_entry` 只改目录项路径，
-不改变 inode 与 payload 绑定。
+内联 payload 直接保存在 SQLite。`link_node` 仅增加目录项与 `nlink`，不复制 payload；
+`move_entry` 只改目录项路径，不改变 inode 与 payload 绑定。
 """
 
 import errno
 import sqlite3
 
-from typing import Any
 
 from stat import S_IFDIR
 
@@ -34,7 +30,7 @@ class NamespaceMixin(MetadataMixinBase):
     """`inodes`、`dir_entries` 的查询与更新，以及 macOS `.Trashes` 目录树。
 
     查询侧统一套用在 `NODE_SELECT` 子查询上，以便同一 inode 的内联列与 `child`/`children`
-    等接口返回结构一致。写路径中与对象存储相关的约定见模块文档字符串。
+    等接口返回结构一致。
     """
 
     NODE_SELECT = """
@@ -105,27 +101,17 @@ class NamespaceMixin(MetadataMixinBase):
             (node_id, node_id),
         ).fetchone()
 
-    def inline_payload(self, node_id: int) -> sqlite3.Row | dict[str, Any] | None:
-        """读 `inode_payloads`；`payload_store` 为 sqlite 时直接返回行，否则用 `payload_key` 从 `payload_store` 取字节并组装为字典。"""
+    def inline_payload(self, node_id: int) -> sqlite3.Row | None:
+        """读 `inode_payloads` 内联 payload 行。"""
         row = self._db.execute(
             """
-            SELECT payload, payload_store, payload_key, compressed, raw_size, stored_size
+            SELECT payload, compressed, raw_size, stored_size
             FROM inode_payloads
             WHERE inode_id = ?
             """,
             (node_id,),
         ).fetchone()
-        if row is None or row["payload_store"] == "sqlite":
-            return row
-        payload = self.payload_store.get(row["payload_key"])
-        return {
-            "payload": payload,
-            "payload_store": row["payload_store"],
-            "payload_key": row["payload_key"],
-            "compressed": row["compressed"],
-            "raw_size": row["raw_size"],
-            "stored_size": row["stored_size"],
-        }
+        return row
 
     def child_dir_count(self, parent_id: int) -> int:
         """统计父目录下子项中 kind 为目录的个数。"""
@@ -294,7 +280,7 @@ class NamespaceMixin(MetadataMixinBase):
         size: int,
         now: int,
     ) -> int:
-        """克隆普通文件 inode：复制 `inode_payloads`（非 sqlite 时在 `payload_store` 写入新键并更新 `payload_key`）、`file_chunks`（并递增块引用计数）、`inode_xattrs`，并在 `parent_id` 下新建目录项。"""
+        """克隆普通文件 inode：复制 `inode_payloads`、`file_chunks`（并递增块引用计数）、`inode_xattrs`，并在 `parent_id` 下新建目录项。"""
         cursor = self._db.execute(
             """
             INSERT INTO inodes
@@ -315,35 +301,14 @@ class NamespaceMixin(MetadataMixinBase):
         self._db.execute(
             """
             INSERT INTO inode_payloads (
-                inode_id, payload, payload_store, payload_key, compressed, raw_size, stored_size
+                inode_id, payload, compressed, raw_size, stored_size
             )
-            SELECT ?, payload, payload_store, payload_key, compressed, raw_size, stored_size
+            SELECT ?, payload, compressed, raw_size, stored_size
             FROM inode_payloads
             WHERE inode_id = ?
             """,
             (inode_id, source_id),
         )
-        payload_row = self._db.execute(
-            """
-            SELECT payload_store, payload_key
-            FROM inode_payloads
-            WHERE inode_id = ?
-            """,
-            (inode_id,),
-        ).fetchone()
-        if payload_row is not None and payload_row["payload_store"] != "sqlite":
-            new_key = f"inode/{inode_id}"
-            self.payload_store.put(
-                new_key, self.payload_store.get(payload_row["payload_key"])
-            )
-            self._db.execute(
-                """
-                UPDATE inode_payloads
-                SET payload_key = ?
-                WHERE inode_id = ?
-                """,
-                (new_key, inode_id),
-            )
         self._db.execute(
             """
             INSERT INTO file_chunks (file_id, chunk_index, hash, size)
@@ -392,7 +357,7 @@ class NamespaceMixin(MetadataMixinBase):
         )
 
     def reset_file_node(self, node_id: int, mode: int, now: int) -> None:
-        """将文件 inode 截断语义落到元数据：`size` 置 0、更新时间戳，并清空内联内容及对应 `payload_store` 对象。"""
+        """将文件 inode 截断语义落到元数据：`size` 置 0、更新时间戳，并清空内联内容。"""
         self._db.execute(
             """
             UPDATE inodes
@@ -428,14 +393,7 @@ class NamespaceMixin(MetadataMixinBase):
         raw_size: int,
         now: int,
     ) -> None:
-        """写入小文件内联：更新 inode `size` 与时间戳；在 `inode_payloads` 中记录元数据，非 sqlite 时 `put` 到 `payload_store` 且 BLOB 列置空。"""
-        payload_store = self.payload_store.name
-        payload_key = None
-        inline_payload: bytes | None = data
-        if payload_store != "sqlite":
-            payload_key = f"inode/{node_id}"
-            self.payload_store.put(payload_key, data)
-            inline_payload = None
+        """写入小文件内联：更新 inode `size` 与时间戳；在 `inode_payloads` 中记录 payload。"""
         self._db.execute(
             """
             UPDATE inodes
@@ -447,22 +405,18 @@ class NamespaceMixin(MetadataMixinBase):
         self._db.execute(
             """
             INSERT INTO inode_payloads (
-                inode_id, payload, payload_store, payload_key, compressed, raw_size, stored_size
+                inode_id, payload, compressed, raw_size, stored_size
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(inode_id) DO UPDATE SET
                 payload = excluded.payload,
-                payload_store = excluded.payload_store,
-                payload_key = excluded.payload_key,
                 compressed = excluded.compressed,
                 raw_size = excluded.raw_size,
                 stored_size = excluded.stored_size
             """,
             (
                 node_id,
-                inline_payload,
-                payload_store,
-                payload_key,
+                data,
                 int(compressed),
                 raw_size,
                 len(data),
@@ -470,21 +424,11 @@ class NamespaceMixin(MetadataMixinBase):
         )
 
     def clear_inline_file(self, node_id: int) -> None:
-        """删除 `inode_payloads` 行；若曾使用外部存储则把对象登记到提交后 GC 队列。"""
-        row = self._db.execute(
-            """
-            SELECT payload_store, payload_key
-            FROM inode_payloads
-            WHERE inode_id = ?
-            """,
-            (node_id,),
-        ).fetchone()
+        """删除 `inode_payloads` 行。"""
         self._db.execute(
             "DELETE FROM inode_payloads WHERE inode_id = ?",
             (node_id,),
         )
-        if row is not None and row["payload_store"] != "sqlite":
-            self.enqueue_pending_payload_deletion(row["payload_key"], time_ns())
 
     def delete_node(self, node_id: int) -> None:
         """从 `inodes` 表删除一行（调用方需已处理目录项与孤儿约束）。"""

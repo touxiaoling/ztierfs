@@ -45,7 +45,6 @@ from .metadata.connection import SQLitePragmas
 from .metadata_ops import MetadataOpsMixin
 from .namespace_ops import NamespaceOpsMixin
 from .pathing import compression_allowed
-from .payload_store import FileKVPayloadStore, NullPayloadStore
 from .perf import OperationProfiler
 
 
@@ -80,8 +79,6 @@ class ZTierFS(
         readahead_blocks: int = DEFAULT_READAHEAD_BLOCKS,
         readahead_workers: int = DEFAULT_READAHEAD_WORKERS,
         sqlite_synchronous: str = "NORMAL",
-        payload_store: str = "sqlite",
-        payload_store_path: str | os.PathLike[str] | None = None,
         update_config: bool = False,
         profile_interval_seconds: float = 0,
         caller_provider: Callable[[], tuple[int, int, int]] | None = None,
@@ -93,10 +90,9 @@ class ZTierFS(
         前缀块数、冷层副本清理年龄等写入 `TieringPolicy` 并交给 `BlockStore`；压缩级别、最小
         压缩长度、跳过后缀集合与内联阈值同时约束块层与 `FileContentService`。
 
-        元数据与内联 payload：`payload_store` 为 ``sqlite`` 时内联数据在库内；为 ``filekv`` 时
-        使用 `payload_store_path`（默认 `tier1/payload-kv`）下的键值存储。`sqlite_synchronous`
-        控制 SQLite 同步模式。`update_config` 与已有 `filesystem_config` 不一致时的行为见
-        `_ensure_filesystem_config`。
+        元数据与内联 payload：小文件内联 payload 与内联块 payload 始终存入 SQLite；
+        `sqlite_synchronous` 控制 SQLite 同步模式。`update_config` 与已有
+        `filesystem_config` 不一致时的行为见 `_ensure_filesystem_config`。
 
         组件顺序：在持锁的 `MetadataStore` 就绪并写入配置后，依次构造进程内 `HandleTable`、
         POSIX 建议锁表 `AdvisoryLockTable`、`BlockStore`（内容寻址块与冷热迁移）以及
@@ -129,8 +125,6 @@ class ZTierFS(
             raise ValueError("readahead_workers must not be negative")
         if sqlite_synchronous.upper() not in {"FULL", "NORMAL", "OFF"}:
             raise ValueError("sqlite_synchronous must be FULL, NORMAL, or OFF")
-        if payload_store not in {"sqlite", "filekv"}:
-            raise ValueError("payload_store must be sqlite or filekv")
         if profile_interval_seconds < 0:
             raise ValueError("profile_interval_seconds must not be negative")
         hot_max = hot_cache_max_bytes
@@ -163,14 +157,6 @@ class ZTierFS(
         self.readahead_blocks = readahead_blocks
         self.readahead_workers = readahead_workers
         self.sqlite_synchronous = sqlite_synchronous.upper()
-        self.payload_store_name = payload_store
-        self.payload_store_path = (
-            Path(payload_store_path).resolve()
-            if payload_store_path is not None
-            else self.tier1 / "payload-kv"
-            if payload_store == "filekv"
-            else None
-        )
         self.profile_interval_seconds = profile_interval_seconds
         self._caller_provider = caller_provider or fuse_get_context
 
@@ -209,19 +195,12 @@ class ZTierFS(
         if self._operation_profiler is not None:
             logger.info("启用 FUSE 性能统计：interval={}s", profile_interval_seconds)
 
-        if payload_store == "filekv":
-            payload_store_path = self.payload_store_path
-            assert payload_store_path is not None
-            inline_payload_store = FileKVPayloadStore(payload_store_path)
-        else:
-            inline_payload_store = NullPayloadStore()
         metadata: MetadataStore | None = None
         try:
             metadata = MetadataStore(
                 self.database,
                 self._lock,
                 pragmas=SQLitePragmas(synchronous=self.sqlite_synchronous),
-                payload_store=inline_payload_store,
             )
             self.metadata = metadata
             self._ensure_filesystem_config(update_config=update_config)
@@ -255,22 +234,15 @@ class ZTierFS(
         return compression_allowed(path, self.compressed_suffixes)
 
     def _ensure_filesystem_config(self, *, update_config: bool) -> None:
-        """将当前冷热层路径与 payload 存储选择持久化到 `filesystem_config`，并与已有记录对齐。
+        """将当前冷热层路径持久化到 `filesystem_config`，并与已有记录对齐。
 
         库中尚无配置或 `update_config` 为真时，直接写入期望字段。否则逐项比对：若与当前
-        进程传入的路径或 `payload_store` 选择不一致，抛出 `RuntimeError`，提示应使用
+        进程传入的路径不一致，抛出 `RuntimeError`，提示应使用
         CLI 的 ``--update-config`` 显式改写本地配置，避免误用属于其它挂载点的数据库文件。
         """
-        payload_store_path = (
-            str(self.payload_store_path)
-            if self.payload_store_path is not None
-            else None
-        )
         desired = {
             "hot_tier_path": str(self.tier1),
             "cold_tier_path": str(self.tier2),
-            "payload_store": self.payload_store_name,
-            "payload_store_path": payload_store_path,
         }
         with self.metadata.transaction():
             current = self.metadata.filesystem_config()

@@ -99,8 +99,6 @@ uv run python -m ztierfs mount /tmp/ztierfs-hot /tmp/ztierfs-cold /tmp/ztierfs-m
 - `--inline-max`：处理后 payload 不超过该大小的块直接内联到 SQLite，默认 `32k`；设为 `0` 禁用。"处理后"指可压缩块经 zstd 后的体积，不可压缩或跳过压缩的块使用原始体积。
 - `--zstd-level`：zstd 压缩等级，默认使用标准库默认值。
 - `--compression-min`：小于该大小的 payload 跳过 zstd 压缩尝试，默认 `4k`。
-- `--payload-store`：内联块和小文件 payload 的存储后端，可选 `sqlite`（默认）或 `filekv`。`filekv` 会把 payload 写到独立的 key-value 目录，避免 SQLite 数据文件随 inline 内容一起膨胀。
-- `--payload-store-path`：`filekv` 后端的目录路径，默认放在热层下的 `payload-kv` 子目录。
 
 读路径与缓存：
 
@@ -134,10 +132,11 @@ FUSE/内核交互：
 uv run python -m ztierfs fsck /tmp/ztierfs-metadata.sqlite3
 ```
 
-`scrub` 在 `fsck` 的基础上读取并校验块 payload，能发现压缩数据损坏、存储大小不匹配和解码后大小异常。只有已经读到 payload 后解码或大小不匹配才会报告损坏；rclone 下载失败这类读取错误会报告为暂时不可用：
+`scrub` 在 `fsck` 的基础上读取并校验 SQLite 内联 payload 和热层块 payload，能发现压缩数据损坏、存储大小不匹配和解码后大小异常。默认不会读取冷层块 payload，因此适合作为远程冷层场景的常规维护命令；需要明确诊断冷层内容时加 `--include-cold`，这可能读取或下载完整冷层数据。只有已经读到 payload 后解码或大小不匹配才会报告损坏；rclone 下载失败这类读取错误会报告为暂时不可用：
 
 ```bash
 uv run python -m ztierfs scrub /tmp/ztierfs-metadata.sqlite3
+uv run python -m ztierfs scrub /tmp/ztierfs-metadata.sqlite3 --include-cold
 ```
 
 `stats` 输出 inode、目录项、chunk、块分布和存储占用摘要。块统计会区分热层、冷层以及冷热两层都有副本的块。维护命令都支持 `--json`，方便脚本消费：
@@ -190,14 +189,14 @@ SQLite 表：
 - `inodes`：文件、目录和符号链接的 POSIX 元数据。
 - `dir_entries`：目录项到 inode 的映射，用于支持 hardlink。
 - `inode_xattrs`：挂在 inode 上的扩展属性。
-- `inode_payloads`：小到不需要分块的小文件直接以 inode 级 payload 存储，可选保存在 SQLite 或外部 payload store。
+- `inode_payloads`：小到不需要分块的小文件直接以 inode 级 payload 存入 SQLite。
 - `blocks`：块元数据、首选层级、压缩状态、大小、引用计数、访问时间、读取频率和迁移时间。
 - `block_locations`：tiered 块在热层和冷层的实际副本位置。
-- `block_payloads`：inline 块的 payload，可保存在 SQLite 或外部 payload store。
+- `block_payloads`：inline 块的 payload，直接存入 SQLite。
 - `file_chunks`：从 `file_id`（文件 inode）+ `chunk_index` 到块 `hash` 和 `size` 的映射。
-- `filesystem_config`：记录热层、冷层和 payload store 的绝对路径，便于维护命令只凭数据库定位整套存储。
+- `filesystem_config`：记录热层和冷层的绝对路径，便于维护命令只凭数据库定位整套存储。
 
-块记录有两种存储形态：`inline` 块的 payload 直接关联到 `block_payloads`，不参与冷层降级；`tiered` 块的文件路径由 SHA-256 digest 派生，按 `aa/bb/<sha256>` 分桶保存在热层或冷层。`block_records` view 会把块元数据、层级副本和 inline payload 聚合成维护工具使用的统一视图。两层 payload 表都支持 `sqlite` 与 `filekv` 两种后端：选择 `filekv` 时，payload 内容写到独立的 key-value 目录，SQLite 中只保留 `payload_key`，避免数据库随 inline 数据一起膨胀。
+块记录有两种存储形态：`inline` 块的 payload 直接关联到 `block_payloads`，不参与冷层降级；`tiered` 块的文件路径由 SHA-256 digest 派生，按 `aa/bb/<sha256>` 分桶保存在热层或冷层。`block_records` view 会把块元数据、层级副本和 inline payload 聚合成维护工具使用的统一视图。
 
 ## 开发说明
 
@@ -209,7 +208,6 @@ SQLite 表：
 - `ztierfs/metadata/`：SQLite schema、连接池、读写事务，以及命名空间、块、chunk 和访问统计的元数据访问层。
 - `ztierfs/file_content.py`：块级文件读写、稀疏区域、截断、读缓存与预读、以及引用计数更新。
 - `ztierfs/block_store.py` + `ztierfs/block_layout.py` + `ztierfs/tier_access.py`：块压缩、原子写入、删除、copy-up 提升、策略性降级和层级回退。
-- `ztierfs/payload_store.py`：inline payload 的 sqlite/filekv 后端抽象。
 - `ztierfs/handles.py`、`ztierfs/pathing.py`、`ztierfs/console.py`、`ztierfs/perf.py`：句柄跟踪、路径规范化与压缩后缀判断、控制台日志输出和性能统计采样。
 - `ztierfs/maintenance/`：`fsck`、`scrub`、`stats`、`cleanup` 共享的检查器、修复器、报告与配置加载。
 
@@ -232,4 +230,3 @@ uv run pytest -m integration
 ## 数据安全说明
 
 `ztierfs` 已在相关路径使用原子块写入，并对块文件和目录执行 fsync，也已有多路径崩溃注入测试约束 SQLite 事务回滚与块文件副作用的恢复行为。但项目尚未声明完整崩溃一致性，同时更新 SQLite 行和块文件的代码需要尤其谨慎。在崩溃注入矩阵继续扩展、`fsck`/`scrub` 修复策略覆盖到带备份与回滚日志的复杂场景之前，请只把它用于可以重新生成的数据。
-

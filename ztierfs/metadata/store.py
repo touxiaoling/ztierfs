@@ -43,7 +43,6 @@ from .connection import ConnectionPool, ReadWriteLock, SQLitePragmas
 from .gc import GarbageCollectionMixin
 from .namespace import NamespaceMixin
 from .schema import SCHEMA_VERSION, SchemaMixin
-from ztierfs.payload_store import NullPayloadStore, PayloadStore
 
 
 class MetadataStore(
@@ -65,14 +64,12 @@ class MetadataStore(
         lock: threading.RLock,
         *,
         pragmas: SQLitePragmas | None = None,
-        payload_store: PayloadStore | None = None,
         deferred_access_flush_blocks: int = DEFAULT_DEFERRED_ACCESS_FLUSH_BLOCKS,
         deferred_access_flush_ns: int = DEFAULT_DEFERRED_ACCESS_FLUSH_NS,
     ):
         """用给定路径、进程内 `RLock`（FUSE/上层与元数据层协调，非本类替代读写锁）以及可选 PRAGMA、内联块存储与延迟访问刷盘阈值，创建连接池与 `ReadWriteLock` 并执行 `setup()`。"""
         self.path = path
         self.lock = lock
-        self.payload_store = payload_store or NullPayloadStore()
         self._pool = ConnectionPool(path, pragmas=pragmas)
         self._rwlock = ReadWriteLock()
         self._local = threading.local()

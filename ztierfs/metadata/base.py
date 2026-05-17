@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .access_stats import BlockAccessStats
-    from ztierfs.payload_store import PayloadStore
 
 
 class MetadataMixinBase:
@@ -27,8 +26,6 @@ class MetadataMixinBase:
     _deferred_access_started_ns: int | None
     _deferred_access_flush_blocks: int
     _deferred_access_flush_ns: int
-    payload_store: "PayloadStore"
-
     @property
     def _db(self) -> sqlite3.Connection:
         """当前线程、当前元数据读/写事务中绑定的 SQLite 连接；无活动事务时由 `MetadataStore` 抛错。
@@ -75,17 +72,13 @@ class MetadataMixinBase:
         raw_size: int,
         now: int,
     ) -> None:
-        """将文件数据以内联形式写入 `inode_payloads`（可经外置 `payload_store`），并更新 inode 的 size 与时间戳。"""
+        """将文件数据以内联形式写入 `inode_payloads`，并更新 inode 的 size 与时间戳。"""
         raise NotImplementedError
 
     def clear_inline_file(self, node_id: int) -> None:
-        """删除该 inode 的 `inode_payloads` 行，并视情况把外置 payload 加入待 GC 队列。"""
+        """删除该 inode 的 `inode_payloads` 行。"""
         raise NotImplementedError
 
     def enqueue_pending_block_file_deletion(self, digest: str, tier: int, now: int) -> None:
         """登记一个提交后可删除的 tier 块文件。"""
-        raise NotImplementedError
-
-    def enqueue_pending_payload_deletion(self, payload_key: str, now: int) -> None:
-        """登记一个提交后可删除的外置 payload 对象。"""
         raise NotImplementedError

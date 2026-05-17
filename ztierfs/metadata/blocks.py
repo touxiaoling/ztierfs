@@ -4,7 +4,6 @@ block_locations.tier 约定：1 表示热层，2 表示冷层；inline 块不走
 """
 
 import sqlite3
-from time import time_ns
 
 from .base import MetadataMixinBase
 from .schema import BLOCK_RECORD_SELECT
@@ -65,14 +64,6 @@ class BlockMetadataMixin(MetadataMixinBase):
     ) -> None:
         """处理 insert block。"""
         is_inline = inline_payload is not None
-        payload_store = self.payload_store.name if is_inline else "sqlite"
-        payload_key = None
-        stored_payload = inline_payload
-        if is_inline and payload_store != "sqlite":
-            payload_key = f"block/{digest}"
-            assert inline_payload is not None
-            self.payload_store.put(payload_key, inline_payload)
-            stored_payload = None
         self._db.execute(
             """
             INSERT INTO blocks (
@@ -94,10 +85,10 @@ class BlockMetadataMixin(MetadataMixinBase):
         if is_inline:
             self._db.execute(
                 """
-                INSERT INTO block_payloads (hash, payload, payload_store, payload_key)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO block_payloads (hash, payload)
+                VALUES (?, ?)
                 """,
-                (digest, stored_payload, payload_store, payload_key),
+                (digest, inline_payload),
             )
         else:
             self._db.execute(
@@ -118,24 +109,14 @@ class BlockMetadataMixin(MetadataMixinBase):
         )
 
     def delete_block(self, digest: str) -> None:
-        """删除 block 元数据；外置 inline payload 只登记到提交后 GC 队列。"""
-        row = self._db.execute(
-            """
-            SELECT payload_store, payload_key
-            FROM block_payloads
-            WHERE hash = ?
-            """,
-            (digest,),
-        ).fetchone()
+        """删除 block 元数据。"""
         self._db.execute("DELETE FROM blocks WHERE hash = ?", (digest,))
-        if row is not None and row["payload_store"] != "sqlite":
-            self.enqueue_pending_payload_deletion(row["payload_key"], time_ns())
 
     def inline_block_payload(self, digest: str) -> bytes | None:
         """处理 inline block payload。"""
         row = self._db.execute(
             """
-            SELECT payload, payload_store, payload_key
+            SELECT payload
             FROM block_payloads
             WHERE hash = ?
             """,
@@ -143,9 +124,7 @@ class BlockMetadataMixin(MetadataMixinBase):
         ).fetchone()
         if row is None:
             return None
-        if row["payload_store"] == "sqlite":
-            return bytes(row["payload"])
-        return self.payload_store.get(row["payload_key"])
+        return bytes(row["payload"])
 
     def set_block_presence(
         self,
