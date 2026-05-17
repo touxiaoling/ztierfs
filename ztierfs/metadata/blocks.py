@@ -5,12 +5,22 @@ block_locations.tier 约定：1 表示热层，2 表示冷层；inline 块不走
 
 import sqlite3
 
+from collections.abc import Mapping
+from time import time_ns
+from typing import TYPE_CHECKING
+
 from .base import MetadataMixinBase
 from .schema import BLOCK_RECORD_SELECT
 
 
 class BlockMetadataMixin(MetadataMixinBase):
     """内容寻址块在库内的存在性、引用计数与冷热位置更新。"""
+
+    if TYPE_CHECKING:
+
+        def enqueue_pending_block_file_deletion(
+            self, digest: str, tier: int, now: int
+        ) -> None: ...
 
     def block_exists(self, digest: str) -> bool:
         """处理 block exists。"""
@@ -107,6 +117,72 @@ class BlockMetadataMixin(MetadataMixinBase):
         self._db.execute(
             "UPDATE blocks SET refcount = refcount - 1 WHERE hash = ?", (digest,)
         )
+
+    def apply_block_refcount_deltas(
+        self, deltas: Mapping[str, int], *, now: int | None = None
+    ) -> None:
+        """批量应用内容块引用计数变化；降至 0 的 tiered 块登记提交后物理删除。
+
+        ``deltas`` 中正数表示新增 chunk 引用，负数表示移除引用，0 会被忽略。调用方应已在
+        同一事务内完成对应 ``file_chunks`` 变更；本函数负责把 ``blocks.refcount`` 与之收敛。
+        """
+        pending = {digest: delta for digest, delta in deltas.items() if delta}
+        if not pending:
+            return
+
+        positive_updates = [
+            (delta, digest) for digest, delta in pending.items() if delta > 0
+        ]
+        if positive_updates:
+            self._db.executemany(
+                "UPDATE blocks SET refcount = refcount + ? WHERE hash = ?",
+                positive_updates,
+            )
+
+        negative_digests = [digest for digest, delta in pending.items() if delta < 0]
+        if not negative_digests:
+            return
+        deletion_time = time_ns() if now is None else now
+        placeholders = ",".join("?" for _ in negative_digests)
+        rows = self._db.execute(
+            f"""
+            SELECT
+                blocks.hash,
+                blocks.refcount,
+                blocks.storage_kind AS storage,
+                CASE WHEN hot_locations.hash IS NULL THEN 0 ELSE 1 END AS hot_present,
+                CASE WHEN cold_locations.hash IS NULL THEN 0 ELSE 1 END AS cold_present
+            FROM blocks
+            LEFT JOIN block_locations AS hot_locations
+              ON hot_locations.hash = blocks.hash AND hot_locations.tier = 1
+            LEFT JOIN block_locations AS cold_locations
+              ON cold_locations.hash = blocks.hash AND cold_locations.tier = 2
+            WHERE blocks.hash IN ({placeholders})
+            """,
+            negative_digests,
+        ).fetchall()
+        rows_by_hash = {row["hash"]: row for row in rows}
+        for digest in negative_digests:
+            row = rows_by_hash.get(digest)
+            if row is None:
+                raise RuntimeError(
+                    f"block refcount delta targets missing block {digest}"
+                )
+            new_refcount = int(row["refcount"]) + pending[digest]
+            if new_refcount < 0:
+                raise RuntimeError(f"block refcount would become negative for {digest}")
+            if new_refcount > 0:
+                self._db.execute(
+                    "UPDATE blocks SET refcount = ? WHERE hash = ?",
+                    (new_refcount, digest),
+                )
+                continue
+            self.delete_block(digest)
+            if row["storage"] == "tiered":
+                if row["hot_present"]:
+                    self.enqueue_pending_block_file_deletion(digest, 1, deletion_time)
+                if row["cold_present"]:
+                    self.enqueue_pending_block_file_deletion(digest, 2, deletion_time)
 
     def delete_block(self, digest: str) -> None:
         """删除 block 元数据。"""

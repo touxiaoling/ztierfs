@@ -501,24 +501,12 @@ class BlockStore:
         if row is None:
             logger.warning("递减块引用时未找到块记录：hash={}", digest[:12])
             return
-        if row["refcount"] > 1:
-            self.metadata.decrement_block_refcount(digest)
-            logger.debug(
-                "递减块引用计数：hash={}，refcount={}->{}",
-                digest[:12],
-                row["refcount"],
-                row["refcount"] - 1,
-            )
-            return
-        self.metadata.delete_block(digest)
-        if row["storage"] == "tiered":
-            now = time_ns()
-            if row["hot_present"]:
-                self.metadata.enqueue_pending_block_file_deletion(digest, 1, now)
-            if row["cold_present"]:
-                self.metadata.enqueue_pending_block_file_deletion(digest, 2, now)
+        self.metadata.apply_block_refcount_deltas({digest: -1})
         logger.debug(
-            "删除最后一个块引用：hash={}，storage={}", digest[:12], row["storage"]
+            "递减块引用：hash={}，refcount={}->{}",
+            digest[:12],
+            row["refcount"],
+            row["refcount"] - 1,
         )
 
     def encode_block(self, data: bytes, compress: bool) -> tuple[bytes, bool]:

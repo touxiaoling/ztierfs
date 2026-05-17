@@ -304,15 +304,11 @@ def test_cross_block_overwrite_crash_leaves_old_file_and_repairable_orphans(
     fs_impl = make_fs(tmp_path, inline_max_bytes=0)
     original = b"A" * 3072
     replacement = bytes(range(256)) * 8
-    original_attach = fs_impl.metadata.attach_file_chunk_to_block
-    attached = 0
+    original_replace = fs_impl.metadata.replace_file_chunks
 
-    def attach_second_new_chunk_then_crash(*args, **kwargs):
-        nonlocal attached
-        original_attach(*args, **kwargs)
-        attached += 1
-        if attached == 2:
-            raise SimulatedCrash("crash after multi-chunk overwrite metadata update")
+    def replace_chunks_then_crash(*args, **kwargs):
+        original_replace(*args, **kwargs)
+        raise SimulatedCrash("crash after multi-chunk overwrite metadata update")
 
     with adapted(fs_impl) as fs:
         fh = fs("create", "/movie.jpg", 0o644)
@@ -320,8 +316,8 @@ def test_cross_block_overwrite_crash_leaves_old_file_and_repairable_orphans(
 
         monkeypatch.setattr(
             fs_impl.metadata,
-            "attach_file_chunk_to_block",
-            attach_second_new_chunk_then_crash,
+            "replace_file_chunks",
+            replace_chunks_then_crash,
         )
         with pytest.raises(SimulatedCrash):
             fs("write", "/movie.jpg", replacement, 512, fh)
@@ -477,11 +473,13 @@ def test_refcount_decrement_crash_before_commit_rolls_back_shared_block(
 ):
     fs_impl = make_fs(tmp_path, inline_max_bytes=0)
     shared = bytes(range(256)) * 4
-    original_decrement = fs_impl.metadata.decrement_block_refcount
+    original_apply_deltas = fs_impl.metadata.apply_block_refcount_deltas
 
-    def decrement_then_crash(*args, **kwargs):
-        original_decrement(*args, **kwargs)
-        raise SimulatedCrash("crash after refcount decrement before commit")
+    def apply_deltas_then_crash(deltas, *args, **kwargs):
+        if any(delta < 0 for delta in deltas.values()):
+            original_apply_deltas(deltas, *args, **kwargs)
+            raise SimulatedCrash("crash after refcount decrement before commit")
+        return original_apply_deltas(deltas, *args, **kwargs)
 
     with adapted(fs_impl) as fs:
         first = fs("create", "/first.jpg", 0o644)
@@ -491,7 +489,7 @@ def test_refcount_decrement_crash_before_commit_rolls_back_shared_block(
         fs("release", "/second.jpg", second)
 
         monkeypatch.setattr(
-            fs_impl.metadata, "decrement_block_refcount", decrement_then_crash
+            fs_impl.metadata, "apply_block_refcount_deltas", apply_deltas_then_crash
         )
         with pytest.raises(SimulatedCrash):
             fs("unlink", "/second.jpg")

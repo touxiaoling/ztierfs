@@ -17,6 +17,7 @@ from macfusepy import FuseOSError
 
 from .block_store import BlockAccess, BlockStore, PreparedBlock
 from .metadata import MetadataStore
+from .metadata.chunks import ChunkReplacement
 
 
 @dataclass(frozen=True)
@@ -344,8 +345,7 @@ class FileContentService:
             return write.bytes_written
         if write.clear_inline:
             self.metadata.clear_inline_file(write.file_id)
-        for chunk_index, prepared in write.chunks:
-            self.set_prepared_chunk(write.file_id, chunk_index, prepared)
+        self.set_prepared_chunks(write.file_id, write.chunks)
         self.metadata.set_node_size(write.file_id, write.new_size, time_ns())
         return write.bytes_written
 
@@ -434,64 +434,49 @@ class FileContentService:
         self, file_id: int, chunk_index: int, block: PreparedBlock
     ) -> None:
         """提交 ``PreparedBlock``：哈希未变则只更新 chunk 记录尺寸；否则确保块存在、绑定新哈希并 ``decrement_block`` 旧哈希。"""
-        old = self.metadata.file_chunk_hash(file_id, chunk_index)
+        self.set_prepared_chunks(file_id, [(chunk_index, block)])
 
-        if old is not None and old["hash"] == block.digest:
-            self.metadata.update_file_chunk_size(file_id, chunk_index, block.raw_size)
-            logger.debug(
-                "chunk 指向未变化，仅更新大小：inode={}，chunk={}，hash={}",
-                file_id,
-                chunk_index,
-                block.digest[:12],
-            )
+    def set_prepared_chunks(
+        self, file_id: int, chunks: list[tuple[int, PreparedBlock]]
+    ) -> None:
+        """提交一组已准备块：payload 先落地，再批量替换 chunk/refcount 元数据。"""
+        if not chunks:
             return
-
-        self.block_store.ensure_prepared_block(block)
-        self.metadata.attach_file_chunk_to_block(
-            file_id, chunk_index, block.digest, block.raw_size
-        )
+        replacements: dict[int, ChunkReplacement] = {}
+        for chunk_index, block in chunks:
+            self.block_store.ensure_prepared_block(block)
+            replacements[chunk_index] = ChunkReplacement(block.digest, block.raw_size)
+        deltas = self.metadata.replace_file_chunks(file_id, replacements)
         logger.debug(
-            "绑定 chunk 到块：inode={}，chunk={}，hash={}，raw_size={}",
+            "批量提交 chunk：inode={}，chunks={}，refcount_deltas={}",
             file_id,
-            chunk_index,
-            block.digest[:12],
-            block.raw_size,
+            len(replacements),
+            len(deltas),
         )
-        if old is not None:
-            self.block_store.decrement_block(old["hash"])
-            logger.debug(
-                "替换 chunk 旧块引用：inode={}，chunk={}，old_hash={}",
-                file_id,
-                chunk_index,
-                old["hash"][:12],
-            )
 
     def remove_chunk(self, file_id: int, chunk_index: int) -> None:
         """删除 ``file_chunks`` 中该索引并递减对应块 refcount。"""
-        old = self.metadata.file_chunk_hash(file_id, chunk_index)
-        if old is not None:
-            self.metadata.delete_file_chunk(file_id, chunk_index)
-            self.block_store.decrement_block(old["hash"])
+        deltas = self.metadata.replace_file_chunks(
+            file_id, {chunk_index: ChunkReplacement(None)}
+        )
+        if deltas:
             logger.debug(
-                "删除 chunk：inode={}，chunk={}，old_hash={}",
+                "删除 chunk：inode={}，chunk={}，refcount_deltas={}",
                 file_id,
                 chunk_index,
-                old["hash"][:12],
+                len(deltas),
             )
 
     def remove_file_chunks(self, file_id: int, first_index: int = 0) -> None:
         """从 ``first_index`` 起删除所有 chunk 记录；若 ``first_index==0`` 同时清除内联列，并对每个被删哈希 ``decrement_block``。"""
         if first_index == 0:
             self.metadata.clear_inline_file(file_id)
-        hashes = self.metadata.file_chunk_hashes_from(file_id, first_index)
-        self.metadata.delete_file_chunks_from(file_id, first_index)
-        for digest in hashes:
-            self.block_store.decrement_block(digest)
+        deltas = self.metadata.replace_file_chunks(file_id, {}, delete_from=first_index)
         logger.debug(
-            "删除文件 chunk 范围：inode={}，first_index={}，count={}",
+            "删除文件 chunk 范围：inode={}，first_index={}，refcount_deltas={}",
             file_id,
             first_index,
-            len(hashes),
+            len(deltas),
         )
 
     def can_store_inline(self, size: int) -> bool:
