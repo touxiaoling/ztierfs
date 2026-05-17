@@ -91,9 +91,7 @@ class MetadataStore(
     def close(self) -> None:
         """先在有延迟访问时通过一次空写事务刷盘并提交（见 `transaction`），再关闭连接池。"""
         logger.info("关闭 SQLite 元数据存储：path={}", self.path)
-        if self.has_deferred_accesses():
-            with self.transaction():
-                pass
+        self.commit()
         self._pool.close()
 
     def commit(self) -> None:

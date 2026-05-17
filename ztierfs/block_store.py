@@ -152,20 +152,12 @@ class BlockStore:
     def close(self) -> None:
         """刷净延迟块访问并关闭后台 ``prepare`` 线程池；应在卸载或进程退出前调用。"""
         logger.info("关闭块存储")
-        if self.metadata.has_deferred_accesses():
-            with self.metadata.transaction():
-                pass
+        self.metadata.commit()
         self.drain_pending_deletions()
         executor = self._prepare_executor
         if executor is not None:
             logger.debug("关闭块准备线程池")
             executor.shutdown(wait=True)
-
-    def read_block(self, row, expected_size: int) -> bytes:
-        """读块并立即将本次 ``BlockAccess`` 记入元数据（访问时间、存在位修正与降级请求）。"""
-        data, access = self.read_block_snapshot(row, expected_size)
-        self.record_block_access(access, time_ns())
-        return data
 
     def read_block_snapshot(self, row, expected_size: int) -> tuple[bytes, BlockAccess]:
         """返回截断/零填充至 ``expected_size`` 的数据与 ``BlockAccess``；不单独刷写延迟访问。
@@ -380,13 +372,6 @@ class BlockStore:
             )
         if access.request_demotion:
             self._demotion_requested = True
-
-    def ensure_block(self, digest: str, data: bytes, compress: bool) -> None:
-        """``prepare_block`` 后校验摘要与 ``digest`` 一致，再 ``ensure_prepared_block``（幂等）。"""
-        block = self.prepare_block(data, compress)
-        if block.digest != digest:
-            raise ValueError("digest does not match block data")
-        self.ensure_prepared_block(block)
 
     def ensure_prepared_block(self, block: PreparedBlock) -> None:
         """若块不存在：非内联则 **原子写入** 热层块文件并 ``note_hot_write``，再 ``insert_block`` 登记。
