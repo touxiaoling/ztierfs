@@ -678,11 +678,13 @@ def test_ztierfs_normal_hot_read_does_not_probe_cold_tier(tmp_path, monkeypatch)
     import ztierfs.block_store as block_store_module
 
     original_probe_path = block_store_module.probe_path
+    original_read_path_bytes = block_store_module.read_path_bytes
 
     with adapted(fs_impl) as fs:
         fh = fs("create", "/hot.jpg", 0o644)
         fs("write", "/hot.jpg", data, 0, fh)
         digest = rows(fs_impl, "SELECT hash FROM blocks")[0]["hash"]
+        hot_path = fs_impl.block_store.block_path(digest, 1)
         cold_path = fs_impl.block_store.block_path(digest, 2)
         fs_impl.block_store._read_cache.clear()
         fs_impl.block_store._read_cache_size = 0
@@ -694,7 +696,16 @@ def test_ztierfs_normal_hot_read_does_not_probe_cold_tier(tmp_path, monkeypatch)
 
         monkeypatch.setattr(block_store_module, "probe_path", fail_cold_probe)
 
+        def read_or_fail(path):
+            if path == cold_path:
+                raise AssertionError("normal hot read must not read cold tier")
+            return original_read_path_bytes(path)
+
+        monkeypatch.setattr(block_store_module, "read_path_bytes", read_or_fail)
+
         assert fs("read", "/hot.jpg", len(data), 0, fh) == data
+
+        assert hot_path.exists()
 
 
 def test_ztierfs_reads_hot_fallback_when_cold_preferred_unavailable(
@@ -723,18 +734,20 @@ def test_ztierfs_reads_hot_fallback_when_cold_preferred_unavailable(
         fs_impl.block_store._read_cache.clear()
         fs_impl.block_store._read_cache_size = 0
 
-        from ztierfs.tier_access import PathProbe
+        from ztierfs.tier_access import PathUnavailable
 
         import ztierfs.block_store as block_store_module
 
-        original_probe_path = block_store_module.probe_path
+        original_read_path_bytes = block_store_module.read_path_bytes
 
-        def cold_unavailable_probe(path):
+        def cold_unavailable_read(path):
             if path == cold_path:
-                return PathProbe("unavailable", errno=5, error="cold unavailable")
-            return original_probe_path(path)
+                raise PathUnavailable(path, OSError(5, "cold unavailable"))
+            return original_read_path_bytes(path)
 
-        monkeypatch.setattr(block_store_module, "probe_path", cold_unavailable_probe)
+        monkeypatch.setattr(
+            block_store_module, "read_path_bytes", cold_unavailable_read
+        )
 
         assert fs("read", "/dual.jpg", len(data), 0, fh) == data
 

@@ -199,7 +199,19 @@ def test_fsck_does_not_repair_missing_referenced_block_file(tmp_path):
 def test_read_cold_block_unavailable_preserves_location_metadata(tmp_path, monkeypatch):
     fs_impl = make_fs(tmp_path, inline_max_bytes=0)
     _digest, data, cold_path = _make_cold_only_block(fs_impl)
-    _make_path_stat_unavailable(monkeypatch, cold_path)
+
+    import ztierfs.block_store as block_store_module
+
+    original_read = block_store_module.read_path_bytes
+
+    def read_or_unavailable(path):
+        if path == cold_path:
+            raise PathUnavailable(
+                path, OSError(errno.EIO, "rclone cold tier unavailable")
+            )
+        return original_read(path)
+
+    monkeypatch.setattr(block_store_module, "read_path_bytes", read_or_unavailable)
 
     reopened = make_fs(tmp_path, inline_max_bytes=0)
     with pytest.raises(FuseOSError) as excinfo:

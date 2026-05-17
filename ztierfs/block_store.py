@@ -210,40 +210,9 @@ class BlockStore:
                 self.schedule_cold_copy_up(row["hash"], row["stored_size"])
             return cached[:expected_size].ljust(expected_size, b"\x00"), access
 
-        path, tier, repair = self._read_path(row, repair_metadata=False)
-        try:
-            with timed(
-                "block_io.read",
-                bytes_key="block_io.read_bytes",
-                size=row["stored_size"],
-            ):
-                payload = read_path_bytes(path)
-        except PathMissing as exc:
-            logger.error(
-                "块文件读取时消失：hash={}，tier={}，path={}",
-                row["hash"][:12],
-                tier,
-                path,
-            )
-            raise FuseOSError(errno.EIO) from exc
-        except PathUnavailable as exc:
-            logger.warning(
-                "块文件临时不可用：hash={}，tier={}，path={}，error={}",
-                row["hash"][:12],
-                tier,
-                path,
-                exc,
-            )
-            raise FuseOSError(errno.EIO) from exc
+        payload, tier, repair = self._read_tiered_payload(row)
         data = self.decode_payload(row, payload)
         self._cache_put(row["hash"], data)
-        logger.debug(
-            "读取块文件：hash={}，tier={}，stored_size={}，path={}",
-            row["hash"][:12],
-            tier,
-            row["stored_size"],
-            path,
-        )
 
         hp_flag = repair.get("hot_present")
         cp_flag = repair.get("cold_present")
@@ -825,40 +794,106 @@ class BlockStore:
             return 1
         return 2
 
-    def _read_path(
-        self, row, *, repair_metadata: bool = True
-    ) -> tuple[Path, int, dict[str, bool | int]]:
-        """优先相信 SQLite 首选层；读失败后再探测 fallback 并返回可延迟提交的 presence 修正。"""
+    def _read_tiered_payload(self, row) -> tuple[bytes, int, dict[str, bool | int]]:
+        """直接读取 SQLite 声明的首选层；失败后再探测 fallback 并返回待延迟修正信息。"""
         digest = row["hash"]
         preferred_tier = self._metadata_preferred_tier(row)
         preferred_path = self.block_path(digest, preferred_tier)
-        alternate_tier = 2 if preferred_tier == 1 else 1
-        alternate_path = self.block_path(digest, alternate_tier)
-        repair: dict[str, bool | int] = {}
-
         try:
-            preferred_probe = probe_path(preferred_path)
-        except OSError as exc:
+            with timed(
+                "block_io.read",
+                bytes_key="block_io.read_bytes",
+                size=row["stored_size"],
+            ):
+                payload = read_path_bytes(preferred_path)
+        except PathMissing:
             logger.warning(
-                "块首选层探测失败：hash={}，tier={}，path={}，error={}",
+                "块首选层读取缺失：hash={}，tier={}，path={}",
                 digest[:12],
                 preferred_tier,
                 preferred_path,
-                exc,
             )
-            preferred_probe = None
-
-        if preferred_probe is not None and preferred_probe.present:
-            return preferred_path, preferred_tier, repair
-
-        if preferred_probe is not None and preferred_probe.unavailable:
+            path, tier, repair = self._fallback_read_path(
+                row,
+                preferred_tier,
+                preferred_missing=True,
+                repair_metadata=False,
+            )
+            return self._read_selected_path(row, path, tier), tier, repair
+        except PathUnavailable as exc:
             logger.warning(
                 "块首选层临时不可用：hash={}，tier={}，path={}，error={}",
                 digest[:12],
                 preferred_tier,
                 preferred_path,
-                preferred_probe.error,
+                exc,
             )
+            path, tier, repair = self._fallback_read_path(
+                row,
+                preferred_tier,
+                preferred_missing=False,
+                repair_metadata=False,
+            )
+            return self._read_selected_path(row, path, tier), tier, repair
+        logger.debug(
+            "读取块文件：hash={}，tier={}，stored_size={}，path={}",
+            row["hash"][:12],
+            preferred_tier,
+            row["stored_size"],
+            preferred_path,
+        )
+        return payload, preferred_tier, {}
+
+    def _read_selected_path(self, row, path: Path, tier: int) -> bytes:
+        """读取 fallback 选中的路径；若在选择后消失或不可用，按读错误返回 EIO。"""
+        try:
+            with timed(
+                "block_io.read",
+                bytes_key="block_io.read_bytes",
+                size=row["stored_size"],
+            ):
+                payload = read_path_bytes(path)
+        except PathMissing as exc:
+            logger.error(
+                "块文件读取时消失：hash={}，tier={}，path={}",
+                row["hash"][:12],
+                tier,
+                path,
+            )
+            raise FuseOSError(errno.EIO) from exc
+        except PathUnavailable as exc:
+            logger.warning(
+                "块文件临时不可用：hash={}，tier={}，path={}，error={}",
+                row["hash"][:12],
+                tier,
+                path,
+                exc,
+            )
+            raise FuseOSError(errno.EIO) from exc
+        logger.debug(
+            "读取块文件：hash={}，tier={}，stored_size={}，path={}",
+            row["hash"][:12],
+            tier,
+            row["stored_size"],
+            path,
+        )
+        return payload
+
+    def _fallback_read_path(
+        self,
+        row,
+        preferred_tier: int,
+        *,
+        preferred_missing: bool,
+        repair_metadata: bool = True,
+    ) -> tuple[Path, int, dict[str, bool | int]]:
+        """首选层读取失败后探测备用层；只在确认缺失时生成 presence 修正。"""
+        digest = row["hash"]
+        alternate_tier = 2 if preferred_tier == 1 else 1
+        alternate_path = self.block_path(digest, alternate_tier)
+        repair: dict[str, bool | int] = {}
+
+        if not preferred_missing:
             alternate_probe = self._probe_declared_alternate(
                 row, alternate_tier, alternate_path
             )
