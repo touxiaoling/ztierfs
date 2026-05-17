@@ -276,10 +276,90 @@ def test_scrub_reports_corrupt_compressed_block(tmp_path):
         fs("write", "/note.txt", b"a" * 1024, 0, fh)
 
     digest = rows(fs_impl, "SELECT hash FROM blocks WHERE compressed = 1")[0]["hash"]
-    block_path(fs_impl.tier1, fs_impl.tier2, digest, 1).write_bytes(b"not-zstd")
+    stored_size = rows(fs_impl, "SELECT stored_size FROM blocks")[0]["stored_size"]
+    block_path(fs_impl.tier1, fs_impl.tier2, digest, 1).write_bytes(b"x" * stored_size)
 
     report = run_scrub(fs_impl.database)
     assert "corrupt_block_payload" in {issue.code for issue in report.issues}
+
+
+def test_scrub_repairs_bad_hot_copy_when_cold_copy_is_good(tmp_path):
+    fs_impl = make_fs(tmp_path, inline_max_bytes=0, compression_min_bytes=0)
+    with adapted(fs_impl) as fs:
+        fh = fs("create", "/note.txt", 0o644)
+        fs("write", "/note.txt", b"a" * 1024, 0, fh)
+
+    digest = rows(fs_impl, "SELECT hash FROM blocks WHERE compressed = 1")[0]["hash"]
+    stored_size = rows(fs_impl, "SELECT stored_size FROM blocks")[0]["stored_size"]
+    hot_path = block_path(fs_impl.tier1, fs_impl.tier2, digest, 1)
+    cold_path = block_path(fs_impl.tier1, fs_impl.tier2, digest, 2)
+    cold_path.parent.mkdir(parents=True, exist_ok=True)
+    cold_path.write_bytes(hot_path.read_bytes())
+    hot_path.write_bytes(b"x" * stored_size)
+    with connect_sqlite(fs_impl.database) as db:
+        db.execute(
+            "INSERT OR IGNORE INTO block_locations (hash, tier) VALUES (?, 2)",
+            (digest,),
+        )
+
+    report = run_scrub(fs_impl.database, repair=True, include_cold=True)
+
+    assert [issue.code for issue in report.issues] == ["corrupt_block_payload"]
+    assert report.issues[0].repaired
+    assert not hot_path.exists()
+    row = rows(
+        fs_impl,
+        "SELECT hot_present, cold_present, preferred_tier FROM block_records",
+    )[0]
+    assert (row["hot_present"], row["cold_present"], row["preferred_tier"]) == (0, 1, 2)
+
+
+def test_scrub_does_not_repair_unique_corrupt_block_copy(tmp_path):
+    fs_impl = make_fs(tmp_path, inline_max_bytes=0, compression_min_bytes=0)
+    with adapted(fs_impl) as fs:
+        fh = fs("create", "/note.txt", 0o644)
+        fs("write", "/note.txt", b"a" * 1024, 0, fh)
+
+    digest = rows(fs_impl, "SELECT hash FROM blocks WHERE compressed = 1")[0]["hash"]
+    stored_size = rows(fs_impl, "SELECT stored_size FROM blocks")[0]["stored_size"]
+    hot_path = block_path(fs_impl.tier1, fs_impl.tier2, digest, 1)
+    hot_path.write_bytes(b"x" * stored_size)
+
+    report = run_scrub(fs_impl.database, repair=True, include_cold=True)
+
+    assert [issue.code for issue in report.issues] == ["corrupt_block_payload"]
+    assert not report.issues[0].repaired
+    assert hot_path.exists()
+    row = rows(
+        fs_impl,
+        "SELECT hot_present, cold_present, preferred_tier FROM block_records",
+    )[0]
+    assert (row["hot_present"], row["cold_present"], row["preferred_tier"]) == (1, 0, 1)
+
+
+def test_scrub_reports_raw_size_mismatch_for_same_stored_size_payload(tmp_path):
+    fs_impl = make_fs(tmp_path, inline_max_bytes=0)
+    with adapted(fs_impl) as fs:
+        fh = fs("create", "/note.txt", 0o644)
+        fs("write", "/note.txt", b"hello", 0, fh)
+
+    digest = rows(fs_impl, "SELECT hash FROM blocks")[0]["hash"]
+    hot_path = block_path(fs_impl.tier1, fs_impl.tier2, digest, 1)
+    hot_path.write_bytes(b"HELLO")
+
+    report = run_scrub(fs_impl.database)
+
+    assert report.ok
+
+    with connect_sqlite(fs_impl.database) as db:
+        db.execute(
+            "UPDATE blocks SET raw_size = raw_size + 1 WHERE hash = ?", (digest,)
+        )
+        db.execute("UPDATE file_chunks SET size = size + 1 WHERE hash = ?", (digest,))
+
+    report = run_scrub(fs_impl.database)
+
+    assert [issue.code for issue in report.issues] == ["raw_size_mismatch"]
 
 
 def test_stats_reports_storage_summary(tmp_path):

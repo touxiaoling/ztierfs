@@ -17,6 +17,7 @@
 import sqlite3
 
 from contextlib import closing
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +38,16 @@ from ztierfs.tier_access import (
 from .config import resolve_maintenance_paths
 from .paths import block_path
 from .reports import CheckReport, Issue
+
+
+@dataclass(frozen=True)
+class PayloadScrubResult:
+    """One scrubbed payload copy and whether this copy is safe to trust."""
+
+    ok: bool
+    code: str | None = None
+    message: str | None = None
+    details: dict[str, Any] | None = None
 
 
 def run_fsck(
@@ -586,37 +597,94 @@ class Checker:
                         {"hash": digest},
                     )
                     continue
-                self._scrub_payload(digest, row, payload, {"storage": "inline"})
+                result = self._validate_payload(
+                    digest, row, payload, {"storage": "inline"}
+                )
+                self._issue_payload_result(result)
                 continue
 
-            paths = [
-                (tier, block_path(self.tier1, self.tier2, digest, tier))
-                for tier in (1, 2)
-                if tier == 1 or self.include_cold
-                if self._payload_path_available(digest, tier)
-            ]
-            for tier, path in paths:
-                try:
-                    payload = read_path_bytes(path)
-                    self._scrub_payload(digest, row, payload, {"tier": tier})
-                except PathMissing:
-                    self._issue(
-                        "missing_block_file",
-                        "referenced block payload disappeared before scrub",
-                        {"hash": digest, "tier": tier},
+            tier_results = {
+                tier: result
+                for tier, result in self._scrub_tiered_payloads(digest, row)
+            }
+            has_good_copy = any(result.ok for result in tier_results.values())
+            for tier, result in tier_results.items():
+                if result.ok:
+                    continue
+                repairable = has_good_copy and result.code in {
+                    "stored_size_mismatch",
+                    "raw_size_mismatch",
+                    "corrupt_block_payload",
+                }
+                self._issue_payload_result(
+                    result,
+                    repairable=repairable,
+                    repair=(
+                        lambda digest=digest, tier=tier: self._remove_bad_block_copy(
+                            db, digest, tier
+                        )
                     )
-                except PathUnavailable as exc:
-                    self._issue(
-                        "block_payload_unavailable",
-                        "block payload cannot be read right now",
-                        {"hash": digest, "tier": tier, "error": str(exc)},
+                    if repairable
+                    else None,
+                )
+
+    def _scrub_tiered_payloads(
+        self, digest: str, row: sqlite3.Row
+    ) -> list[tuple[int, PayloadScrubResult]]:
+        """Read and validate tiered block copies selected by scrub policy."""
+        results: list[tuple[int, PayloadScrubResult]] = []
+        for tier in (1, 2):
+            if tier == 2 and not self.include_cold:
+                continue
+            if not self._payload_path_available(digest, tier):
+                continue
+            location = {"tier": tier}
+            path = block_path(self.tier1, self.tier2, digest, tier)
+            try:
+                payload = read_path_bytes(path)
+            except PathMissing:
+                results.append(
+                    (
+                        tier,
+                        PayloadScrubResult(
+                            ok=False,
+                            code="missing_block_file",
+                            message="referenced block payload disappeared before scrub",
+                            details={"hash": digest, "tier": tier},
+                        ),
                     )
-                except (OSError, zstd.ZstdError) as exc:
-                    self._issue(
-                        "corrupt_block_payload",
-                        "block payload cannot be read or decoded",
-                        {"hash": digest, "tier": tier, "error": str(exc)},
+                )
+                continue
+            except PathUnavailable as exc:
+                results.append(
+                    (
+                        tier,
+                        PayloadScrubResult(
+                            ok=False,
+                            code="block_payload_unavailable",
+                            message="block payload cannot be read right now",
+                            details={"hash": digest, "tier": tier, "error": str(exc)},
+                        ),
                     )
+                )
+                continue
+            except OSError as exc:
+                results.append(
+                    (
+                        tier,
+                        PayloadScrubResult(
+                            ok=False,
+                            code="corrupt_block_payload",
+                            message="block payload cannot be read",
+                            details={"hash": digest, "tier": tier, "error": str(exc)},
+                        ),
+                    )
+                )
+                continue
+            results.append(
+                (tier, self._validate_payload(digest, row, payload, location))
+            )
+        return results
 
     def _payload_path_available(self, digest: str, tier: int) -> bool:
         """探测某层块路径是否可访问：暂时不可用则记录 issue 并返回 False；存在则返回 True。"""
@@ -638,19 +706,20 @@ class Checker:
         payload = row["payload"] if "payload" in row.keys() else row["inline_payload"]
         return bytes(payload) if payload is not None else None
 
-    def _scrub_payload(
+    def _validate_payload(
         self,
         digest: str,
         row: sqlite3.Row,
         payload: bytes,
         location: dict[str, Any],
-    ) -> None:
+    ) -> PayloadScrubResult:
         """对已读入的块字节校验 `stored_size`，解压后校验与 `raw_size` 是否一致。"""
         if len(payload) != row["stored_size"]:
-            self._issue(
-                "stored_size_mismatch",
-                "block payload size does not match metadata stored_size",
-                {
+            return PayloadScrubResult(
+                ok=False,
+                code="stored_size_mismatch",
+                message="block payload size does not match metadata stored_size",
+                details={
                     "hash": digest,
                     **location,
                     "metadata_size": row["stored_size"],
@@ -660,23 +729,45 @@ class Checker:
         try:
             data = zstd.decompress(payload) if row["compressed"] else payload
         except zstd.ZstdError as exc:
-            self._issue(
-                "corrupt_block_payload",
-                "block payload cannot be decoded",
-                {"hash": digest, **location, "error": str(exc)},
+            return PayloadScrubResult(
+                ok=False,
+                code="corrupt_block_payload",
+                message="block payload cannot be decoded",
+                details={"hash": digest, **location, "error": str(exc)},
             )
-            return
         if len(data) != row["raw_size"]:
-            self._issue(
-                "raw_size_mismatch",
-                "decoded block size does not match metadata raw_size",
-                {
+            return PayloadScrubResult(
+                ok=False,
+                code="raw_size_mismatch",
+                message="decoded block size does not match metadata raw_size",
+                details={
                     "hash": digest,
                     **location,
                     "metadata_size": row["raw_size"],
                     "decoded_size": len(data),
                 },
             )
+        return PayloadScrubResult(ok=True)
+
+    def _issue_payload_result(
+        self,
+        result: PayloadScrubResult,
+        *,
+        repairable: bool = False,
+        repair: Any = None,
+    ) -> None:
+        """Emit an issue for a failed payload validation result."""
+        if result.ok:
+            return
+        if result.code is None or result.message is None or result.details is None:
+            raise ValueError("failed scrub result must include issue fields")
+        self._issue(
+            result.code,
+            result.message,
+            result.details,
+            repairable=repairable,
+            repair=repair,
+        )
 
     def _scan_disk_blocks(self) -> dict[str, set[int]]:
         """遍历热/冷层 `blocks` 目录，收集 64 位十六进制文件名的摘要及所在 tier；根目录不可扫描时区分暂时不可用与不存在。"""
@@ -808,6 +899,26 @@ class Checker:
                 "DELETE FROM block_locations WHERE hash = ? AND tier = 1",
                 (digest,),
             )
+
+    def _remove_bad_block_copy(
+        self, db: sqlite3.Connection, digest: str, tier: int
+    ) -> None:
+        """Drop one corrupted redundant copy from metadata and disk."""
+        logger.info("删除损坏冗余块副本：hash={}，tier={}", digest[:12], tier)
+        self._unlink_block_file(digest, tier)
+        db.execute(
+            "DELETE FROM block_locations WHERE hash = ? AND tier = ?",
+            (digest, tier),
+        )
+        alternate_tier = 2 if tier == 1 else 1
+        db.execute(
+            """
+            UPDATE blocks
+            SET preferred_tier = ?
+            WHERE hash = ? AND preferred_tier = ?
+            """,
+            (alternate_tier, digest, tier),
+        )
 
     def _delete_disk_block_files(self, digest: str, tiers: tuple[int, ...]) -> None:
         """对给定 tier 列表逐个调用 `_unlink_block_file` 删除块文件。"""
