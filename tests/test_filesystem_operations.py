@@ -294,6 +294,60 @@ def test_ztierfs_updates_directories_renames_and_truncates(tmp_path):
         assert fs("readdir", "/", None) == [".", "..", ".Trashes"]
 
 
+def test_ztierfs_defers_readdir_atime_until_metadata_commit(tmp_path):
+    fs_impl = make_fs(tmp_path)
+
+    with adapted(fs_impl) as fs:
+        fs("mkdir", "/docs", 0o755)
+        ino = fs_impl.lookup(1, b"docs").ino
+        before = rows(fs_impl, f"SELECT atime_ns FROM inodes WHERE id = {ino}")[0][
+            "atime_ns"
+        ]
+
+        assert fs("readdir", "/docs", None) == [".", ".."]
+
+        assert (
+            rows(fs_impl, f"SELECT atime_ns FROM inodes WHERE id = {ino}")[0][
+                "atime_ns"
+            ]
+            == before
+        )
+        fs_impl.metadata.commit()
+        assert (
+            rows(fs_impl, f"SELECT atime_ns FROM inodes WHERE id = {ino}")[0][
+                "atime_ns"
+            ]
+            > before
+        )
+
+
+def test_ztierfs_defers_readlink_atime_until_metadata_commit(tmp_path):
+    fs_impl = make_fs(tmp_path)
+
+    with adapted(fs_impl) as fs:
+        fs("symlink", "/link.txt", "target.txt")
+        ino = fs_impl.lookup(1, b"link.txt").ino
+        before = rows(fs_impl, f"SELECT atime_ns FROM inodes WHERE id = {ino}")[0][
+            "atime_ns"
+        ]
+
+        assert fs("readlink", "/link.txt") == "target.txt"
+
+        assert (
+            rows(fs_impl, f"SELECT atime_ns FROM inodes WHERE id = {ino}")[0][
+                "atime_ns"
+            ]
+            == before
+        )
+        fs_impl.metadata.commit()
+        assert (
+            rows(fs_impl, f"SELECT atime_ns FROM inodes WHERE id = {ino}")[0][
+                "atime_ns"
+            ]
+            > before
+        )
+
+
 def test_ztierfs_reports_expected_errors(tmp_path):
     fs_impl = make_fs(tmp_path)
 

@@ -517,9 +517,9 @@ class InodeFuseMixin(InodeOperations, FileSystemMixinBase):
             state["cursors"][offset] = name
 
     def _readdir_inode(self, ino: int, offset: int, size: int, fh):
-        """``readdir`` 的实现体：含 ``.``/``..``、分页子项、更新 atime。"""
+        """``readdir`` 的实现体：含 ``.``/``..``、分页子项、延迟更新 atime。"""
         self._ensure_trash_directory_for_caller()
-        with self.metadata.transaction():
+        with self.metadata.read_transaction():
             node = self._node_by_ino(ino)
             if node["kind"] != "dir":
                 raise FuseOSError(errno.ENOTDIR)
@@ -543,8 +543,10 @@ class InodeFuseMixin(InodeOperations, FileSystemMixinBase):
                 encoded = child["name"].encode("utf-8", "surrogateescape")
                 self._remember_dir_cursor(ino, fh, index, child["name"])
                 entries.append(self._entry_from_node(encoded, child, index))
-            self.metadata.touch_node_atime(ino, time_ns())
-            return tuple(entries)
+        should_flush = self.metadata.defer_node_atime(ino, time_ns())
+        if should_flush:
+            self.metadata.commit()
+        return tuple(entries)
 
     def releasedir(self, ino: int, fh) -> int:
         """关闭 ``opendir`` 分配的目录 ``fh``；忽略未知 ``fh`` 时静默成功。"""
@@ -673,13 +675,16 @@ class InodeFuseMixin(InodeOperations, FileSystemMixinBase):
         return self._run_fuse_op(self._readlink_inode, ino)
 
     def _readlink_inode(self, ino: int) -> str:
-        """``readlink`` 的实现体；写事务内 touch atime。"""
-        with self.metadata.transaction():
+        """``readlink`` 的实现体；延迟更新 symlink atime。"""
+        with self.metadata.read_transaction():
             node = self._node_by_ino(ino)
             if node["kind"] != "symlink":
                 raise FuseOSError(errno.EINVAL)
-            self.metadata.touch_node_atime(ino, time_ns())
-            return node["symlink_target"]
+            target = node["symlink_target"]
+        should_flush = self.metadata.defer_node_atime(ino, time_ns())
+        if should_flush:
+            self.metadata.commit()
+        return target
 
     def symlink(self, link: bytes, parent: int, name: bytes) -> LowLevelEntry:
         """在 ``parent`` 下创建指向 ``link`` 的符号链接。
