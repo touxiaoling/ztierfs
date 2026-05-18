@@ -27,7 +27,7 @@ from macfusepy import FuseOSError
 from .block_layout import block_file_path
 from .metadata.blocks import BlockInsert
 from .metadata import MetadataStore
-from .perf import timed
+from .perf import count, timed
 from .tier_access import (
     PathMissing,
     PathUnavailable,
@@ -707,7 +707,8 @@ class BlockStore:
             if max_deletions is not None:
                 limit = min(limit, max_deletions - removed)
             with self.metadata.read_transaction():
-                rows = self.metadata.pending_deletions(limit)
+                with timed("gc.pending.read"):
+                    rows = self.metadata.pending_deletions(limit)
             if not rows:
                 return removed
             removed_ids: list[int] = []
@@ -715,9 +716,10 @@ class BlockStore:
             for row in rows:
                 try:
                     if row["kind"] == "block_file":
-                        deleted_or_missing = not unlink_path(
-                            self.block_path(row["digest"], row["tier"])
-                        )
+                        with timed("gc.pending.unlink"):
+                            deleted_or_missing = not unlink_path(
+                                self.block_path(row["digest"], row["tier"])
+                            )
                 except PathUnavailable:
                     logger.warning(
                         "待 GC 块文件暂时不可用：id={}，hash={}，tier={}",
@@ -738,9 +740,10 @@ class BlockStore:
                     )
             if removed_ids or deferred_ids:
                 now = time_ns()
-                with self.metadata.transaction():
-                    self.metadata.remove_pending_deletions(removed_ids)
-                    self.metadata.defer_pending_deletions(deferred_ids, now)
+                with timed("gc.pending.commit"):
+                    with self.metadata.transaction():
+                        self.metadata.remove_pending_deletions(removed_ids)
+                        self.metadata.defer_pending_deletions(deferred_ids, now)
                 removed += len(removed_ids)
             if max_deletions is None and not removed_ids and not deferred_ids:
                 return removed
@@ -825,10 +828,11 @@ class BlockStore:
                     total,
                 )
                 return demoted
-            row = self.metadata.demotion_candidate(
-                protected_prefix_chunks=self.policy.protected_prefix_chunks,
-                max_atime_ns=time_ns() - self.policy.min_hot_age_ns,
-            )
+            with timed("tier.demote.select"):
+                row = self.metadata.demotion_candidate(
+                    protected_prefix_chunks=self.policy.protected_prefix_chunks,
+                    max_atime_ns=time_ns() - self.policy.min_hot_age_ns,
+                )
             if row is None:
                 logger.info("热层降级停止：没有可降级候选，hot_bytes={}", total)
                 return demoted
@@ -843,15 +847,18 @@ class BlockStore:
                 self._demotion_requested = True
                 return demoted
             if not row["cold_present"] or cold_probe.missing:
-                self.copy_block(row["hash"], 1, 2)
+                with timed("tier.demote.copy"):
+                    self.copy_block(row["hash"], 1, 2)
             try:
-                unlink_path(self.block_path(row["hash"], 1))
+                with timed("tier.demote.unlink"):
+                    unlink_path(self.block_path(row["hash"], 1))
             except PathUnavailable:
                 logger.warning(
                     "热层降级停止：热层块临时不可用，hash={}", row["hash"][:12]
                 )
                 self._demotion_requested = True
                 return demoted
+            count("tier.demote.blocks")
             self.metadata.set_block_presence(
                 row["hash"],
                 hot_present=False,

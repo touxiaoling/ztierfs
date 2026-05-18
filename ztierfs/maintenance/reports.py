@@ -72,6 +72,7 @@ class StatsReport:
     chunks: dict[str, int]
     blocks: dict[str, int]
     storage: dict[str, int]
+    maintenance: dict[str, int]
 
     def to_dict(self) -> dict[str, Any]:
         """浅封装 `dataclasses.asdict`，得到与字段同结构的嵌套字典，便于 JSON 输出。"""

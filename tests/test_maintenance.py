@@ -396,6 +396,7 @@ def test_stats_reports_storage_summary(tmp_path):
     assert data["blocks"]["both"] == 0
     assert data["storage"]["logical_file_bytes"] == 5
     assert data["storage"]["inline_stored_bytes"] == 5
+    assert data["maintenance"]["pending_deletions"] == 0
 
 
 def test_cleanup_removes_old_promoted_cold_copy(tmp_path):

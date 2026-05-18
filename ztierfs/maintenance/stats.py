@@ -142,6 +142,11 @@ def collect_stats(
             chunks={"file_chunks": scalar(db, "SELECT COUNT(*) FROM file_chunks")},
             blocks=block_counts,
             storage=storage,
+            maintenance={
+                "pending_deletions": scalar(
+                    db, "SELECT COUNT(*) FROM pending_deletions"
+                )
+            },
         )
     logger.info(
         "统计信息收集完成：inodes={}，blocks={}，stored_bytes={}",

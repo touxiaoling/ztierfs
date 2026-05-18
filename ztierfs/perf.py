@@ -50,6 +50,13 @@ def current_counters() -> PerfCounters | None:
     return _CURRENT_COUNTERS.get()
 
 
+def count(name: str, amount: int = 1) -> None:
+    """若存在活动计数器，则给 ``name`` 增加 ``amount`` 次数。"""
+    counters = current_counters()
+    if counters is not None:
+        counters.counts[name] += amount
+
+
 @contextmanager
 def collect_perf() -> Iterator[PerfCounters]:
     """在 `with` 块内将新的 `PerfCounters` 挂到当前 context，退出时恢复，供嵌套 `timed` 等写入。"""
