@@ -132,13 +132,13 @@ FUSE/内核交互：
 
 `fsck` 检查 SQLite 元数据与块文件的一致性。维护命令的首选入口是 SQLite 元数据文件；数据库会记录热层、冷层的绝对路径，因此在线和离线维护都只需要传一个路径。默认只报告问题；加上 `--repair` 后，会执行确定安全的修复，例如重算块引用计数、修正错误层级、删除无引用块记录和孤儿块文件。`refcount=0` 且仍有 `cold_present=1` 的 cold garbage 是合法维护态，不会被当作普通无引用块错误；如果这类冷层垃圾对应文件已经缺失，`fsck --repair` 会报告并删除这条垃圾元数据。被引用但缺失或损坏的块不会被伪造修复，只会报告错误。冷层使用 rclone 挂载时，如果检查期间冷层或某个块临时不可访问，维护命令会报告 `cold_tier_unavailable` 或 `block_payload_unavailable`，并跳过依赖这次冷层观察的修复，不会把它当作缺失或损坏处理。
 
-ztierfs 的默认可靠性假设是：只要块文件已经通过原子写入、`fsync` 和元数据提交成功落盘，后续字节保持正确应由下层文件系统、磁盘、rclone/VFS cache 或网盘服务负责。ztierfs 主要负责自己的写入顺序、SQLite 元数据、引用计数、冷热层 presence 和崩溃后可诊断状态。块文件可能丢失或暂时不可访问，这是 ztierfs 要报告的状态；持续 bit-rot 或底层静默损坏不进入普通读写热路径的默认假设。
+ztierfs 的默认可靠性假设是：只要块文件已经通过原子写入、`fsync` 和元数据提交成功落盘，后续字节保持正确应由下层文件系统、磁盘、rclone/VFS cache 或网盘服务负责。ztierfs 主要负责自己的写入顺序、SQLite 元数据、引用计数、冷热层 presence 和崩溃后可诊断状态。块文件可能丢失或暂时不可访问，这是 ztierfs 要报告的状态；持续 bit-rot、同长度静默损坏或恶意同长度 payload 替换不进入 ztierfs 的默认检查模型。
 
 ```bash
 uv run python -m ztierfs fsck /tmp/ztierfs-metadata.sqlite3
 ```
 
-`scrub` 在 `fsck` 的基础上读取并校验 SQLite 内联 payload 和热层块 payload，能发现压缩数据损坏、存储大小不匹配和解码后大小异常。默认不会读取冷层块 payload，因此适合作为远程冷层场景的常规维护命令；需要明确诊断冷层内容时加 `--include-cold`，这可能读取或下载完整冷层数据。只有已经读到 payload 后解码或大小不匹配才会报告损坏；rclone 下载失败这类读取错误会报告为暂时不可用。默认维护策略不把冷层内容校验作为常规任务，避免为了低概率损坏检查而持续消耗网盘缓存和远端带宽：
+`scrub` 在 `fsck` 的基础上读取并校验 SQLite 内联 payload 和热层块 payload，能发现压缩数据损坏、存储大小不匹配和解码后大小异常。它不会把解码后的数据重新计算 SHA-256 并与块 hash 比较，因此不会检测同长度未压缩 payload 替换、同长度静默损坏或恶意篡改。默认不会读取冷层块 payload，因此适合作为远程冷层场景的常规维护命令；需要明确诊断冷层内容时加 `--include-cold`，这可能读取或下载完整冷层数据。只有已经读到 payload 后解码或大小不匹配才会报告损坏；rclone 下载失败这类读取错误会报告为暂时不可用。默认维护策略不把冷层内容校验作为常规任务，避免为了低概率损坏检查而持续消耗网盘缓存和远端带宽：
 
 ```bash
 uv run python -m ztierfs scrub /tmp/ztierfs-metadata.sqlite3

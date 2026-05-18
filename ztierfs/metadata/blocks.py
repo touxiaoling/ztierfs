@@ -60,6 +60,21 @@ class BlockMetadataMixin(MetadataMixinBase):
             (digest,),
         ).fetchone()
 
+    def block_records(self, digests: list[str]) -> dict[str, sqlite3.Row]:
+        """Return block records for the requested digests, keyed by hash."""
+        if not digests:
+            return {}
+        placeholders = ",".join("?" for _ in digests)
+        rows = self._db.execute(
+            f"""
+            SELECT *
+            FROM ({BLOCK_RECORD_SELECT}) AS block_record
+            WHERE hash IN ({placeholders})
+            """,
+            digests,
+        ).fetchall()
+        return {row["hash"]: row for row in rows}
+
     def block_refcount_and_presence(self, digest: str) -> sqlite3.Row | None:
         """处理 block refcount and presence。"""
         return self._db.execute(

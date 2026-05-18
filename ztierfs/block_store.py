@@ -79,10 +79,13 @@ class PreparedBlock:
 
     ``digest`` 为原始未压缩数据的 SHA-256 十六进制摘要；``raw_size`` 为逻辑块原始字节数。
     ``payload`` 为磁盘或内联存储字节序列（可能经 zstd 压缩，由 ``compressed`` 标明）。
+    ``raw_data`` 为本次外部写入提供的原始块字节，用于复用冷层已有记录时直接生成热层副本，
+    避免从冷层读取 payload。
     ``inline_payload`` 非 ``None`` 时表示整块走 SQLite 内联存储，不写 tier 目录下的块文件。
     """
 
     digest: str
+    raw_data: bytes
     raw_size: int
     payload: bytes
     compressed: bool
@@ -393,11 +396,12 @@ class BlockStore:
         if not unique:
             return
 
-        existing_hashes = self.metadata.existing_block_hashes(list(unique))
+        existing_rows = self.metadata.block_records(list(unique))
         new_blocks: list[PreparedBlockMetadata] = []
         for digest, block in unique.items():
-            if digest in existing_hashes:
-                logger.debug("块已存在，跳过写入：hash={}", digest[:12])
+            existing = existing_rows.get(digest)
+            if existing is not None:
+                self._ensure_existing_block_hot_from_write(digest, block, existing)
                 continue
             if block.inline_payload is None:
                 self.write_block_file(digest, 1, block.payload)
@@ -450,6 +454,50 @@ class BlockStore:
             raise RuntimeError(
                 f"prepared block metadata mismatch for digest {existing.digest}"
             )
+
+    def _ensure_existing_block_hot_from_write(
+        self, digest: str, block: PreparedBlock, row
+    ) -> None:
+        """Reuse existing metadata while writing incoming data to hot tier if needed."""
+        if row["storage"] == "inline":
+            logger.debug("内联块已存在，跳过写入：hash={}", digest[:12])
+            return
+        if row["hot_present"]:
+            logger.debug("热层块已存在，跳过写入：hash={}", digest[:12])
+            return
+        payload, compressed = self._payload_matching_existing_record(block, row)
+        self.write_block_file(digest, 1, payload)
+        self.note_hot_write(len(payload))
+        self.metadata.set_block_presence(
+            digest,
+            hot_present=True,
+            preferred_tier=1,
+            last_promoted_ns=time_ns(),
+        )
+        logger.debug(
+            "用本次写入数据提升已有块到热层：hash={}，compressed={}，stored_size={}",
+            digest[:12],
+            compressed,
+            len(payload),
+        )
+
+    def _payload_matching_existing_record(
+        self, block: PreparedBlock, row
+    ) -> tuple[bytes, bool]:
+        if row["raw_size"] != block.raw_size:
+            raise RuntimeError(f"block raw_size mismatch for digest {block.digest}")
+        if row["compressed"]:
+            payload = zstd.compress(block.raw_data, level=self.compression_level)
+            compressed = True
+        else:
+            payload = block.raw_data
+            compressed = False
+        if len(payload) != row["stored_size"]:
+            raise RuntimeError(
+                f"block stored_size mismatch for digest {block.digest}: "
+                f"metadata={row['stored_size']} prepared={len(payload)}"
+            )
+        return payload, compressed
 
     def prepare_blocks(
         self, chunks: Iterable[tuple[int, bytes]], compress: bool
@@ -509,6 +557,7 @@ class BlockStore:
         inline_payload = payload if self.should_inline(payload) else None
         return PreparedBlock(
             digest=digest,
+            raw_data=data,
             raw_size=len(data),
             payload=payload,
             compressed=compressed,

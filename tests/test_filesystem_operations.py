@@ -46,6 +46,30 @@ def test_ztierfs_preserves_zero_byte_files_without_blocks(tmp_path):
         assert fs("read", "/empty.txt", 64, 0, fh) == b""
 
 
+def test_ztierfs_create_existing_file_respects_open_flags(tmp_path):
+    fs_impl = make_fs(tmp_path)
+
+    with adapted(fs_impl) as fs:
+        fh = fs("create", "/note.txt", 0o644)
+        fs("write", "/note.txt", b"contents", 0, fh)
+        fs("release", "/note.txt", fh)
+
+        reopened = fs("create", "/note.txt", 0o600, os.O_RDWR | os.O_CREAT)
+        assert fs("read", "/note.txt", 8, 0, reopened) == b"contents"
+        assert fs("getattr", "/note.txt")["st_size"] == 8
+        fs("release", "/note.txt", reopened)
+
+        truncated = fs(
+            "create", "/note.txt", 0o600, os.O_RDWR | os.O_CREAT | os.O_TRUNC
+        )
+        assert fs("getattr", "/note.txt")["st_size"] == 0
+        fs("release", "/note.txt", truncated)
+
+        with pytest.raises(FuseOSError) as exc:
+            fs("create", "/note.txt", 0o600, os.O_RDWR | os.O_CREAT | os.O_EXCL)
+        assert exc.value.errno == errno.EEXIST
+
+
 def test_ztierfs_handles_reads_and_writes_on_exact_chunk_boundaries(tmp_path):
     fs_impl = make_fs(tmp_path, chunk_size=8, inline_max_bytes=0)
 

@@ -413,13 +413,16 @@ class InodeFuseMixin(InodeOperations, FileSystemMixinBase):
             existing = self.metadata.child(parent, decoded)
             now = time_ns()
             if existing is not None:
+                if flags & os.O_EXCL:
+                    raise FuseOSError(errno.EEXIST)
                 if existing["kind"] != "file":
                     raise FuseOSError(errno.EISDIR)
-                self._require_open_access(existing, flags | os.O_TRUNC)
-                self.file_content.remove_file_chunks(existing["id"])
-                self.metadata.reset_file_node(
-                    existing["id"], S_IFREG | (mode & 0o7777), now
-                )
+                self._require_open_access(existing, flags)
+                if flags & os.O_TRUNC:
+                    self.file_content.remove_file_chunks(existing["id"])
+                    self.metadata.reset_file_node(
+                        existing["id"], S_IFREG | (mode & 0o7777), now
+                    )
                 node = self._node_by_ino(existing["id"])
             else:
                 inode_id = self.metadata.insert_node(

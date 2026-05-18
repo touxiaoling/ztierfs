@@ -92,22 +92,20 @@ def test_ztierfs_batches_duplicate_prepared_chunks_within_one_write(
     fs_impl = make_fs(tmp_path, inline_max_bytes=0)
     data = b"x" * fs_impl.chunk_size
     calls = 0
-    original_existing_block_hashes = fs_impl.metadata.existing_block_hashes
+    original_block_records = fs_impl.metadata.block_records
     original_insert_blocks = fs_impl.metadata.insert_blocks
     inserted_batch_sizes: list[int] = []
 
-    def observed_existing_block_hashes(digests):
+    def observed_block_records(digests):
         nonlocal calls
         calls += 1
-        return original_existing_block_hashes(digests)
+        return original_block_records(digests)
 
     def observed_insert_blocks(blocks, *, now):
         inserted_batch_sizes.append(len(blocks))
         return original_insert_blocks(blocks, now=now)
 
-    monkeypatch.setattr(
-        fs_impl.metadata, "existing_block_hashes", observed_existing_block_hashes
-    )
+    monkeypatch.setattr(fs_impl.metadata, "block_records", observed_block_records)
     monkeypatch.setattr(fs_impl.metadata, "insert_blocks", observed_insert_blocks)
 
     with adapted(fs_impl) as fs:
@@ -473,7 +471,9 @@ def test_ztierfs_updates_refcounts_when_overwriting_and_unlinking(tmp_path):
     assert block_rows[0]["refcount"] == 1
 
 
-def test_ztierfs_keeps_unreferenced_cold_block_index_for_reuse(tmp_path, monkeypatch):
+def test_ztierfs_reuses_cold_garbage_by_writing_incoming_data_to_hot(
+    tmp_path, monkeypatch
+):
     fs_impl = make_fs(tmp_path, inline_max_bytes=0)
     data = b"cold-garbage" * 64
 
@@ -511,13 +511,24 @@ def test_ztierfs_keeps_unreferenced_cold_block_index_for_reuse(tmp_path, monkeyp
     assert rows(fs_impl, "SELECT tier FROM pending_deletions") == []
 
     original_write_block_file = fs_impl.block_store.write_block_file
+    original_read_path = fs_impl.block_store.file_io.read_path
+    hot_writes = []
 
-    def fail_cold_rewrite(digest_arg, tier, payload):
+    def observed_write_block_file(digest_arg, tier, payload):
         if tier == 2:
             raise AssertionError("reuse must not rewrite an indexed cold payload")
+        hot_writes.append((digest_arg, tier, payload))
         return original_write_block_file(digest_arg, tier, payload)
 
-    monkeypatch.setattr(fs_impl.block_store, "write_block_file", fail_cold_rewrite)
+    def fail_if_cold_read(path):
+        if path == cold_path:
+            raise AssertionError("reuse must not read cold payload")
+        return original_read_path(path)
+
+    monkeypatch.setattr(
+        fs_impl.block_store, "write_block_file", observed_write_block_file
+    )
+    monkeypatch.setattr(fs_impl.block_store.file_io, "read_path", fail_if_cold_read)
 
     fh = fs("create", "/again.jpg", 0o644)
     fs("write", "/again.jpg", data, 0, fh)
@@ -525,15 +536,20 @@ def test_ztierfs_keeps_unreferenced_cold_block_index_for_reuse(tmp_path, monkeyp
     reused = rows(
         fs_impl,
         f"""
-        SELECT refcount, cold_present, preferred_tier, cold_gc_enqueued_ns
+        SELECT refcount, hot_present, cold_present, preferred_tier, cold_gc_enqueued_ns
         FROM block_records
         WHERE hash = '{digest}'
         """,
     )[0]
     assert reused["refcount"] == 1
+    assert reused["hot_present"] == 1
     assert reused["cold_present"] == 1
-    assert reused["preferred_tier"] == 2
+    assert reused["preferred_tier"] == 1
     assert reused["cold_gc_enqueued_ns"] is None
+    assert len(hot_writes) == 1
+    assert hot_writes[0] == (digest, 1, data)
+    assert hot_path.exists()
+    assert fs("read", "/again.jpg", len(data), 0, fh) == data
 
 
 def test_ztierfs_partial_overwrite_of_deduped_chunk_keeps_other_file_intact(tmp_path):
