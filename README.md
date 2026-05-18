@@ -141,7 +141,7 @@ uv run python -m ztierfs scrub /tmp/ztierfs-metadata.sqlite3
 uv run python -m ztierfs scrub /tmp/ztierfs-metadata.sqlite3 --include-cold
 ```
 
-`stats` 输出 inode、目录项、chunk、块分布和存储占用摘要。块统计会区分热层、冷层以及冷热两层都有副本的块。维护命令都支持 `--json`，方便脚本消费：
+`stats` 输出 inode、目录项、chunk、块分布、存储占用和维护队列摘要。块统计会区分热层、冷层以及冷热两层都有副本的块；`maintenance.pending_deletions` 显示仍等待物理清理的 payload 队列数量。维护命令都支持 `--json`，方便脚本消费：
 
 ```bash
 uv run python -m ztierfs stats /tmp/ztierfs-metadata.sqlite3 --json
