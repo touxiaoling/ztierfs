@@ -16,7 +16,7 @@ from ztierfs.maintenance import (
 )
 from ztierfs.tier_access import PathUnavailable
 
-from .helpers import adapted, connect_sqlite, make_fs, rows
+from .helpers import TestOperationsAdapter, adapted, connect_sqlite, make_fs, rows
 
 
 def _make_cold_only_block(fs_impl, data: bytes = b"hello") -> tuple[str, bytes, Path]:
@@ -50,6 +50,40 @@ def _make_path_stat_unavailable(monkeypatch, unavailable_path: Path) -> None:
         return original_stat(path, *args, **kwargs)
 
     monkeypatch.setattr(Path, "stat", stat_with_unavailable)
+
+
+def _make_cold_garbage(fs_impl, data: bytes, *, enqueued_ns: int) -> tuple[str, Path]:
+    assert len(data) <= fs_impl.chunk_size
+    name = f"/garbage-{len(data)}-{data[:1].hex()}.jpg"
+    fs = TestOperationsAdapter(fs_impl)
+    fh = fs("create", name, 0o644)
+    fs("write", name, data, 0, fh)
+    fs("release", name, fh)
+    digest = rows(fs_impl, "SELECT hash FROM blocks ORDER BY atime_ns DESC")[0]["hash"]
+    hot_path = block_path(fs_impl.tier1, fs_impl.tier2, digest, 1)
+    cold_path = block_path(fs_impl.tier1, fs_impl.tier2, digest, 2)
+    cold_path.parent.mkdir(parents=True, exist_ok=True)
+    cold_path.write_bytes(hot_path.read_bytes())
+    with connect_sqlite(fs_impl.database) as db:
+        db.execute(
+            """
+            UPDATE blocks
+            SET cold_present = 1
+            WHERE hash = ?
+            """,
+            (digest,),
+        )
+    fs("unlink", name)
+    with connect_sqlite(fs_impl.database) as db:
+        db.execute(
+            """
+            UPDATE blocks
+            SET cold_gc_enqueued_ns = ?
+            WHERE hash = ?
+            """,
+            (enqueued_ns, digest),
+        )
+    return digest, cold_path
 
 
 def test_fsck_reports_clean_filesystem(tmp_path):
@@ -500,6 +534,91 @@ def test_cleanup_reports_pending_deletion_unavailable(tmp_path, monkeypatch):
     assert report.pending_skipped == 1
     assert report.pending_unavailable == 1
     assert rows(fs_impl, "SELECT * FROM pending_deletions")
+
+
+def test_cleanup_keeps_recent_cold_garbage_by_default(tmp_path):
+    fs_impl = make_fs(tmp_path, inline_max_bytes=0)
+    _, cold_path = _make_cold_garbage(fs_impl, b"recent-garbage" * 64, enqueued_ns=0)
+    with connect_sqlite(fs_impl.database) as db:
+        db.execute("UPDATE blocks SET cold_gc_enqueued_ns = ?", (time_ns(),))
+
+    report = cleanup_promoted_cold_copies(
+        fs_impl.database,
+        min_age_seconds=0,
+    )
+
+    assert report.cold_garbage_candidates == 0
+    assert report.removed_cold_garbage == 0
+    assert report.remaining_cold_garbage == 1
+    assert cold_path.exists()
+    assert rows(fs_impl, "SELECT refcount FROM blocks")[0]["refcount"] == 0
+
+
+def test_cleanup_dry_run_reports_old_cold_garbage_without_deleting(tmp_path):
+    fs_impl = make_fs(tmp_path, inline_max_bytes=0)
+    _, cold_path = _make_cold_garbage(fs_impl, b"dry-run-garbage" * 64, enqueued_ns=1)
+
+    report = cleanup_promoted_cold_copies(
+        fs_impl.database,
+        min_age_seconds=0,
+        cold_gc_age_seconds=0,
+        dry_run=True,
+    )
+
+    assert report.cold_garbage_candidates == 1
+    assert report.removed_cold_garbage == 0
+    assert report.reclaimed_cold_bytes == 0
+    assert report.remaining_cold_garbage == 1
+    assert cold_path.exists()
+    assert rows(fs_impl, "SELECT refcount FROM blocks")[0]["refcount"] == 0
+
+
+def test_cleanup_removes_old_cold_garbage_with_batch_limit(tmp_path):
+    fs_impl = make_fs(tmp_path, inline_max_bytes=0)
+    first_digest, first_path = _make_cold_garbage(
+        fs_impl, b"first-cold-garbage" * 32, enqueued_ns=1
+    )
+    _, second_path = _make_cold_garbage(
+        fs_impl, b"second-cold-garbage" * 32, enqueued_ns=2
+    )
+    first_size = first_path.stat().st_size
+
+    report = cleanup_promoted_cold_copies(
+        fs_impl.database,
+        min_age_seconds=0,
+        cold_gc_age_seconds=0,
+        max_cold_deletes=1,
+    )
+
+    assert report.cold_garbage_candidates == 2
+    assert report.removed_cold_garbage == 1
+    assert report.reclaimed_cold_bytes == first_size
+    assert report.remaining_cold_garbage == 1
+    assert not first_path.exists()
+    assert second_path.exists()
+    assert first_digest not in {
+        row["hash"] for row in rows(fs_impl, "SELECT hash FROM blocks")
+    }
+
+
+def test_cleanup_keeps_cold_garbage_when_cold_tier_unavailable(tmp_path, monkeypatch):
+    fs_impl = make_fs(tmp_path, inline_max_bytes=0)
+    _, cold_path = _make_cold_garbage(
+        fs_impl, b"unavailable-cold-garbage" * 32, enqueued_ns=1
+    )
+    _make_path_stat_unavailable(monkeypatch, cold_path)
+
+    report = cleanup_promoted_cold_copies(
+        fs_impl.database,
+        min_age_seconds=0,
+        cold_gc_age_seconds=0,
+    )
+
+    assert report.cold_garbage_candidates == 1
+    assert report.removed_cold_garbage == 0
+    assert report.skipped_cold_unavailable == 1
+    assert report.remaining_cold_garbage == 1
+    assert rows(fs_impl, "SELECT refcount, cold_present FROM blocks")
 
 
 def test_schema_rejects_invalid_metadata_rows(tmp_path):

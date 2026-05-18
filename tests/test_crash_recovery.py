@@ -614,11 +614,23 @@ def test_after_commit_gc_skips_cold_pending_delete_queue(tmp_path):
 
     assert not hot_path.exists()
     assert cold_path.exists()
-    pending = rows(
+    garbage = rows(
         fs_impl,
-        "SELECT digest, tier FROM pending_deletions ORDER BY tier",
+        f"""
+        SELECT refcount, hot_present, cold_present, preferred_tier, cold_gc_enqueued_ns
+        FROM blocks
+        WHERE hash = '{digest}'
+        """,
     )
-    assert [(row["digest"], row["tier"]) for row in pending] == [(digest, 2)]
+    assert len(garbage) == 1
+    assert (
+        garbage[0]["refcount"],
+        garbage[0]["hot_present"],
+        garbage[0]["cold_present"],
+        garbage[0]["preferred_tier"],
+    ) == (0, 0, 1, 2)
+    assert garbage[0]["cold_gc_enqueued_ns"] is not None
+    assert rows(fs_impl, "SELECT * FROM pending_deletions") == []
 
 
 def test_block_store_close_skips_cold_pending_deletions(tmp_path):
@@ -641,8 +653,23 @@ def test_block_store_close_skips_cold_pending_deletions(tmp_path):
 
     assert not hot_path.exists()
     assert cold_path.exists()
-    pending = rows(fs_impl, "SELECT digest, tier FROM pending_deletions")
-    assert [(row["digest"], row["tier"]) for row in pending] == [(digest, 2)]
+    garbage = rows(
+        fs_impl,
+        f"""
+        SELECT refcount, hot_present, cold_present, preferred_tier, cold_gc_enqueued_ns
+        FROM blocks
+        WHERE hash = '{digest}'
+        """,
+    )
+    assert len(garbage) == 1
+    assert (
+        garbage[0]["refcount"],
+        garbage[0]["hot_present"],
+        garbage[0]["cold_present"],
+        garbage[0]["preferred_tier"],
+    ) == (0, 0, 1, 2)
+    assert garbage[0]["cold_gc_enqueued_ns"] is not None
+    assert rows(fs_impl, "SELECT * FROM pending_deletions") == []
 
 
 def test_pending_delete_drain_batches_queue_updates(tmp_path, monkeypatch):

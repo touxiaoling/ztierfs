@@ -290,9 +290,14 @@ def test_cli_cleanup_outputs_json(tmp_path, capsys):
     )
     output = json.loads(capsys.readouterr().out)
     assert output == {
+        "cold_garbage_candidates": 0,
+        "reclaimed_cold_bytes": 0,
+        "remaining_cold_garbage": 0,
+        "removed_cold_garbage": 0,
         "removed_cold_copies": 0,
         "removed_pending_deletions": 0,
         "pending_deletion_unavailable": 0,
         "skipped_cold_copies": 0,
+        "skipped_cold_unavailable": 0,
         "skipped_pending_deletions": 0,
     }

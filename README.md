@@ -153,10 +153,11 @@ uv run python -m ztierfs stats /tmp/ztierfs-metadata.sqlite3 --json
 
 普通写事务提交后只会按小预算清理一部分热层 `pending_deletions`，大量 unlink、truncate 或 rename overwrite 不会在返回前同步清空所有物理 GC 队列。剩余队列是可恢复状态，由后续提交或 `cleanup` 继续处理。冷层无引用块按维护对象处理：前台路径不实时删除冷层垃圾，冷层是否已有同 hash 块优先以 SQLite 记录为依据，而不是读取冷层 payload 重新判断。
 
-`cleanup` 删除已经提升到热层、并且超过保留时间的冷层副本，并完整 drain `pending_deletions`。它适合定期运行，用来把 rclone 冷层的删除操作从读路径上移走。冷层临时不可访问时会跳过对应副本并保留 `blocks.cold_present` 元数据，输出中的 `skipped_cold_copies` 表示本次未处理的冷层副本数量；待删除 payload 路径暂不可用时会保留队列项，并在 JSON 输出中通过 `pending_deletion_unavailable` 计数：
+`cleanup` 删除已经提升到热层、并且超过保留时间的冷层副本，并 drain 热层 `pending_deletions`。它还会把超过冷层 GC 保留期的 `refcount=0` cold garbage 作为显式维护对象批量删除；默认保留期是 30 天，可用 `--cold-gc-age` 调整，用 `--max-cold-deletes` 控制单次删除数量，用 `--dry-run` 先查看候选而不删除。冷层临时不可访问时会跳过对应副本或 cold garbage，并保留 SQLite 元数据，输出中的 `skipped_cold_copies`、`skipped_cold_unavailable`、`removed_cold_garbage`、`reclaimed_cold_bytes` 和 `remaining_cold_garbage` 可用于脚本诊断；待删除热层 payload 路径暂不可用时会保留队列项，并在 JSON 输出中通过 `pending_deletion_unavailable` 计数：
 
 ```bash
 uv run python -m ztierfs cleanup /tmp/ztierfs-metadata.sqlite3 --age 86400
+uv run python -m ztierfs cleanup /tmp/ztierfs-metadata.sqlite3 --cold-gc-age 2592000 --max-cold-deletes 100 --dry-run --json
 ```
 
 如果整套存储目录被手工移动，先用新的热/冷层路径挂载一次并显式传 `--update-config`，让数据库中的本机路径配置更新到新位置；之后维护命令仍只需要传 SQLite 元数据库路径。挂载命令会校验同一个数据库不能用不同热/冷层打开，除非显式传入 `--update-config`。

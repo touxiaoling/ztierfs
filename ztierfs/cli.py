@@ -17,6 +17,7 @@ from .constants import (
     CHUNK_SIZE,
     DEFAULT_COMPRESSION_MIN_BYTES,
     DEFAULT_COLD_COPY_CLEANUP_AGE_SECONDS,
+    DEFAULT_COLD_GC_AGE_SECONDS,
     DEFAULT_FUSE_METADATA_CACHE_SECONDS,
     DEFAULT_FUSE_IOSIZE,
     DEFAULT_HOT_CACHE_MAX_BYTES,
@@ -234,6 +235,23 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_COLD_COPY_CLEANUP_AGE_SECONDS,
         help="只删除已保留至少这么多秒的冷层副本",
     )
+    cleanup.add_argument(
+        "--cold-gc-age",
+        type=int,
+        default=DEFAULT_COLD_GC_AGE_SECONDS,
+        help="只删除进入 cold garbage 至少这么多秒的无引用冷层块，默认 30 天",
+    )
+    cleanup.add_argument(
+        "--max-cold-deletes",
+        type=_parse_nonnegative_int,
+        default=None,
+        help="本次最多删除多少个 cold garbage 块；默认不限",
+    )
+    cleanup.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只报告会清理的 cold garbage，不删除块文件或元数据",
+    )
     cleanup.add_argument("--json", action="store_true", help="以 JSON 输出")
     cleanup.set_defaults(handler=_run_cleanup_command)
     return parser
@@ -369,10 +387,18 @@ def _run_stats_command(args: argparse.Namespace) -> None:
 
 def _run_cleanup_command(args: argparse.Namespace) -> None:
     """调用 ``cleanup_promoted_cold_copies``，按 ``--age`` 等条件删除过期的冷层残留副本并汇报数量。"""
-    logger.info("开始清理已提升块遗留的冷层副本：min_age_seconds={}", args.age)
+    logger.info(
+        "开始清理已提升块遗留的冷层副本：min_age_seconds={}，cold_gc_age_seconds={}，dry_run={}",
+        args.age,
+        args.cold_gc_age,
+        args.dry_run,
+    )
     report = cleanup_promoted_cold_copies(
         args.database,
         min_age_seconds=args.age,
+        cold_gc_age_seconds=args.cold_gc_age,
+        max_cold_deletes=args.max_cold_deletes,
+        dry_run=args.dry_run,
     )
     _emit_report(
         report,
@@ -412,6 +438,11 @@ def _cleanup_report_to_dict(report) -> dict[str, int]:
         "removed_pending_deletions": report.pending_removed,
         "skipped_pending_deletions": report.pending_skipped,
         "pending_deletion_unavailable": report.pending_unavailable,
+        "cold_garbage_candidates": report.cold_garbage_candidates,
+        "removed_cold_garbage": report.removed_cold_garbage,
+        "skipped_cold_unavailable": report.skipped_cold_unavailable,
+        "reclaimed_cold_bytes": report.reclaimed_cold_bytes,
+        "remaining_cold_garbage": report.remaining_cold_garbage,
     }
 
 
@@ -420,7 +451,12 @@ def _cleanup_report_to_text(report) -> str:
     return (
         f"cleanup: removed {report.removed} promoted cold copy/copies, "
         f"skipped {report.skipped}, removed {report.pending_removed} pending deletion(s), "
-        f"skipped {report.pending_skipped}, unavailable {report.pending_unavailable}"
+        f"skipped {report.pending_skipped}, unavailable {report.pending_unavailable}, "
+        f"cold garbage candidates {report.cold_garbage_candidates}, "
+        f"removed {report.removed_cold_garbage}, "
+        f"skipped unavailable {report.skipped_cold_unavailable}, "
+        f"reclaimed cold bytes {report.reclaimed_cold_bytes}, "
+        f"remaining cold garbage {report.remaining_cold_garbage}"
     )
 
 

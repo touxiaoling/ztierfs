@@ -49,6 +49,9 @@ DEFAULT_MIN_HOT_AGE_SECONDS = 24 * 60 * 60
 DEFAULT_COLD_COPY_CLEANUP_AGE_SECONDS = 0
 """copy-up 后冗余冷层副本按龄清理的窗口（秒）；≤0 时关闭该清理路径。"""
 
+DEFAULT_COLD_GC_AGE_SECONDS = 30 * 24 * 60 * 60
+"""无引用冷层块进入 cold garbage 后的默认保留窗口（秒），默认 30 天。"""
+
 # --- 已知已压缩/媒体类后缀：跳过 zstd 尝试 ---
 COMPRESSED_SUFFIXES = frozenset(
     {
