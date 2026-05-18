@@ -339,9 +339,8 @@ class InodeFuseMixin(InodeOperations, FileSystemMixinBase):
                 node = self._file_node_from_ino_or_fh(ino, fh)
                 self._require_access(node, os.W_OK)
                 path = self._name_for_inode(node)
-                prepared = self.file_content.prepare_write_file(
-                    node, path, data, offset
-                )
+                plan = self.file_content.plan_write_file(node, path, data, offset)
+            prepared = self.file_content.prepare_file_write(plan)
             with self.metadata.transaction():
                 written = self.file_content.commit_prepared_write(prepared)
         if self.block_store.take_demotion_request():

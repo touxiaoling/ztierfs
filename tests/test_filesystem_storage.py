@@ -104,6 +104,30 @@ def test_ztierfs_batches_duplicate_prepared_chunks_within_one_write(
     assert inserted_batch_sizes == [1]
 
 
+def test_ztierfs_prepares_partial_overwrite_after_read_transaction(
+    tmp_path, monkeypatch
+):
+    fs_impl = make_fs(tmp_path, inline_max_bytes=0)
+    data = b"a" * fs_impl.chunk_size
+    original_read_block_snapshot = fs_impl.block_store.read_block_snapshot
+
+    def observed_read_block_snapshot(row, expected_size):
+        assert not getattr(fs_impl.metadata._local, "transaction_read_only", False)
+        return original_read_block_snapshot(row, expected_size)
+
+    monkeypatch.setattr(
+        fs_impl.block_store, "read_block_snapshot", observed_read_block_snapshot
+    )
+
+    with adapted(fs_impl) as fs:
+        fh = fs("create", "/partial.txt", 0o644)
+        fs("write", "/partial.txt", data, 0, fh)
+        fs("write", "/partial.txt", b"Z", 10, fh)
+        assert (
+            fs("read", "/partial.txt", len(data), 0, fh) == data[:10] + b"Z" + data[11:]
+        )
+
+
 def test_ztierfs_clonefile_copies_metadata_without_reprocessing_blocks(
     tmp_path, monkeypatch
 ):

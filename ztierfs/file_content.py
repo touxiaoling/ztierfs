@@ -53,6 +53,33 @@ class PreparedFileWrite:
     chunks: list[tuple[int, PreparedBlock]]
 
 
+@dataclass(frozen=True)
+class FileWriteChunkPlan:
+    """One touched chunk for a write plan, with old metadata captured in read transaction."""
+
+    chunk_index: int
+    chunk_len: int
+    existing_len: int
+    write_start: int
+    write_stop: int
+    source_start: int
+    row: Any | None
+
+
+@dataclass(frozen=True)
+class FileWritePlan:
+    """Transaction-light write plan; payload reads and block preparation happen later."""
+
+    file_id: int
+    path: str
+    bytes_written: int
+    old_size: int
+    new_size: int
+    compress: bool
+    data: bytes
+    chunks: list[FileWriteChunkPlan]
+
+
 class FileContentService:
     """在 ``file_chunks``、块引用计数与 ``BlockStore`` 之间编排普通文件的字节读写。
 
@@ -181,49 +208,49 @@ class FileContentService:
     def write_file(self, node, path: str, data: bytes, offset: int) -> int:
         """``prepare_write_file`` 后 ``commit_prepared_write``；返回本次写入字节数。"""
         return self.commit_prepared_write(
-            self.prepare_write_file(node, path, data, offset)
+            self.prepare_file_write(self.plan_write_file(node, path, data, offset))
         )
 
     def prepare_write_file(
         self, node, path: str, data: bytes, offset: int
     ) -> PreparedFileWrite:
-        """计算写入后的 ``PreparedFileWrite``：小文件可仍保持内联；否则合并旧内联/已存在 chunk 与覆盖数据，再 ``prepare_blocks``。
+        """Compatibility wrapper for callers that do not need a split write plan."""
+        return self.prepare_file_write(self.plan_write_file(node, path, data, offset))
 
-        稀疏扩展会先读出逻辑零再写入；尾块与跨 chunk 覆盖已展开为完整 chunk 字节再寻址写块。
+    def plan_write_file(
+        self, node, path: str, data: bytes, offset: int
+    ) -> FileWritePlan:
+        """Plan a write using only metadata already available in the current transaction.
+
+        The returned plan captures touched chunk metadata. Existing payload reads,
+        sparse zero filling, hashing, compression, and block file preparation are left
+        to ``prepare_file_write`` outside the read transaction.
         """
         if offset < 0:
             raise FuseOSError(errno.EINVAL)
+        old_size = node["size"]
         if not data:
-            return PreparedFileWrite(node["id"], 0, node["size"], [])
+            return FileWritePlan(
+                node["id"], path, 0, old_size, old_size, False, b"", []
+            )
         if node["kind"] != "file":
             raise FuseOSError(errno.EISDIR)
 
-        old_size = node["size"]
         new_size = max(old_size, offset + len(data))
-        compress = self.compression_allowed(path)
         logger.debug(
-            "准备写入文件内容：inode={}，path={}，old_size={}，new_size={}，bytes={}，compress={}",
+            "规划写入文件内容：inode={}，path={}，old_size={}，new_size={}，bytes={}",
             node["id"],
             path,
             old_size,
             new_size,
             len(data),
-            compress,
         )
-        data_pos = 0
         first_chunk = offset // self.chunk_size
         last_chunk = (offset + len(data) - 1) // self.chunk_size
+        block_rows = self.metadata.chunk_blocks(node["id"], first_chunk, last_chunk)
+        chunks: list[FileWriteChunkPlan] = []
+        data_pos = 0
 
-        if old_size == 0 and offset == 0 and first_chunk == last_chunk:
-            return PreparedFileWrite(
-                node["id"],
-                len(data),
-                new_size,
-                self.block_store.prepare_blocks([(first_chunk, data)], compress),
-            )
-
-        pending_chunks: list[tuple[int, bytes]] = []
-        pending_chunk_indexes: set[int] = set()
         for chunk_index in range(first_chunk, last_chunk + 1):
             chunk_start = chunk_index * self.chunk_size
             chunk_end = min(chunk_start + self.chunk_size, new_size)
@@ -233,31 +260,68 @@ class FileContentService:
             write_start = max(offset - chunk_start, 0)
             write_stop = min(offset + len(data) - chunk_start, chunk_len)
             take = write_stop - write_start
-            source = data[data_pos : data_pos + take]
+            source_start = data_pos
             data_pos += take
-            if write_start == 0 and take == chunk_len:
-                pending_chunks.append((chunk_index, source))
-                pending_chunk_indexes.add(chunk_index)
-                continue
-            chunk = bytearray(self.read_chunk(node["id"], chunk_index, existing_len))
-            if len(chunk) < chunk_len:
-                chunk.extend(b"\x00" * (chunk_len - len(chunk)))
-            chunk[write_start:write_stop] = source
-            pending_chunks.append((chunk_index, bytes(chunk)))
-            pending_chunk_indexes.add(chunk_index)
+            chunks.append(
+                FileWriteChunkPlan(
+                    chunk_index=chunk_index,
+                    chunk_len=chunk_len,
+                    existing_len=existing_len,
+                    write_start=write_start,
+                    write_stop=write_stop,
+                    source_start=source_start,
+                    row=block_rows.get(chunk_index),
+                )
+            )
 
+        return FileWritePlan(
+            file_id=node["id"],
+            path=path,
+            bytes_written=len(data),
+            old_size=old_size,
+            new_size=new_size,
+            compress=self.compression_allowed(path),
+            data=data,
+            chunks=chunks,
+        )
+
+    def prepare_file_write(self, plan: FileWritePlan) -> PreparedFileWrite:
+        """Read old payloads and prepare content-addressed blocks outside metadata transactions."""
+        if plan.bytes_written == 0:
+            return PreparedFileWrite(plan.file_id, 0, plan.new_size, [])
+        logger.debug(
+            "准备写入文件内容：inode={}，path={}，old_size={}，new_size={}，bytes={}，compress={}",
+            plan.file_id,
+            plan.path,
+            plan.old_size,
+            plan.new_size,
+            plan.bytes_written,
+            plan.compress,
+        )
+        pending_chunks: list[tuple[int, bytes]] = []
+        for chunk in plan.chunks:
+            take = chunk.write_stop - chunk.write_start
+            source = plan.data[chunk.source_start : chunk.source_start + take]
+            if chunk.write_start == 0 and take == chunk.chunk_len:
+                pending_chunks.append((chunk.chunk_index, source))
+                continue
+            old_chunk = bytearray(self.read_planned_chunk(chunk))
+            if len(old_chunk) < chunk.chunk_len:
+                old_chunk.extend(b"\x00" * (chunk.chunk_len - len(old_chunk)))
+            old_chunk[chunk.write_start : chunk.write_stop] = source
+            pending_chunks.append((chunk.chunk_index, bytes(old_chunk)))
         logger.debug(
             "写入文件内容分块完成：inode={}，first_chunk={}，last_chunk={}，pending_chunks={}",
-            node["id"],
-            first_chunk,
-            last_chunk,
+            plan.file_id,
+            plan.chunks[0].chunk_index,
+            plan.chunks[-1].chunk_index,
             len(pending_chunks),
         )
         return PreparedFileWrite(
-            node["id"],
-            len(data),
-            new_size,
-            self.block_store.prepare_blocks(pending_chunks, compress),
+            plan.file_id,
+            plan.bytes_written,
+            plan.new_size,
+            self.block_store.prepare_blocks(pending_chunks, plan.compress),
         )
 
     def commit_prepared_write(self, write: PreparedFileWrite) -> int:
@@ -324,6 +388,22 @@ class FileContentService:
             )
             return b"\x00" * expected_size
         data, _access = self.block_store.read_block_snapshot(row, expected_size)
+        return data
+
+    def read_planned_chunk(self, chunk: FileWriteChunkPlan) -> bytes:
+        """Read a chunk row captured by ``plan_write_file``; missing rows are sparse zeroes."""
+        if chunk.existing_len <= 0:
+            return b""
+        if chunk.row is None:
+            logger.debug(
+                "读取计划中的稀疏 chunk：chunk={}，expected_size={}",
+                chunk.chunk_index,
+                chunk.existing_len,
+            )
+            return b"\x00" * chunk.existing_len
+        data, _access = self.block_store.read_block_snapshot(
+            chunk.row, chunk.existing_len
+        )
         return data
 
     def set_chunk(
