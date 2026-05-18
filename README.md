@@ -15,7 +15,7 @@
 - 当 zstd 压缩结果更小时，压缩对应块。
 - 将处理后 payload 不超过阈值的小块直接内联到 SQLite，避免为小文件创建大量块文件。
 - 对常见已压缩后缀跳过压缩，例如 `.jpg`、`.png`、`.zip`、`.zst`、`.mp4` 和 `.pdf`。
-- 面向“本机热层 + rclone 挂载网盘冷层”的分层策略：热层使用高/低水位，文件开头块优先留热，冷读提升使用 copy-up 并延迟清理冷层副本。
+- 面向“本机热层 + rclone 挂载网盘冷层”的分层策略：热层使用高/低水位，文件开头块优先留热，冷读提升使用 copy-up，并把冷层视为昂贵但持久的层，尽量减少冷层探测、读取、写入和删除。
 - 保留重要的打开文件语义，例如 rename 或 unlink 后仍可通过既有句柄读取原文件。
 - 支持符号链接、普通文件硬链接、macOS `clonefile`、扩展属性、基于 mode/uid/gid 的权限检查，以及进程内 POSIX advisory 文件锁。
 
@@ -37,7 +37,7 @@
 - macOS（Apple Silicon 或 Intel 均可），且已安装 [macFUSE](https://macfuse.github.io/)。Linux/FUSE3 不在支持范围内。
 - Python `>=3.14`
 - `uv`
-- 冷层可以是本地目录，也可以是使用 rclone 挂载到本地路径的网盘（推荐 `--vfs-cache-mode full` 等配置）；ztierfs 只把冷层当作普通本地目录读写，不直接调用 rclone 接口。
+- 冷层可以是本地目录，也可以是使用 rclone 挂载到本地路径的网盘（推荐 `--vfs-cache-mode full` 等配置）；ztierfs 不直接调用 rclone 接口，但设计上把冷层视为高延迟、高抖动、带本地缓存窗口的昂贵层，而不是普通低成本目录。
 
 ### 安装 macFUSE
 
@@ -106,6 +106,8 @@ uv run python -m ztierfs mount /tmp/ztierfs-hot /tmp/ztierfs-cold /tmp/ztierfs-m
 - `--readahead-blocks`：检测到顺序读取时后台预读的后续块数，默认 `1`；设为 `0` 禁用。
 - `--readahead-workers`：后台预读线程数，默认 `1`；设为 `0` 同样禁用预读。
 
+底层块文件的字节缓存由上级文件系统和系统缓存负责，例如热层 APFS 的文件缓存，以及冷层 rclone VFS cache、本地缓存目录和 macOS 统一缓存。ztierfs 自己的 `--read-cache` 只缓存解码后的逻辑块，用来减少重复解压和短时间重复读的开销；它不是数据正确性机制，也不是冷层长期缓存。不要把它当成 rclone 或 APFS 缓存的替代品。
+
 读目录、读符号链接和读文件只会延迟合并 inode atime 与块访问统计；达到阈值、后续写事务、`flush`/`fsync`/关闭文件系统或显式维护提交时再落库。这样目录扫描和小读不会为每次访问都打开 SQLite 写事务。
 
 FUSE/内核交互：
@@ -128,13 +130,15 @@ FUSE/内核交互：
 
 ## 维护命令
 
-`fsck` 检查 SQLite 元数据与块文件的一致性。维护命令的首选入口是 SQLite 元数据文件；数据库会记录热层、冷层的绝对路径，因此在线和离线维护都只需要传一个路径。默认只报告问题；加上 `--repair` 后，会执行确定安全的修复，例如重算块引用计数、修正错误层级、删除无引用块记录和孤儿块文件。被引用但缺失或损坏的块不会被伪造修复，只会报告错误。冷层使用 rclone 挂载时，如果检查期间冷层或某个块临时不可访问，维护命令会报告 `cold_tier_unavailable` 或 `block_payload_unavailable`，并跳过依赖这次冷层观察的修复，不会把它当作缺失或损坏处理：
+`fsck` 检查 SQLite 元数据与块文件的一致性。维护命令的首选入口是 SQLite 元数据文件；数据库会记录热层、冷层的绝对路径，因此在线和离线维护都只需要传一个路径。默认只报告问题；加上 `--repair` 后，会执行确定安全的修复，例如重算块引用计数、修正错误层级、删除无引用块记录和孤儿块文件。被引用但缺失或损坏的块不会被伪造修复，只会报告错误。冷层使用 rclone 挂载时，如果检查期间冷层或某个块临时不可访问，维护命令会报告 `cold_tier_unavailable` 或 `block_payload_unavailable`，并跳过依赖这次冷层观察的修复，不会把它当作缺失或损坏处理。
+
+ztierfs 的默认可靠性假设是：只要块文件已经通过原子写入、`fsync` 和元数据提交成功落盘，后续字节保持正确应由下层文件系统、磁盘、rclone/VFS cache 或网盘服务负责。ztierfs 主要负责自己的写入顺序、SQLite 元数据、引用计数、冷热层 presence 和崩溃后可诊断状态。块文件可能丢失或暂时不可访问，这是 ztierfs 要报告的状态；持续 bit-rot 或底层静默损坏不进入普通读写热路径的默认假设。
 
 ```bash
 uv run python -m ztierfs fsck /tmp/ztierfs-metadata.sqlite3
 ```
 
-`scrub` 在 `fsck` 的基础上读取并校验 SQLite 内联 payload 和热层块 payload，能发现压缩数据损坏、存储大小不匹配和解码后大小异常。默认不会读取冷层块 payload，因此适合作为远程冷层场景的常规维护命令；需要明确诊断冷层内容时加 `--include-cold`，这可能读取或下载完整冷层数据。只有已经读到 payload 后解码或大小不匹配才会报告损坏；rclone 下载失败这类读取错误会报告为暂时不可用：
+`scrub` 在 `fsck` 的基础上读取并校验 SQLite 内联 payload 和热层块 payload，能发现压缩数据损坏、存储大小不匹配和解码后大小异常。默认不会读取冷层块 payload，因此适合作为远程冷层场景的常规维护命令；需要明确诊断冷层内容时加 `--include-cold`，这可能读取或下载完整冷层数据。只有已经读到 payload 后解码或大小不匹配才会报告损坏；rclone 下载失败这类读取错误会报告为暂时不可用。默认维护策略不把冷层内容校验作为常规任务，避免为了低概率损坏检查而持续消耗网盘缓存和远端带宽：
 
 ```bash
 uv run python -m ztierfs scrub /tmp/ztierfs-metadata.sqlite3
@@ -147,7 +151,7 @@ uv run python -m ztierfs scrub /tmp/ztierfs-metadata.sqlite3 --include-cold
 uv run python -m ztierfs stats /tmp/ztierfs-metadata.sqlite3 --json
 ```
 
-普通写事务提交后只会按小预算清理一部分 `pending_deletions`，大量 unlink、truncate 或 rename overwrite 不会在返回前同步清空所有物理 GC 队列。剩余队列是可恢复状态，由后续提交、关闭文件系统或 `cleanup` 继续处理。
+普通写事务提交后只会按小预算清理一部分 `pending_deletions`，大量 unlink、truncate 或 rename overwrite 不会在返回前同步清空所有物理 GC 队列。剩余队列是可恢复状态，由后续提交、关闭文件系统或 `cleanup` 继续处理。后续面向网盘冷层的设计会进一步把冷层无引用块视为按龄维护对象：前台路径不实时删除冷层垃圾，冷层是否已有同 hash 块优先以 SQLite 记录为依据，而不是读取冷层 payload 重新判断。
 
 `cleanup` 删除已经提升到热层、并且超过保留时间的冷层副本，并完整 drain `pending_deletions`。它适合定期运行，用来把 rclone 冷层的删除操作从读路径上移走。冷层临时不可访问时会跳过对应副本并保留 `blocks.cold_present` 元数据，输出中的 `skipped_cold_copies` 表示本次未处理的冷层副本数量；待删除 payload 路径暂不可用时会保留队列项，并在 JSON 输出中通过 `pending_deletion_unavailable` 计数：
 
