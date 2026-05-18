@@ -222,7 +222,7 @@ class ZTierFS(
         )
 
         def drain_pending_deletions() -> None:
-            self.block_store.drain_pending_deletions()
+            self.block_store.drain_pending_deletions(max_deletions=64)
 
         self.metadata.add_after_commit_hook(drain_pending_deletions)
         self.file_content = FileContentService(

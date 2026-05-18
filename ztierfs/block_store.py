@@ -606,14 +606,27 @@ class BlockStore:
                     candidate_tier,
                 )
 
-    def drain_pending_deletions(self, *, limit: int = 256) -> int:
-        """Delete queued physical payloads after their metadata transaction has committed."""
+    def drain_pending_deletions(
+        self, *, batch_size: int = 256, max_deletions: int | None = None
+    ) -> int:
+        """Delete queued physical payloads after their metadata transaction has committed.
+
+        ``max_deletions`` limits the number of queue rows processed by a latency-sensitive
+        caller such as an after-commit hook. ``None`` keeps draining until the queue is
+        empty or the next batch cannot make progress.
+        """
         removed = 0
         while True:
+            if max_deletions is not None and removed >= max_deletions:
+                return removed
+            limit = batch_size
+            if max_deletions is not None:
+                limit = min(limit, max_deletions - removed)
             with self.metadata.read_transaction():
                 rows = self.metadata.pending_deletions(limit)
             if not rows:
                 return removed
+            removed_before_batch = removed
             for row in rows:
                 now = time_ns()
                 try:
@@ -643,6 +656,8 @@ class BlockStore:
                     logger.debug(
                         "待 GC payload 已清理：id={}，kind={}", row["id"], row["kind"]
                     )
+            if max_deletions is None and removed == removed_before_batch:
+                return removed
 
     def copy_block(self, digest: str, source_tier: int, target_tier: int) -> None:
         """跨层 **原子复制**：``shutil.copyfile`` 至临时文件、读 ``fsync``、``replace`` 落位、目录 ``fsync``。

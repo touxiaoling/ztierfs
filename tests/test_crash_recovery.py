@@ -571,3 +571,25 @@ def test_last_unlink_commit_queues_block_delete_for_cleanup(tmp_path, monkeypatc
     assert report.pending_removed == 1
     assert not path.exists()
     assert rows(fs_impl, "SELECT * FROM pending_deletions") == []
+
+
+def test_after_commit_gc_leaves_large_pending_delete_queue_for_cleanup(tmp_path):
+    fs_impl = make_fs(tmp_path, inline_max_bytes=0, chunk_size=1024)
+    data = b"".join(bytes([index]) * 1024 for index in range(70))
+    fs = OperationsAdapter(fs_impl)
+
+    fh = fs("create", "/large.bin", 0o644)
+    fs("write", "/large.bin", data, 0, fh)
+    fs("release", "/large.bin", fh)
+    fs("unlink", "/large.bin")
+
+    pending = rows(fs_impl, "SELECT * FROM pending_deletions")
+    assert len(pending) == 6
+
+    report = cleanup_promoted_cold_copies(
+        fs_impl.database,
+        min_age_seconds=0,
+    )
+
+    assert report.pending_removed == 6
+    assert rows(fs_impl, "SELECT * FROM pending_deletions") == []
