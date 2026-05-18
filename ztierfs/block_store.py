@@ -697,9 +697,9 @@ class BlockStore:
                 rows = self.metadata.pending_deletions(limit)
             if not rows:
                 return removed
-            removed_before_batch = removed
+            removed_ids: list[int] = []
+            deferred_ids: list[int] = []
             for row in rows:
-                now = time_ns()
                 try:
                     if row["kind"] == "block_file":
                         deleted_or_missing = not unlink_path(
@@ -712,22 +712,24 @@ class BlockStore:
                         str(row["digest"])[:12],
                         row["tier"],
                     )
-                    with self.metadata.transaction():
-                        self.metadata.defer_pending_deletion(row["id"], now)
+                    deferred_ids.append(row["id"])
                     continue
                 except OSError:
                     logger.exception("待 GC payload 删除失败：id={}", row["id"])
-                    with self.metadata.transaction():
-                        self.metadata.defer_pending_deletion(row["id"], now)
+                    deferred_ids.append(row["id"])
                     continue
-                with self.metadata.transaction():
-                    self.metadata.remove_pending_deletion(row["id"])
-                removed += 1
+                removed_ids.append(row["id"])
                 if deleted_or_missing:
                     logger.debug(
                         "待 GC payload 已清理：id={}，kind={}", row["id"], row["kind"]
                     )
-            if max_deletions is None and removed == removed_before_batch:
+            if removed_ids or deferred_ids:
+                now = time_ns()
+                with self.metadata.transaction():
+                    self.metadata.remove_pending_deletions(removed_ids)
+                    self.metadata.defer_pending_deletions(deferred_ids, now)
+                removed += len(removed_ids)
+            if max_deletions is None and not removed_ids and not deferred_ids:
                 return removed
 
     def copy_block(self, digest: str, source_tier: int, target_tier: int) -> None:

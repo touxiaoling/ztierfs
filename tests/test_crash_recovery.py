@@ -593,3 +593,34 @@ def test_after_commit_gc_leaves_large_pending_delete_queue_for_cleanup(tmp_path)
 
     assert report.pending_removed == 6
     assert rows(fs_impl, "SELECT * FROM pending_deletions") == []
+
+
+def test_pending_delete_drain_batches_queue_updates(tmp_path, monkeypatch):
+    fs_impl = make_fs(tmp_path, inline_max_bytes=0, chunk_size=1024)
+    data = b"".join(bytes([index]) * 1024 for index in range(3))
+    fs_impl.metadata._after_commit_hooks.clear()
+
+    fs = OperationsAdapter(fs_impl)
+    fh = fs("create", "/large.bin", 0o644)
+    fs("write", "/large.bin", data, 0, fh)
+    fs("release", "/large.bin", fh)
+    fs("unlink", "/large.bin")
+
+    pending = rows(fs_impl, "SELECT * FROM pending_deletions")
+    assert len(pending) == 3
+    block_path(fs_impl.tier1, fs_impl.tier2, pending[0]["digest"], 1).unlink()
+
+    write_transactions = 0
+    original_transaction = fs_impl.metadata.transaction
+
+    def observed_transaction():
+        nonlocal write_transactions
+        write_transactions += 1
+        return original_transaction()
+
+    monkeypatch.setattr(fs_impl.metadata, "transaction", observed_transaction)
+
+    assert fs_impl.block_store.drain_pending_deletions(batch_size=3) == 3
+
+    assert write_transactions == 1
+    assert rows(fs_impl, "SELECT * FROM pending_deletions") == []

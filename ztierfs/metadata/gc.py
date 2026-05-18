@@ -47,9 +47,27 @@ class GarbageCollectionMixin(MetadataMixinBase):
             (deletion_id,),
         )
 
+    def remove_pending_deletions(self, deletion_ids: list[int]) -> None:
+        """Remove queue items after their physical deletes have succeeded or are unnecessary."""
+        if not deletion_ids:
+            return
+        self._db.executemany(
+            "DELETE FROM pending_deletions WHERE id = ?",
+            [(deletion_id,) for deletion_id in deletion_ids],
+        )
+
     def defer_pending_deletion(self, deletion_id: int, now: int) -> None:
         """Keep a failed queue item and refresh its timestamp for later retry."""
         self._db.execute(
             "UPDATE pending_deletions SET enqueued_ns = ? WHERE id = ?",
             (now, deletion_id),
+        )
+
+    def defer_pending_deletions(self, deletion_ids: list[int], now: int) -> None:
+        """Refresh failed queue items for later retry."""
+        if not deletion_ids:
+            return
+        self._db.executemany(
+            "UPDATE pending_deletions SET enqueued_ns = ? WHERE id = ?",
+            [(now, deletion_id) for deletion_id in deletion_ids],
         )
