@@ -561,8 +561,8 @@ def test_cleanup_reports_pending_deletion_unavailable(tmp_path, monkeypatch):
     with connect_sqlite(fs_impl.database) as db:
         db.execute(
             """
-            INSERT INTO pending_deletions (kind, digest, tier, enqueued_ns)
-            VALUES ('block_file', ?, 1, ?)
+            INSERT INTO pending_deletions (digest, tier, enqueued_ns)
+            VALUES (?, 1, ?)
             """,
             (digest, time_ns()),
         )

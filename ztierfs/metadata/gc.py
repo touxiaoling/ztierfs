@@ -22,8 +22,8 @@ class GarbageCollectionMixin(MetadataMixinBase):
         self._db.execute(
             """
             INSERT OR IGNORE INTO pending_deletions
-                (kind, digest, tier, enqueued_ns)
-            VALUES ('block_file', ?, ?, ?)
+                (digest, tier, enqueued_ns)
+            VALUES (?, ?, ?)
             """,
             (digest, tier, now),
         )
@@ -32,14 +32,13 @@ class GarbageCollectionMixin(MetadataMixinBase):
         self, limit: int = 256, *, tier: int | None = None
     ) -> list[sqlite3.Row]:
         """Return queued physical deletions in FIFO order."""
-        tier_filter = "" if tier is None else "AND tier = ?"
+        tier_filter = "" if tier is None else "WHERE tier = ?"
         params = (limit,) if tier is None else (tier, limit)
         return self._db.execute(
             f"""
-            SELECT id, kind, digest, tier, enqueued_ns
+            SELECT id, digest, tier, enqueued_ns
             FROM pending_deletions
-            WHERE kind = 'block_file'
-              {tier_filter}
+            {tier_filter}
             ORDER BY id
             LIMIT ?
             """,

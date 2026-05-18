@@ -560,10 +560,8 @@ def test_last_unlink_commit_queues_block_delete_for_cleanup(tmp_path, monkeypatc
 
     path = block_path(fs_impl.tier1, fs_impl.tier2, digest, 1)
     assert path.exists()
-    pending = rows(fs_impl, "SELECT kind, digest, tier FROM pending_deletions")
-    assert [(row["kind"], row["digest"], row["tier"]) for row in pending] == [
-        ("block_file", digest, 1)
-    ]
+    pending = rows(fs_impl, "SELECT digest, tier FROM pending_deletions")
+    assert [(row["digest"], row["tier"]) for row in pending] == [(digest, 1)]
 
     report = cleanup_promoted_cold_copies(
         fs_impl.database,

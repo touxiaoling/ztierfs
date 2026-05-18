@@ -23,7 +23,7 @@ from time import time_ns
 
 from .base import MetadataMixinBase
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 CONFIG_VERSION = 1
 
 FILESYSTEM_CONFIG_SELECT = """
@@ -234,19 +234,16 @@ class SchemaMixin(MetadataMixinBase):
             """
             CREATE TABLE IF NOT EXISTS pending_deletions (
                 id INTEGER PRIMARY KEY,
-                kind TEXT NOT NULL CHECK (kind = 'block_file'),
                 digest TEXT NOT NULL,
                 tier INTEGER NOT NULL CHECK (tier IN (1, 2)),
-                enqueued_ns INTEGER NOT NULL,
-                CHECK (kind = 'block_file')
+                enqueued_ns INTEGER NOT NULL
             )
             """
         )
         self._db.execute(
             """
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_deletions_block_file
-            ON pending_deletions(kind, digest, tier)
-            WHERE kind = 'block_file'
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_deletions_digest_tier
+            ON pending_deletions(digest, tier)
             """
         )
 

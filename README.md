@@ -193,6 +193,7 @@ SQLite 表：
 - `blocks`：块元数据、首选层级、冷热层 presence、压缩状态、大小、引用计数、访问时间、读取频率和迁移时间。
 - `block_payloads`：inline 块的 payload，直接存入 SQLite。
 - `file_chunks`：从 `file_id`（文件 inode）+ `chunk_index` 到块 `hash` 和 `size` 的映射。
+- `pending_deletions`：等待提交后或维护命令继续物理删除的 tiered 块文件队列，按 `digest` 和 `tier` 去重。
 - `filesystem_config`：记录热层和冷层的绝对路径，便于维护命令只凭数据库定位整套存储。
 
 所有非空普通文件内容都通过 `file_chunks -> blocks` 表达；小文件也会建立 chunk 映射，只是目标块可为 `inline`。块记录有两种存储形态：`inline` 块的 payload 直接关联到 `block_payloads`，不参与冷层降级，且 `preferred_tier = 0`、`hot_present = 0`、`cold_present = 0`；`tiered` 块的文件路径由 SHA-256 digest 派生，按 `aa/bb/<sha256>` 分桶保存在热层或冷层，冷热副本 presence 直接记录在 `blocks.hot_present` 和 `blocks.cold_present`。`block_records` view 会把块元数据和 inline payload 聚合成维护工具使用的统一视图。

@@ -188,7 +188,7 @@ def _drain_pending_deletions(
     try:
         rows = db.execute(
             f"""
-            SELECT id, kind, digest, tier
+            SELECT id, digest, tier
             FROM pending_deletions
             {tier_filter}
             ORDER BY id
