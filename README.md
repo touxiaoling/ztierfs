@@ -145,13 +145,13 @@ uv run python -m ztierfs scrub /tmp/ztierfs-metadata.sqlite3
 uv run python -m ztierfs scrub /tmp/ztierfs-metadata.sqlite3 --include-cold
 ```
 
-`stats` 输出 inode、目录项、chunk、块分布、存储占用和维护队列摘要。块统计会区分热层、冷层以及冷热两层都有副本的块；`maintenance.pending_deletions` 显示仍等待物理清理的 payload 队列数量。维护命令都支持 `--json`，方便脚本消费：
+`stats` 输出 inode、目录项、chunk、块分布、存储占用和维护队列摘要。块统计会区分热层、冷层以及冷热两层都有副本的块；冷层可以是 rclone 或其它网盘本地挂载，`blocks.cold_present` 是 ztierfs 正常路径使用的权威 presence 索引，不表示每次统计或迁移都实时探测远端 payload。`maintenance.pending_deletions` 显示仍等待物理清理的 payload 队列数量，`cold_garbage`、`cold_garbage_bytes` 和 `oldest_cold_garbage_ns` 用于观察可复用但可清理的冷层无引用块。维护命令都支持 `--json`，方便脚本消费：
 
 ```bash
 uv run python -m ztierfs stats /tmp/ztierfs-metadata.sqlite3 --json
 ```
 
-普通写事务提交后只会按小预算清理一部分 `pending_deletions`，大量 unlink、truncate 或 rename overwrite 不会在返回前同步清空所有物理 GC 队列。剩余队列是可恢复状态，由后续提交、关闭文件系统或 `cleanup` 继续处理。后续面向网盘冷层的设计会进一步把冷层无引用块视为按龄维护对象：前台路径不实时删除冷层垃圾，冷层是否已有同 hash 块优先以 SQLite 记录为依据，而不是读取冷层 payload 重新判断。
+普通写事务提交后只会按小预算清理一部分热层 `pending_deletions`，大量 unlink、truncate 或 rename overwrite 不会在返回前同步清空所有物理 GC 队列。剩余队列是可恢复状态，由后续提交或 `cleanup` 继续处理。冷层无引用块按维护对象处理：前台路径不实时删除冷层垃圾，冷层是否已有同 hash 块优先以 SQLite 记录为依据，而不是读取冷层 payload 重新判断。
 
 `cleanup` 删除已经提升到热层、并且超过保留时间的冷层副本，并完整 drain `pending_deletions`。它适合定期运行，用来把 rclone 冷层的删除操作从读路径上移走。冷层临时不可访问时会跳过对应副本并保留 `blocks.cold_present` 元数据，输出中的 `skipped_cold_copies` 表示本次未处理的冷层副本数量；待删除 payload 路径暂不可用时会保留队列项，并在 JSON 输出中通过 `pending_deletion_unavailable` 计数：
 

@@ -93,6 +93,16 @@ def collect_stats(
                   AND cold_present = 1
                 """,
             ),
+            "cold_garbage": scalar(
+                db,
+                """
+                SELECT COUNT(*)
+                FROM blocks
+                WHERE storage_kind = 'tiered'
+                  AND refcount = 0
+                  AND cold_present = 1
+                """,
+            ),
             "compressed": scalar(
                 db, "SELECT COUNT(*) FROM blocks WHERE compressed = 1"
             ),
@@ -130,6 +140,16 @@ def collect_stats(
                 WHERE storage_kind = 'tiered' AND cold_present = 1
                 """,
             ),
+            "cold_garbage_bytes": scalar(
+                db,
+                """
+                SELECT COALESCE(SUM(stored_size), 0)
+                FROM blocks
+                WHERE storage_kind = 'tiered'
+                  AND refcount = 0
+                  AND cold_present = 1
+                """,
+            ),
         }
         report = StatsReport(
             inodes={
@@ -145,7 +165,10 @@ def collect_stats(
             maintenance={
                 "pending_deletions": scalar(
                     db, "SELECT COUNT(*) FROM pending_deletions"
-                )
+                ),
+                "cold_garbage": block_counts["cold_garbage"],
+                "cold_garbage_bytes": storage["cold_garbage_bytes"],
+                "oldest_cold_garbage_ns": 0,
             },
         )
     logger.info(
