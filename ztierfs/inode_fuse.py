@@ -324,9 +324,6 @@ class InodeFuseMixin(InodeOperations, FileSystemMixinBase):
                 with self.metadata.transaction():
                     for access in accesses:
                         self.block_store.record_block_presence(access, now)
-        if self.block_store.take_demotion_request():
-            with self.metadata.transaction():
-                self.block_store.demote_cold_blocks()
         return data
 
     def write(self, ino: int, data: bytes, offset: int, fh) -> int:
@@ -352,9 +349,6 @@ class InodeFuseMixin(InodeOperations, FileSystemMixinBase):
             prepared = self.file_content.prepare_file_write(plan)
             with self.metadata.transaction():
                 written = self.file_content.commit_prepared_write(prepared)
-        if self.block_store.take_demotion_request():
-            with self.metadata.transaction():
-                self.block_store.demote_cold_blocks()
         return written
 
     def flush(self, ino: int, fh) -> None:

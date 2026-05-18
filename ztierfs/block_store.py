@@ -168,6 +168,7 @@ class BlockStore:
         """刷净延迟块访问并关闭后台 ``prepare`` 线程池；应在卸载或进程退出前调用。"""
         logger.info("关闭块存储")
         self.metadata.commit()
+        self.drain_requested_demotions()
         self.drain_pending_deletions()
         executor = self._prepare_executor
         if executor is not None:
@@ -290,7 +291,7 @@ class BlockStore:
         future.add_done_callback(lambda done: self._finish_cold_copy_up(digest, done))
 
     def _copy_up_cold_block(self, digest: str, stored_size: int) -> None:
-        """将冷层块 **copy-up** 到热层（原子复制），在写事务中标记冷热均存在、首选热层并尝试 ``demote_cold_blocks``。"""
+        """将冷层块 **copy-up** 到热层（原子复制），在写事务中标记冷热均存在、首选热层并请求后续降级。"""
         self.copy_block(digest, 2, 1)
         if not probe_path(self.block_path(digest, 1)).present:
             logger.debug("冷层块后台提升未产生热层副本：hash={}", digest[:12])
@@ -304,7 +305,7 @@ class BlockStore:
                 preferred_tier=1,
                 last_promoted_ns=now,
             )
-            self.demote_cold_blocks()
+            self.request_demotion()
         logger.info(
             "冷层块后台提升到热层：hash={}，stored_size={}", digest[:12], stored_size
         )
@@ -626,6 +627,18 @@ class BlockStore:
         self._demotion_requested = False
         return requested
 
+    def request_demotion(self) -> None:
+        """Request a later hot-tier demotion pass without doing it on the caller path."""
+        if self.policy.hot_max_bytes > 0:
+            self._demotion_requested = True
+
+    def drain_requested_demotions(self, *, max_blocks: int | None = None) -> int:
+        """若有降级请求，则在一次写事务中执行有预算的热层降级。"""
+        if not self.take_demotion_request():
+            return 0
+        with self.metadata.transaction():
+            return self.demote_cold_blocks(max_blocks=max_blocks)
+
     def note_hot_write(self, stored_size: int) -> None:
         """累加热层新写字节；自上次检查以来累计达到 ``hot_max_bytes`` 时置 **降级请求** 并重置累计。"""
         if self.policy.hot_max_bytes <= 0:
@@ -784,7 +797,7 @@ class BlockStore:
             "复制块完成：hash={}，{} -> {}", digest[:12], source_tier, target_tier
         )
 
-    def demote_cold_blocks(self) -> None:
+    def demote_cold_blocks(self, *, max_blocks: int | None = None) -> int:
         """当热层已存 payload 总字节超过 ``hot_max_bytes`` 时，循环选取候选块 **降级** 到冷层。
 
         先 ``flush_deferred_accesses``；若冷层尚无副本则 ``copy_block(1→2)``，再删热层文件并更新
@@ -792,21 +805,33 @@ class BlockStore:
         冷/热路径不可用时中止本轮。
         """
         if self.policy.hot_max_bytes <= 0:
-            return
+            return 0
+        if max_blocks is not None and max_blocks <= 0:
+            self._demotion_requested = True
+            return 0
         self.metadata.flush_deferred_accesses()
         total = self.metadata.hot_tier_stored_size()
         if total <= self.policy.hot_max_bytes:
-            return
+            return 0
         target = self.policy.hot_min_bytes
         logger.info("开始热层降级：hot_bytes={}，target={}", total, target)
+        demoted = 0
         while total > target:
+            if max_blocks is not None and demoted >= max_blocks:
+                self._demotion_requested = True
+                logger.info(
+                    "热层降级暂停：达到本轮预算，demoted={}，hot_bytes={}",
+                    demoted,
+                    total,
+                )
+                return demoted
             row = self.metadata.demotion_candidate(
                 protected_prefix_chunks=self.policy.protected_prefix_chunks,
                 max_atime_ns=time_ns() - self.policy.min_hot_age_ns,
             )
             if row is None:
                 logger.info("热层降级停止：没有可降级候选，hot_bytes={}", total)
-                return
+                return demoted
             now = time_ns()
             cold_probe = probe_path(self.block_path(row["hash"], 2))
             if cold_probe.unavailable:
@@ -815,7 +840,8 @@ class BlockStore:
                     row["hash"][:12],
                     cold_probe.error,
                 )
-                return
+                self._demotion_requested = True
+                return demoted
             if not row["cold_present"] or cold_probe.missing:
                 self.copy_block(row["hash"], 1, 2)
             try:
@@ -824,7 +850,8 @@ class BlockStore:
                 logger.warning(
                     "热层降级停止：热层块临时不可用，hash={}", row["hash"][:12]
                 )
-                return
+                self._demotion_requested = True
+                return demoted
             self.metadata.set_block_presence(
                 row["hash"],
                 hot_present=False,
@@ -834,12 +861,14 @@ class BlockStore:
                 cold_verified_ns=now,
             )
             total -= row["stored_size"]
+            demoted += 1
             logger.debug(
                 "降级块完成：hash={}，stored_size={}，remaining_hot_bytes={}",
                 row["hash"][:12],
                 row["stored_size"],
                 total,
             )
+        return demoted
 
     def cleanup_promoted_cold_copies(self) -> int:
         """删除 **copy-up** 后超过 ``cold_copy_cleanup_age_ns`` 仍留在冷层的冗余副本，并清除 ``cold_present``。

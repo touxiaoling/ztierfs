@@ -118,9 +118,6 @@ class FileContentService:
             with self.metadata.transaction():
                 for access in accesses:
                     self.block_store.record_block_presence(access, now)
-        if self.block_store.take_demotion_request():
-            with self.metadata.transaction():
-                self.block_store.demote_cold_blocks()
         return data
 
     def plan_read(self, node, size: int, offset: int) -> FileReadPlan:

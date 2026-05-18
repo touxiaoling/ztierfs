@@ -696,6 +696,36 @@ def test_ztierfs_moves_least_recently_used_blocks_to_cold_tier(tmp_path):
         assert sum(row["cold_present"] for row in presence) == 2
 
 
+def test_ztierfs_write_only_runs_budgeted_after_commit_demote(tmp_path):
+    fs_impl = make_fs(
+        tmp_path,
+        hot_cache_max_bytes=1,
+        hot_cache_min_bytes=0,
+        protected_prefix_chunks=0,
+        min_hot_age_seconds=0,
+        inline_max_bytes=0,
+    )
+    data = b"".join(bytes([index]) * fs_impl.chunk_size for index in range(3))
+
+    with adapted(fs_impl) as fs:
+        fh = fs("create", "/large.jpg", 0o644)
+        fs("write", "/large.jpg", data, 0, fh)
+
+        presence = rows(fs_impl, "SELECT hot_present, cold_present FROM block_records")
+        assert sum(row["hot_present"] for row in presence) == 2
+        assert sum(row["cold_present"] for row in presence) == 1
+
+        fs_impl.metadata._after_commit_hooks.clear()
+        assert fs_impl.block_store.drain_requested_demotions(max_blocks=1) == 1
+        presence = rows(fs_impl, "SELECT hot_present, cold_present FROM block_records")
+        assert sum(row["hot_present"] for row in presence) == 1
+        assert sum(row["cold_present"] for row in presence) == 2
+        fs_impl.block_store.drain_requested_demotions()
+        presence = rows(fs_impl, "SELECT hot_present, cold_present FROM block_records")
+        assert sum(row["hot_present"] for row in presence) == 0
+        assert sum(row["cold_present"] for row in presence) == 3
+
+
 def test_ztierfs_keeps_file_prefix_chunks_hot_during_demote(tmp_path):
     fs_impl = make_fs(
         tmp_path,
