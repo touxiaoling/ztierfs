@@ -118,6 +118,23 @@ class BlockAccess:
     request_demotion: bool = False
 
 
+@dataclass(frozen=True)
+class TierReadDecision:
+    """Fallback tier read target plus deferred metadata repair."""
+
+    path: Path
+    tier: int
+    repair: dict[str, bool | int]
+
+
+@dataclass(frozen=True)
+class PreferredReadFailure:
+    """首选层读取失败分类；missing 和 unavailable 不能混用。"""
+
+    missing: bool
+    unavailable: bool
+
+
 class BlockStore:
     """内容寻址块在热层（tier1）与冷层（tier2）目录上的 IO、进程内读解码缓存与分层迁移。
 
@@ -211,7 +228,7 @@ class BlockStore:
 
         cached = self._cache_get(row["hash"])
         if cached is not None:
-            tier = self._metadata_preferred_tier(row)
+            tier = self._preferred_tier(row)
             logger.debug(
                 "读取块缓存命中：hash={}，raw_size={}", row["hash"][:12], len(cached)
             )
@@ -770,7 +787,7 @@ class BlockStore:
             logger.debug("清理提升后遗留冷层副本：hash={}", row["hash"][:12])
         return removed
 
-    def _metadata_preferred_tier(self, row) -> int:
+    def _preferred_tier(self, row) -> int:
         """仅按 SQLite preferred/presence 选择预计读取层；缓存命中时避免磁盘探测。"""
         if row["preferred_tier"] == 2 and row["cold_present"]:
             return 2
@@ -782,8 +799,31 @@ class BlockStore:
 
     def _read_tiered_payload(self, row) -> tuple[bytes, int, dict[str, bool | int]]:
         """直接读取 SQLite 声明的首选层；失败后再探测 fallback 并返回待延迟修正信息。"""
+        preferred_tier = self._preferred_tier(row)
+        payload, failure = self._read_preferred_payload(row, preferred_tier)
+        if failure is None:
+            return payload, preferred_tier, {}
+        if failure.missing:
+            decision = self._decide_after_preferred_missing(row, preferred_tier)
+            return (
+                self._read_selected_path(row, decision.path, decision.tier),
+                decision.tier,
+                decision.repair,
+            )
+        if failure.unavailable:
+            decision = self._decide_after_preferred_unavailable(row, preferred_tier)
+            return (
+                self._read_selected_path(row, decision.path, decision.tier),
+                decision.tier,
+                decision.repair,
+            )
+        raise FuseOSError(errno.EIO)
+
+    def _read_preferred_payload(
+        self, row, preferred_tier: int
+    ) -> tuple[bytes, PreferredReadFailure | None]:
+        """读取首选层；失败时只返回分类，不在这里决定 fallback 或 metadata 修正。"""
         digest = row["hash"]
-        preferred_tier = self._metadata_preferred_tier(row)
         preferred_path = self.file_io.block_path(digest, preferred_tier)
         try:
             with timed(
@@ -799,13 +839,7 @@ class BlockStore:
                 preferred_tier,
                 preferred_path,
             )
-            path, tier, repair = self._fallback_read_path(
-                row,
-                preferred_tier,
-                preferred_missing=True,
-                repair_metadata=False,
-            )
-            return self._read_selected_path(row, path, tier), tier, repair
+            return b"", PreferredReadFailure(missing=True, unavailable=False)
         except PathUnavailable as exc:
             logger.warning(
                 "块首选层临时不可用：hash={}，tier={}，path={}，error={}",
@@ -814,13 +848,7 @@ class BlockStore:
                 preferred_path,
                 exc,
             )
-            path, tier, repair = self._fallback_read_path(
-                row,
-                preferred_tier,
-                preferred_missing=False,
-                repair_metadata=False,
-            )
-            return self._read_selected_path(row, path, tier), tier, repair
+            return b"", PreferredReadFailure(missing=False, unavailable=True)
         logger.debug(
             "读取块文件：hash={}，tier={}，stored_size={}，path={}",
             row["hash"][:12],
@@ -828,7 +856,7 @@ class BlockStore:
             row["stored_size"],
             preferred_path,
         )
-        return payload, preferred_tier, {}
+        return payload, None
 
     def _read_selected_path(self, row, path: Path, tier: int) -> bytes:
         """读取 fallback 选中的路径；若在选择后消失或不可用，按读错误返回 EIO。"""
@@ -865,33 +893,32 @@ class BlockStore:
         )
         return payload
 
-    def _fallback_read_path(
-        self,
-        row,
-        preferred_tier: int,
-        *,
-        preferred_missing: bool,
-        repair_metadata: bool = True,
-    ) -> tuple[Path, int, dict[str, bool | int]]:
-        """首选层读取失败后探测备用层；只在确认缺失时生成 presence 修正。"""
+    def _decide_after_preferred_unavailable(
+        self, row, preferred_tier: int
+    ) -> TierReadDecision:
+        """首选层暂时不可用时，只允许临时改读 metadata 声明存在的备用层，不修复 presence。"""
         digest = row["hash"]
         alternate_tier = 2 if preferred_tier == 1 else 1
         alternate_path = self.file_io.block_path(digest, alternate_tier)
-        repair: dict[str, bool | int] = {}
-
-        if not preferred_missing:
-            alternate_probe = self._probe_declared_alternate(
-                row, alternate_tier, alternate_path
+        alternate_probe = self._probe_declared_alternate(
+            row, alternate_tier, alternate_path
+        )
+        if alternate_probe is not None and alternate_probe.present:
+            logger.warning(
+                "块首选层临时不可用，临时改读另一层且不修复元数据：hash={}，tier={}",
+                digest[:12],
+                alternate_tier,
             )
-            if alternate_probe is not None and alternate_probe.present:
-                logger.warning(
-                    "块首选层临时不可用，临时改读另一层且不修复元数据：hash={}，tier={}",
-                    digest[:12],
-                    alternate_tier,
-                )
-                return alternate_path, alternate_tier, repair
-            raise FuseOSError(errno.EIO)
+            return TierReadDecision(alternate_path, alternate_tier, {})
+        raise FuseOSError(errno.EIO)
 
+    def _decide_after_preferred_missing(
+        self, row, preferred_tier: int
+    ) -> TierReadDecision:
+        """首选层确认缺失后决策 fallback；只有确认缺失时才生成 presence 修正。"""
+        digest = row["hash"]
+        alternate_tier = 2 if preferred_tier == 1 else 1
+        alternate_path = self.file_io.block_path(digest, alternate_tier)
         missing_tiers = {preferred_tier}
         alternate_probe = self._probe_declared_alternate(
             row, alternate_tier, alternate_path
@@ -908,20 +935,13 @@ class BlockStore:
                         "cold_present": False,
                         "preferred_tier": alternate_tier,
                     }
-                if repair_metadata:
-                    self.metadata.set_block_presence(
-                        digest,
-                        hot_present=False if preferred_tier == 1 else None,
-                        cold_present=False if preferred_tier == 2 else None,
-                        preferred_tier=alternate_tier,
-                    )
                 logger.warning(
                     "块首选层缺失，改用另一层：hash={}，missing_tier={}，read_tier={}",
                     digest[:12],
                     preferred_tier,
                     alternate_tier,
                 )
-                return alternate_path, alternate_tier, repair
+                return TierReadDecision(alternate_path, alternate_tier, repair)
             if alternate_probe.unavailable:
                 logger.warning(
                     "块备用层临时不可用：hash={}，tier={}，path={}，error={}",
@@ -933,6 +953,18 @@ class BlockStore:
                 raise FuseOSError(errno.EIO)
             missing_tiers.add(alternate_tier)
 
+        decision = self._probe_all_tiers_for_repair(row, missing_tiers)
+        if decision is not None:
+            return decision
+
+        logger.error("块元数据引用的 payload 缺失：hash={}", digest[:12])
+        raise FuseOSError(errno.EIO)
+
+    def _probe_all_tiers_for_repair(
+        self, row, missing_tiers: set[int]
+    ) -> TierReadDecision | None:
+        """完整探测两层，用于 metadata 与磁盘位置不一致时生成显式修正。"""
+        digest = row["hash"]
         full_probe = self._probe_all_tiers(digest)
         hot_probe = full_probe[1]
         cold_probe = full_probe[2]
@@ -961,33 +993,12 @@ class BlockStore:
                 hot_exists,
                 cold_exists,
             )
-            if repair_metadata:
-                self.metadata.set_block_presence(
-                    digest,
-                    hot_present=hot_exists,
-                    cold_present=None if cold_probe.unavailable else cold_exists,
-                    preferred_tier=repaired_preferred,
-                )
-            return (
+            return TierReadDecision(
                 self.file_io.block_path(digest, repaired_preferred),
                 repaired_preferred,
                 repair,
             )
-
-        hot_present = False if 1 in missing_tiers else None
-        cold_present = False if 2 in missing_tiers else None
-        if hot_present is not None:
-            repair["hot_present"] = hot_present
-        if cold_present is not None:
-            repair["cold_present"] = cold_present
-        if repair_metadata:
-            self.metadata.set_block_presence(
-                digest,
-                hot_present=hot_present,
-                cold_present=cold_present,
-            )
-        logger.error("块元数据引用的 payload 缺失：hash={}", digest[:12])
-        raise FuseOSError(errno.EIO)
+        return None
 
     def _probe_declared_alternate(self, row, tier: int, path: Path):
         """仅在 metadata 声明备用层存在时探测，避免正常读固定 probe 双层。"""
