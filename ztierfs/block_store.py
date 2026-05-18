@@ -76,7 +76,7 @@ class TieringPolicy:
 
 @dataclass(frozen=True)
 class PreparedBlock:
-    """经 ``prepare_block(s)`` 得到的待落盘块描述，供 ``ensure_prepared_block`` 原子写入与 SQLite 登记。
+    """经 ``prepare_blocks()`` 得到的待落盘块描述，供 ``ensure_prepared_blocks()`` 原子写入与 SQLite 登记。
 
     ``digest`` 为原始未压缩数据的 SHA-256 十六进制摘要；``raw_size`` 为逻辑块原始字节数。
     ``payload`` 为磁盘或内联存储字节序列（可能经 zstd 压缩，由 ``compressed`` 标明）。
@@ -129,7 +129,7 @@ class BlockStore:
     可异步 **copy-up** 到热层并更新 ``preferred_tier``；热层超水位时 **降级** 将 payload 复制
     到冷层后删除热层文件。``read_cache_bytes`` 控制解码后明文 LRU 缓存上限（内联块亦可命中）。
 
-    注意：``ensure_prepared_block`` / ``demote_cold_blocks`` / copy-up 回调内对 ``MetadataStore``
+    注意：``ensure_prepared_blocks`` / ``demote_cold_blocks`` / copy-up 回调内对 ``MetadataStore``
     的更新须在调用方约定的写事务或本类已开启的事务中与块文件操作一致提交，避免元数据与磁盘脱节。
     """
 
@@ -364,13 +364,6 @@ class BlockStore:
         if access.request_demotion:
             self._demotion_requested = True
 
-    def ensure_prepared_block(self, block: PreparedBlock) -> None:
-        """若块不存在：非内联则 **原子写入** 热层块文件并 ``note_hot_write``，再 ``insert_block`` 登记。
-
-        已存在时直接返回。调用方须保证与引用计数/文件块元数据在同一元数据事务中一致提交。
-        """
-        self.ensure_prepared_blocks([block])
-
     def ensure_prepared_blocks(self, blocks: Iterable[PreparedBlock]) -> None:
         """Ensure unique prepared blocks exist, writing payloads before metadata rows."""
         unique: dict[str, PreparedBlock] = {}
@@ -479,10 +472,6 @@ class BlockStore:
             )
         return prepared
 
-    def prepare_block(self, data: bytes, compress: bool) -> PreparedBlock:
-        """单块 ``prepare_blocks`` 的便捷封装。"""
-        return self.prepare_blocks([(0, data)], compress)[0][1]
-
     def _prepare_block_sync(self, data: bytes, compress: bool) -> PreparedBlock:
         """在当前线程完成编码、摘要、缓存与内联判定（无并行开销）。"""
         payload, compressed = self._timed_encode_block(data, compress)
@@ -535,20 +524,6 @@ class BlockStore:
             "block_prepare.encode", bytes_key="block_prepare.raw_bytes", size=len(data)
         ):
             return self.encode_block(data, compress)
-
-    def decrement_block(self, digest: str) -> None:
-        """引用计数递减；降至零时删除 SQLite 块行并把物理 payload 登记到提交后 GC 队列。"""
-        row = self.metadata.block_refcount_and_presence(digest)
-        if row is None:
-            logger.warning("递减块引用时未找到块记录：hash={}", digest[:12])
-            return
-        self.metadata.apply_block_refcount_deltas({digest: -1})
-        logger.debug(
-            "递减块引用：hash={}，refcount={}->{}",
-            digest[:12],
-            row["refcount"],
-            row["refcount"] - 1,
-        )
 
     def encode_block(self, data: bytes, compress: bool) -> tuple[bytes, bool]:
         """按策略尝试 zstd；过短或禁用压缩时返回原始字节与 ``compressed=False``。"""
@@ -665,21 +640,6 @@ class BlockStore:
             tier,
             len(payload),
         )
-
-    def delete_block_file(self, digest: str) -> None:
-        """依次尝试删除 tier1 与 tier2 上同名块文件；路径临时不可用时记警告并跳过该层。"""
-        for candidate_tier in (1, 2):
-            try:
-                if unlink_path(self.block_path(digest, candidate_tier)):
-                    logger.debug(
-                        "删除块文件：hash={}，tier={}", digest[:12], candidate_tier
-                    )
-            except PathUnavailable:
-                logger.warning(
-                    "删除块文件跳过：块路径临时不可用，hash={}，tier={}",
-                    digest[:12],
-                    candidate_tier,
-                )
 
     def drain_pending_deletions(
         self,

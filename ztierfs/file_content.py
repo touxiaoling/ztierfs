@@ -435,14 +435,13 @@ class FileContentService:
         if not data:
             self.remove_chunk(file_id, chunk_index)
             return
-        self.set_prepared_chunk(
-            file_id, chunk_index, self.block_store.prepare_block(data, compress)
-        )
+        prepared = self.block_store.prepare_blocks([(chunk_index, data)], compress)
+        self.set_prepared_chunks(file_id, prepared)
 
     def set_prepared_chunk(
         self, file_id: int, chunk_index: int, block: PreparedBlock
     ) -> None:
-        """提交 ``PreparedBlock``：哈希未变则只更新 chunk 记录尺寸；否则确保块存在、绑定新哈希并 ``decrement_block`` 旧哈希。"""
+        """提交单个 ``PreparedBlock``；实际更新仍走批量块/refcount 边界。"""
         self.set_prepared_chunks(file_id, [(chunk_index, block)])
 
     def set_prepared_chunks(
