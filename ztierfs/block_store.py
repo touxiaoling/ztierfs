@@ -35,6 +35,8 @@ from .tier_access import (
 
 PARALLEL_READ_MIN_BLOCKS = 4
 PARALLEL_READ_MIN_BYTES = 512 * 1024
+PARALLEL_PREPARE_MIN_BLOCKS = 4
+PARALLEL_PREPARE_MIN_BYTES = 512 * 1024
 
 
 @dataclass(frozen=True)
@@ -454,7 +456,7 @@ class BlockStore:
     ) -> list[tuple[int, PreparedBlock]]:
         """对多块并行或同步计算摘要与编码，填充 **读缓存** 明文，并判定是否 **内联** 存储。"""
         pending = list(chunks)
-        if len(pending) <= 1:
+        if not self._should_parallel_prepare(pending):
             logger.debug("同步准备块：count={}，compress={}", len(pending), compress)
             return [
                 (chunk_index, self._prepare_block_sync(data, compress))
@@ -486,6 +488,12 @@ class BlockStore:
                 (chunk_index, self._prepared_block(digest, data, payload, compressed))
             )
         return prepared
+
+    def _should_parallel_prepare(self, pending: list[tuple[int, bytes]]) -> bool:
+        if len(pending) < PARALLEL_PREPARE_MIN_BLOCKS:
+            return False
+        total_bytes = sum(len(data) for _chunk_index, data in pending)
+        return total_bytes >= PARALLEL_PREPARE_MIN_BYTES
 
     def _prepare_block_sync(self, data: bytes, compress: bool) -> PreparedBlock:
         """在当前线程完成编码、摘要、缓存与内联判定（无并行开销）。"""

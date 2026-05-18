@@ -673,9 +673,9 @@ def test_ztierfs_reads_large_multi_chunk_plan_in_parallel(tmp_path, monkeypatch)
 def test_ztierfs_prepares_uncompressed_multi_chunk_writes_in_parallel(
     tmp_path, monkeypatch
 ):
-    fs_impl = make_fs(tmp_path, inline_max_bytes=0)
-    data = bytes(range(256)) * 8
-    barrier = threading.Barrier(2)
+    fs_impl = make_fs(tmp_path, chunk_size=128 * 1024, inline_max_bytes=0)
+    data = b"".join(bytes([index]) * fs_impl.chunk_size for index in range(4))
+    barrier = threading.Barrier(4)
     lock = threading.Lock()
     active = 0
     max_active = 0
@@ -700,7 +700,36 @@ def test_ztierfs_prepares_uncompressed_multi_chunk_writes_in_parallel(
         fh = fs("create", "/movie.jpg", 0o644)
         assert fs("write", "/movie.jpg", data, 0, fh) == len(data)
 
-    assert max_active == 2
+    assert max_active > 1
+
+
+def test_ztierfs_prepares_small_multi_chunk_writes_synchronously(tmp_path, monkeypatch):
+    fs_impl = make_fs(tmp_path, inline_max_bytes=0)
+    data = bytes(range(256)) * 8
+    lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    original_digest = fs_impl.block_store._timed_digest_block
+
+    def observed_digest(chunk):
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        try:
+            return original_digest(chunk)
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(fs_impl.block_store, "_timed_digest_block", observed_digest)
+
+    with adapted(fs_impl) as fs:
+        fh = fs("create", "/movie.jpg", 0o644)
+        assert fs("write", "/movie.jpg", data, 0, fh) == len(data)
+
+    assert max_active == 1
 
 
 def test_ztierfs_cold_copy_up_does_not_block_read(tmp_path, monkeypatch):
