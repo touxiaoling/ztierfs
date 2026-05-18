@@ -551,23 +551,14 @@ class BlockStore:
         )
 
     def encode_block(self, data: bytes, compress: bool) -> tuple[bytes, bool]:
-        """按策略尝试 zstd；过短、禁用压缩或压缩无体积收益时返回原始字节与 ``compressed=False``。"""
+        """按策略尝试 zstd；过短或禁用压缩时返回原始字节与 ``compressed=False``。"""
         if not compress:
             logger.debug("跳过压缩块：raw_size={}，原因=路径策略", len(data))
             return data, False
         if len(data) < self.compression_min_bytes:
             logger.debug("跳过压缩块：raw_size={}，原因=小于压缩阈值", len(data))
             return data, False
-        packed = zstd.compress(data, level=self.compression_level)
-        if len(packed) >= len(data):
-            logger.debug(
-                "跳过压缩块：raw_size={}，packed_size={}，原因=压缩无收益",
-                len(data),
-                len(packed),
-            )
-            return data, False
-        logger.debug("压缩块成功：raw_size={}，packed_size={}", len(data), len(packed))
-        return packed, True
+        return zstd.compress(data, level=self.compression_level), True
 
     def decode_payload(self, row, payload: bytes) -> bytes:
         """按 ``row["compressed"]`` 解压或直通，并校验解码后长度等于 ``row["raw_size"]``。"""

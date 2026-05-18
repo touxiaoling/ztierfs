@@ -12,7 +12,7 @@
 - 使用 SQLite 持久化目录和文件元数据。
 - 将文件内容切分为固定大小的块。
 - 使用 SHA-256 存储块，让相同块可以去重。
-- 当 zstd 压缩结果更小时，压缩对应块。
+- 对未按后缀跳过且达到大小阈值的块使用 zstd 压缩。
 - 将处理后 payload 不超过阈值的小块直接内联到 SQLite，避免为小文件创建大量块文件。
 - 对常见已压缩后缀跳过压缩，例如 `.jpg`、`.png`、`.zip`、`.zst`、`.mp4` 和 `.pdf`。
 - 面向“本机热层 + rclone 挂载网盘冷层”的分层策略：热层使用高/低水位，文件开头块优先留热，冷读提升使用 copy-up，并把冷层视为昂贵但持久的层，尽量减少冷层探测、读取、写入和删除。
@@ -96,7 +96,7 @@ uv run python -m ztierfs mount /tmp/ztierfs-hot /tmp/ztierfs-cold /tmp/ztierfs-m
 分块与压缩：
 
 - `--chunk-size`：文件分块大小，默认 `4m`。
-- `--inline-max`：处理后 payload 不超过该大小的块直接内联到 SQLite，默认 `32k`；设为 `0` 禁用。"处理后"指可压缩块经 zstd 后的体积，不可压缩或跳过压缩的块使用原始体积。
+- `--inline-max`：处理后 payload 不超过该大小的块直接内联到 SQLite，默认 `32k`；设为 `0` 禁用。"处理后"指走 zstd 压缩的块使用压缩后体积，按后缀或大小阈值跳过压缩的块使用原始体积。
 - `--zstd-level`：zstd 压缩等级，默认使用标准库默认值。
 - `--compression-min`：小于该大小的 payload 跳过 zstd 压缩尝试，默认 `4k`。
 

@@ -56,6 +56,21 @@ def test_ztierfs_skips_zstd_for_known_compressed_suffixes(tmp_path):
     assert {row["stored_size"] for row in block_rows} == {1024}
 
 
+def test_ztierfs_compresses_unprofitable_zstd_payloads_by_path_policy(tmp_path):
+    fs_impl = make_fs(tmp_path, compression_min_bytes=0)
+    data = b"x"
+
+    with adapted(fs_impl) as fs:
+        fh = fs("create", "/randomish.bin", 0o644)
+        fs("write", "/randomish.bin", data, 0, fh)
+
+    block_rows = rows(fs_impl, "SELECT compressed, raw_size, stored_size FROM blocks")
+    assert block_rows
+    assert {row["compressed"] for row in block_rows} == {1}
+    assert {row["raw_size"] for row in block_rows} == {1}
+    assert all(row["stored_size"] >= row["raw_size"] for row in block_rows)
+
+
 def test_ztierfs_deduplicates_equal_chunks(tmp_path):
     fs_impl = make_fs(tmp_path, inline_max_bytes=0)
     data = b"same-block" * 100
