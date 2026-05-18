@@ -280,9 +280,8 @@ def test_read_cold_block_unavailable_preserves_location_metadata(tmp_path, monke
     fs_impl = make_fs(tmp_path, inline_max_bytes=0)
     _digest, data, cold_path = _make_cold_only_block(fs_impl)
 
-    import ztierfs.block_store as block_store_module
-
-    original_read = block_store_module.read_path_bytes
+    reopened = make_fs(tmp_path, inline_max_bytes=0)
+    original_read = reopened.block_store.file_io.read_path
 
     def read_or_unavailable(path):
         if path == cold_path:
@@ -291,9 +290,8 @@ def test_read_cold_block_unavailable_preserves_location_metadata(tmp_path, monke
             )
         return original_read(path)
 
-    monkeypatch.setattr(block_store_module, "read_path_bytes", read_or_unavailable)
+    monkeypatch.setattr(reopened.block_store.file_io, "read_path", read_or_unavailable)
 
-    reopened = make_fs(tmp_path, inline_max_bytes=0)
     with pytest.raises(FuseOSError) as excinfo:
         with adapted(reopened) as fs:
             fh = fs("open", "/note.txt", 0)

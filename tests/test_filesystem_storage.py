@@ -445,7 +445,7 @@ def test_ztierfs_reuses_decoded_block_cache_for_repeated_reads(tmp_path, monkeyp
                 "second read should be served from decoded block cache"
             )
 
-        monkeypatch.setattr("ztierfs.block_store.read_path_bytes", fail_disk_read)
+        monkeypatch.setattr(fs_impl.block_store.file_io, "read_path", fail_disk_read)
         assert fs("read", "/cached.jpg", len(data), 0, fh) == data
 
 
@@ -767,10 +767,6 @@ def test_ztierfs_demote_trusts_cold_present_without_probe(tmp_path, monkeypatch)
     )
     data = b"already-cold" * 128
 
-    import ztierfs.block_store as block_store_module
-
-    original_probe_path = block_store_module.probe_path
-
     with adapted(fs_impl) as fs:
         fh = fs("create", "/movie.jpg", 0o644)
         fs("write", "/movie.jpg", data, 0, fh)
@@ -783,6 +779,8 @@ def test_ztierfs_demote_trusts_cold_present_without_probe(tmp_path, monkeypatch)
                 (digest,),
             )
 
+        original_probe_path = fs_impl.block_store.file_io.probe_path
+
         def fail_cold_probe(path):
             if path == cold_path:
                 raise AssertionError(
@@ -790,7 +788,7 @@ def test_ztierfs_demote_trusts_cold_present_without_probe(tmp_path, monkeypatch)
                 )
             return original_probe_path(path)
 
-        monkeypatch.setattr(block_store_module, "probe_path", fail_cold_probe)
+        monkeypatch.setattr(fs_impl.block_store.file_io, "probe_path", fail_cold_probe)
 
         def fail_copy_block(digest_arg, source_tier, target_tier):
             raise AssertionError(
@@ -957,11 +955,6 @@ def test_ztierfs_normal_hot_read_does_not_probe_cold_tier(tmp_path, monkeypatch)
     fs_impl = make_fs(tmp_path, inline_max_bytes=0)
     data = b"hot block" * 128
 
-    import ztierfs.block_store as block_store_module
-
-    original_probe_path = block_store_module.probe_path
-    original_read_path_bytes = block_store_module.read_path_bytes
-
     with adapted(fs_impl) as fs:
         fh = fs("create", "/hot.jpg", 0o644)
         fs("write", "/hot.jpg", data, 0, fh)
@@ -971,19 +964,22 @@ def test_ztierfs_normal_hot_read_does_not_probe_cold_tier(tmp_path, monkeypatch)
         fs_impl.block_store._read_cache.clear()
         fs_impl.block_store._read_cache_size = 0
 
+        original_probe_path = fs_impl.block_store.file_io.probe_path
+        original_read_path = fs_impl.block_store.file_io.read_path
+
         def fail_cold_probe(path):
             if path == cold_path:
                 raise AssertionError("normal hot read must not probe cold tier")
             return original_probe_path(path)
 
-        monkeypatch.setattr(block_store_module, "probe_path", fail_cold_probe)
+        monkeypatch.setattr(fs_impl.block_store.file_io, "probe_path", fail_cold_probe)
 
         def read_or_fail(path):
             if path == cold_path:
                 raise AssertionError("normal hot read must not read cold tier")
-            return original_read_path_bytes(path)
+            return original_read_path(path)
 
-        monkeypatch.setattr(block_store_module, "read_path_bytes", read_or_fail)
+        monkeypatch.setattr(fs_impl.block_store.file_io, "read_path", read_or_fail)
 
         assert fs("read", "/hot.jpg", len(data), 0, fh) == data
 
@@ -1018,17 +1014,15 @@ def test_ztierfs_reads_hot_fallback_when_cold_preferred_unavailable(
 
         from ztierfs.tier_access import PathUnavailable
 
-        import ztierfs.block_store as block_store_module
-
-        original_read_path_bytes = block_store_module.read_path_bytes
+        original_read_path = fs_impl.block_store.file_io.read_path
 
         def cold_unavailable_read(path):
             if path == cold_path:
                 raise PathUnavailable(path, OSError(5, "cold unavailable"))
-            return original_read_path_bytes(path)
+            return original_read_path(path)
 
         monkeypatch.setattr(
-            block_store_module, "read_path_bytes", cold_unavailable_read
+            fs_impl.block_store.file_io, "read_path", cold_unavailable_read
         )
 
         assert fs("read", "/dual.jpg", len(data), 0, fh) == data

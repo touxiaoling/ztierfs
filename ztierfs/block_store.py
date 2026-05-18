@@ -1,15 +1,14 @@
 """内容寻址块存储（tier1=热层，tier2=冷层）。
 
-负责 zstd 压缩、按内容摘要在各 tier 目录下的原子写入、与 SQLite `blocks`
-元数据协同（引用计数、存在性、preferred_tier）。包含读 LRU 缓存、异步 prepare、热→冷降级与读冷层时的
-copy-up，以及在元数据与物理文件不一致时的有限自修复。
+负责 zstd 压缩、读 LRU 缓存、异步 prepare、冷热策略、copy-up、热→冷降级，以及
+与 SQLite `blocks` 元数据协同（引用计数、存在性、preferred_tier）。
+具体块文件路径、原子写入、原子复制和 fsync 边界委托给 `BlockFileIO`。
 
 块文件即用户数据：须保持临时文件+rename、fsync 等与项目其它模块一致的原子性与持久化约定。
 """
 
 import errno
 import os
-import shutil
 import threading
 
 from collections.abc import Iterable
@@ -24,7 +23,7 @@ import compression.zstd as zstd
 from loguru import logger
 from macfusepy import FuseOSError
 
-from .block_layout import block_file_path
+from .block_file_io import BlockFileIO
 from .metadata.blocks import BlockInsert
 from .metadata import MetadataStore
 from .pending_deletions import drain_pending_block_files
@@ -32,9 +31,6 @@ from .perf import count, timed
 from .tier_access import (
     PathMissing,
     PathUnavailable,
-    probe_path,
-    read_path_bytes,
-    unlink_path,
 )
 
 PARALLEL_READ_MIN_BLOCKS = 4
@@ -125,10 +121,10 @@ class BlockAccess:
 class BlockStore:
     """内容寻址块在热层（tier1）与冷层（tier2）目录上的 IO、进程内读解码缓存与分层迁移。
 
-    新块默认先 ``write_block_file`` 到热层，再以临时文件 + ``fsync`` + ``os.replace`` 保证
-    块文件原子落盘；跨层 ``copy_block`` 同样经临时文件与目录 ``fsync``。读冷层且满足策略时
-    可异步 **copy-up** 到热层并更新 ``preferred_tier``；热层超水位时 **降级** 将 payload 复制
-    到冷层后删除热层文件。``read_cache_bytes`` 控制解码后明文 LRU 缓存上限（内联块亦可命中）。
+    新块默认先通过 ``BlockFileIO.write_atomic`` 到热层，再登记 SQLite 元数据；跨层
+    ``copy_block`` 委托 ``BlockFileIO.copy_atomic``。读冷层且满足策略时可异步 **copy-up**
+    到热层并更新 ``preferred_tier``；热层超水位时 **降级** 将 payload 复制到冷层后删除热层文件。
+    ``read_cache_bytes`` 控制解码后明文 LRU 缓存上限（内联块亦可命中）。
 
     注意：``ensure_prepared_blocks`` / ``demote_cold_blocks`` / copy-up 回调内对 ``MetadataStore``
     的更新须在调用方约定的写事务或本类已开启的事务中与块文件操作一致提交，避免元数据与磁盘脱节。
@@ -150,6 +146,7 @@ class BlockStore:
         self.metadata = metadata
         self.tier1_blocks = tier1_blocks
         self.tier2_blocks = tier2_blocks
+        self.file_io = BlockFileIO(tier1_blocks, tier2_blocks)
         self.policy = policy
         self.compression_level = compression_level
         self.compression_min_bytes = compression_min_bytes
@@ -294,7 +291,7 @@ class BlockStore:
     def _copy_up_cold_block(self, digest: str, stored_size: int) -> None:
         """将冷层块 **copy-up** 到热层（原子复制），在写事务中标记冷热均存在、首选热层并请求后续降级。"""
         self.copy_block(digest, 2, 1)
-        if not probe_path(self.block_path(digest, 1)).present:
+        if not self.file_io.probe(digest, 1).present:
             logger.debug("冷层块后台提升未产生热层副本：hash={}", digest[:12])
             return
         now = time_ns()
@@ -586,7 +583,7 @@ class BlockStore:
 
     def block_path(self, digest: str, tier: int) -> Path:
         """返回给定 ``digest`` 在 tier1（1）或 tier2（2）下的内容寻址块文件路径。"""
-        return block_file_path(self.tier1_blocks, self.tier2_blocks, digest, tier)
+        return self.file_io.block_path(digest, tier)
 
     def take_demotion_request(self) -> bool:
         """原子地读取并清除内部“需要 **热层降级**”标志（由 ``note_hot_write`` 或访问记录置位）。"""
@@ -616,31 +613,8 @@ class BlockStore:
             self._hot_bytes_added_since_check = 0
 
     def write_block_file(self, digest: str, tier: int, payload: bytes) -> None:
-        """向 ``tier`` 目录 **原子写入** 块文件：临时文件 → ``fsync`` → ``os.replace`` → 父目录 ``fsync``。
-
-        目标路径已存在则跳过（幂等）。``payload`` 为磁盘存储字节序列（可为压缩形式）。
-        """
-        path = self.block_path(digest, tier)
-        if probe_path(path).present:
-            logger.debug("块文件已存在，跳过写入：hash={}，tier={}", digest[:12], tier)
-            return
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-        with timed(
-            "block_io.write", bytes_key="block_io.write_bytes", size=len(payload)
-        ):
-            with open(tmp, "wb") as file:
-                file.write(payload)
-                file.flush()
-                os.fsync(file.fileno())
-        os.replace(tmp, path)
-        self.fsync_dir(path.parent)
-        logger.debug(
-            "写入块文件完成：hash={}，tier={}，bytes={}",
-            digest[:12],
-            tier,
-            len(payload),
-        )
+        """向 ``tier`` 目录原子写入块文件；物理落盘由 ``BlockFileIO`` 执行。"""
+        self.file_io.write_atomic(digest, tier, payload)
 
     def drain_pending_deletions(
         self,
@@ -671,7 +645,7 @@ class BlockStore:
             with timed("gc.pending.unlink"):
                 outcome = drain_pending_block_files(
                     rows,
-                    lambda digest, tier: self.block_path(digest, tier),
+                    lambda digest, tier: self.file_io.block_path(digest, tier),
                 )
             for deletion_id in outcome.unavailable_ids:
                 logger.warning("待 GC 块文件暂时不可用：id={}", deletion_id)
@@ -686,56 +660,8 @@ class BlockStore:
                 return removed
 
     def copy_block(self, digest: str, source_tier: int, target_tier: int) -> None:
-        """跨层 **原子复制**：``shutil.copyfile`` 至临时文件、读 ``fsync``、``replace`` 落位、目录 ``fsync``。
-
-        源缺失、任一侧路径不可用或目标已存在时安全返回；用于 **copy-up** 与降级前冷层落盘。
-        """
-        source = self.block_path(digest, source_tier)
-        target = self.block_path(digest, target_tier)
-        source_probe = probe_path(source)
-        if source_probe.unavailable:
-            logger.warning(
-                "复制块跳过：源块临时不可用，hash={}，source_tier={}，error={}",
-                digest[:12],
-                source_tier,
-                source_probe.error,
-            )
-            return
-        if source_probe.missing:
-            logger.warning(
-                "复制块失败：源块不存在，hash={}，source_tier={}",
-                digest[:12],
-                source_tier,
-            )
-            return
-        target_probe = probe_path(target)
-        if target_probe.unavailable:
-            logger.warning(
-                "复制块跳过：目标层临时不可用，hash={}，target_tier={}，error={}",
-                digest[:12],
-                target_tier,
-                target_probe.error,
-            )
-            return
-        if target_probe.present:
-            logger.debug(
-                "复制块跳过：目标已存在，hash={}，target_tier={}",
-                digest[:12],
-                target_tier,
-            )
-            return
-        target.parent.mkdir(parents=True, exist_ok=True)
-        tmp = target.with_name(
-            f".{target.name}.{os.getpid()}.{threading.get_ident()}.tmp"
-        )
-        shutil.copyfile(source, tmp)
-        with open(tmp, "rb") as file:
-            os.fsync(file.fileno())
-        os.replace(tmp, target)
-        self.fsync_dir(target.parent)
-        logger.debug(
-            "复制块完成：hash={}，{} -> {}", digest[:12], source_tier, target_tier
-        )
+        """跨层原子复制块文件；物理复制由 ``BlockFileIO`` 执行。"""
+        self.file_io.copy_atomic(digest, source_tier, target_tier)
 
     def demote_cold_blocks(self, *, max_blocks: int | None = None) -> int:
         """当热层已存 payload 总字节超过 ``hot_max_bytes`` 时，循环选取候选块 **降级** 到冷层。
@@ -775,7 +701,7 @@ class BlockStore:
                 return demoted
             now = time_ns()
             if not row["cold_present"]:
-                cold_probe = probe_path(self.block_path(row["hash"], 2))
+                cold_probe = self.file_io.probe(row["hash"], 2)
                 if cold_probe.unavailable:
                     logger.warning(
                         "热层降级暂停：冷层临时不可用，hash={}，error={}",
@@ -788,7 +714,7 @@ class BlockStore:
                     self.copy_block(row["hash"], 1, 2)
             try:
                 with timed("tier.demote.unlink"):
-                    unlink_path(self.block_path(row["hash"], 1))
+                    self.file_io.unlink(row["hash"], 1)
             except PathUnavailable:
                 logger.warning(
                     "热层降级停止：热层块临时不可用，hash={}", row["hash"][:12]
@@ -824,8 +750,7 @@ class BlockStore:
         cutoff = time_ns() - self.policy.cold_copy_cleanup_age_ns
         removed = 0
         for row in self.metadata.promoted_cold_copy_candidates(cutoff):
-            path = self.block_path(row["hash"], 2)
-            probe = probe_path(path)
+            probe = self.file_io.probe(row["hash"], 2)
             if probe.unavailable:
                 logger.warning(
                     "跳过清理冷层副本：冷层临时不可用，hash={}，error={}",
@@ -834,7 +759,7 @@ class BlockStore:
                 )
                 continue
             try:
-                unlink_path(path)
+                self.file_io.unlink(row["hash"], 2)
             except PathUnavailable:
                 logger.warning(
                     "跳过清理冷层副本：冷层临时不可用，hash={}", row["hash"][:12]
@@ -859,14 +784,14 @@ class BlockStore:
         """直接读取 SQLite 声明的首选层；失败后再探测 fallback 并返回待延迟修正信息。"""
         digest = row["hash"]
         preferred_tier = self._metadata_preferred_tier(row)
-        preferred_path = self.block_path(digest, preferred_tier)
+        preferred_path = self.file_io.block_path(digest, preferred_tier)
         try:
             with timed(
                 "block_io.read",
                 bytes_key="block_io.read_bytes",
                 size=row["stored_size"],
             ):
-                payload = read_path_bytes(preferred_path)
+                payload = self.file_io.read_path(preferred_path)
         except PathMissing:
             logger.warning(
                 "块首选层读取缺失：hash={}，tier={}，path={}",
@@ -913,7 +838,7 @@ class BlockStore:
                 bytes_key="block_io.read_bytes",
                 size=row["stored_size"],
             ):
-                payload = read_path_bytes(path)
+                payload = self.file_io.read_path(path)
         except PathMissing as exc:
             logger.error(
                 "块文件读取时消失：hash={}，tier={}，path={}",
@@ -951,7 +876,7 @@ class BlockStore:
         """首选层读取失败后探测备用层；只在确认缺失时生成 presence 修正。"""
         digest = row["hash"]
         alternate_tier = 2 if preferred_tier == 1 else 1
-        alternate_path = self.block_path(digest, alternate_tier)
+        alternate_path = self.file_io.block_path(digest, alternate_tier)
         repair: dict[str, bool | int] = {}
 
         if not preferred_missing:
@@ -1015,7 +940,7 @@ class BlockStore:
             logger.warning(
                 "冷层块临时不可用：hash={}，path={}，error={}",
                 digest[:12],
-                self.block_path(digest, 2),
+                self.file_io.block_path(digest, 2),
                 cold_probe.error,
             )
             raise FuseOSError(errno.EIO)
@@ -1044,7 +969,7 @@ class BlockStore:
                     preferred_tier=repaired_preferred,
                 )
             return (
-                self.block_path(digest, repaired_preferred),
+                self.file_io.block_path(digest, repaired_preferred),
                 repaired_preferred,
                 repair,
             )
@@ -1070,21 +995,11 @@ class BlockStore:
             return None
         if tier == 2 and not row["cold_present"]:
             return None
-        return probe_path(path)
+        return self.file_io.probe_path(path)
 
     def _probe_all_tiers(self, digest: str):
         """首选层和声明备用层都不可读时，完整探测两层用于 presence 修正。"""
         return {
-            1: probe_path(self.block_path(digest, 1)),
-            2: probe_path(self.block_path(digest, 2)),
+            1: self.file_io.probe(digest, 1),
+            2: self.file_io.probe(digest, 2),
         }
-
-    def fsync_dir(self, path: Path) -> None:
-        """在支持 ``O_DIRECTORY`` 的平台上对目录 fd 执行 ``fsync``，巩固 **rename 落盘** 的目录项持久化。"""
-        if not hasattr(os, "O_DIRECTORY"):
-            return
-        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
