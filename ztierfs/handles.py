@@ -2,6 +2,22 @@
 
 import threading
 
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class FileHandleSnapshot:
+    """Stable inode fields cached on an open file handle for type and permission checks."""
+
+    id: int
+    kind: str
+    mode: int
+    uid: int
+    gid: int
+
+    def __getitem__(self, key: str):
+        return getattr(self, key)
+
 
 class HandleTable:
     """进程内 FUSE 文件句柄（fh）的分配及其与 inode（file_id）的绑定。
@@ -17,10 +33,16 @@ class HandleTable:
         self._lock = lock
         self._next_fh = 0
         self._handles: dict[int, int] = {}
+        self._snapshots: dict[int, FileHandleSnapshot | None] = {}
         self._lock_owners: dict[int, int] = {}
         self._open_counts: dict[int, int] = {}
 
-    def new(self, file_id: int, lock_owner: int | None = None) -> int:
+    def new(
+        self,
+        file_id: int,
+        lock_owner: int | None = None,
+        snapshot: FileHandleSnapshot | None = None,
+    ) -> int:
         """分配新的 fh，绑定到 ``file_id``（inode），并将该 inode 的打开计数加一。
 
         ``lock_owner`` 为进程内建议锁的分桶键；若为 ``None`` 则默认使用本 fh，
@@ -29,6 +51,7 @@ class HandleTable:
         with self._lock:
             self._next_fh += 1
             self._handles[self._next_fh] = file_id
+            self._snapshots[self._next_fh] = snapshot
             self._lock_owners[self._next_fh] = (
                 lock_owner if lock_owner is not None else self._next_fh
             )
@@ -45,6 +68,7 @@ class HandleTable:
         with self._lock:
             if isinstance(fh, int):
                 file_id = self._handles.pop(fh, None)
+                self._snapshots.pop(fh, None)
                 lock_owner = self._lock_owners.pop(fh, fh)
                 if file_id is not None:
                     remaining = self._open_counts.get(file_id, 0) - 1
@@ -54,6 +78,20 @@ class HandleTable:
                         self._open_counts.pop(file_id, None)
                     return file_id, lock_owner
             return None
+
+    def snapshot(self, fh) -> FileHandleSnapshot | None:
+        """Return cached stable inode fields for ``fh`` when still valid."""
+        with self._lock:
+            if not isinstance(fh, int):
+                return None
+            return self._snapshots.get(fh)
+
+    def invalidate_file(self, file_id: int) -> None:
+        """Invalidate permission snapshots for all open handles bound to ``file_id``."""
+        with self._lock:
+            for fh, bound_file_id in self._handles.items():
+                if bound_file_id == file_id:
+                    self._snapshots[fh] = None
 
     def file_id(self, fh) -> int | None:
         """由 fh 查询当前绑定的 inode（``file_id``）；非整数或未登记则 ``None``。"""

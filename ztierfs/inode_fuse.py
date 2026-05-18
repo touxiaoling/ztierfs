@@ -26,6 +26,7 @@ from time import perf_counter_ns, time_ns
 from loguru import logger
 from macfusepy import FuseOSError, InodeOperations, LowLevelAttr, LowLevelEntry
 from .fs_mixins import FileSystemMixinBase
+from .handles import FileHandleSnapshot
 from .metadata_ops import ENOATTR, XATTR_CREATE, XATTR_REPLACE
 from .namespace_ops import RENAME_NOREPLACE
 from .perf import collect_perf
@@ -73,6 +74,31 @@ class InodeFuseMixin(InodeOperations, FileSystemMixinBase):
         if file_id is not None:
             return self._inode_by_ino(file_id)
         return self._inode_by_ino(ino)
+
+    def _handle_snapshot_from_node(self, node) -> FileHandleSnapshot:
+        """Build a stable permission/type snapshot for a file handle."""
+        return FileHandleSnapshot(
+            id=node["id"],
+            kind=node["kind"],
+            mode=node["mode"],
+            uid=node["uid"],
+            gid=node["gid"],
+        )
+
+    def _file_node_for_read_write(self, ino: int, fh, mask: int):
+        """Load current size while using a valid fh snapshot for type and permission checks."""
+        file_id = self.handles.file_id(fh)
+        if file_id is None:
+            node = self._inode_by_ino(ino)
+            self._require_access(node, mask)
+            return node
+        snapshot = self.handles.snapshot(fh)
+        if snapshot is not None:
+            self._require_access(snapshot, mask)
+        node = self._inode_by_ino(file_id)
+        if snapshot is None:
+            self._require_access(node, mask)
+        return node
 
     def _entry_from_node(self, name: bytes, node, next_id: int) -> LowLevelEntry:
         """由子节点行构造 ``LowLevelEntry``，并缓存 inode→显示名供块路径等使用。"""
@@ -240,12 +266,14 @@ class InodeFuseMixin(InodeOperations, FileSystemMixinBase):
                 self.metadata.set_node_mode(
                     node["id"], kind | (attrs["st_mode"] & 0o7777), now
                 )
+                self.handles.invalidate_file(node["id"])
             if to_set & (FUSE_SET_ATTR_UID | FUSE_SET_ATTR_GID):
                 if self._caller_ids()[0] != 0:
                     raise FuseOSError(errno.EPERM)
                 uid = attrs["st_uid"] if to_set & FUSE_SET_ATTR_UID else node["uid"]
                 gid = attrs["st_gid"] if to_set & FUSE_SET_ATTR_GID else node["gid"]
                 self.metadata.set_node_owner(node["id"], uid, gid, now)
+                self.handles.invalidate_file(node["id"])
             if to_set & FUSE_SET_ATTR_SIZE:
                 if node["kind"] != "file":
                     raise FuseOSError(errno.EISDIR)
@@ -291,7 +319,9 @@ class InodeFuseMixin(InodeOperations, FileSystemMixinBase):
             with self._content_lock(ino), self.metadata.transaction():
                 node = self._node_by_ino(ino)
                 self.file_content.truncate_file(ino, self._name_for_inode(node), 0)
-        return self.handles.new(ino, self._lock_owner())
+        return self.handles.new(
+            ino, self._lock_owner(), self._handle_snapshot_from_node(node)
+        )
 
     def read(self, ino: int, size: int, offset: int, fh) -> bytes:
         """从文件读取 ``size`` 字节（自 ``offset``）。
@@ -309,8 +339,7 @@ class InodeFuseMixin(InodeOperations, FileSystemMixinBase):
         inode_id = self.handles.file_id(fh) or ino
         with self._content_lock(inode_id):
             with self.metadata.read_transaction():
-                node = self._file_node_from_ino_or_fh(ino, fh)
-                self._require_access(node, os.R_OK)
+                node = self._file_node_for_read_write(ino, fh, os.R_OK)
                 plan = self.file_content.plan_read(node, size, offset)
             data, accesses = self.file_content.execute_read_plan(plan)
             self._schedule_readahead(plan, offset, len(data), fh)
@@ -342,8 +371,7 @@ class InodeFuseMixin(InodeOperations, FileSystemMixinBase):
         inode_id = self.handles.file_id(fh) or ino
         with self._content_lock(inode_id):
             with self.metadata.read_transaction():
-                node = self._file_node_from_ino_or_fh(ino, fh)
-                self._require_access(node, os.W_OK)
+                node = self._file_node_for_read_write(ino, fh, os.W_OK)
                 path = self._name_for_inode(node)
                 plan = self.file_content.plan_write_file(node, path, data, offset)
             prepared = self.file_content.prepare_file_write(plan)
@@ -403,7 +431,9 @@ class InodeFuseMixin(InodeOperations, FileSystemMixinBase):
                     now,
                 )
                 node = self._node_by_ino(inode_id)
-            fh = self.handles.new(node["id"], self._lock_owner())
+            fh = self.handles.new(
+                node["id"], self._lock_owner(), self._handle_snapshot_from_node(node)
+            )
             return self._entry_from_node(name, node, node["id"]), fh
 
     def mkdir(self, parent: int, name: bytes, mode: int) -> LowLevelEntry:

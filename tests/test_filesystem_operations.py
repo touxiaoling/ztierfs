@@ -6,6 +6,7 @@ import pytest
 from macfusepy import FuseOSError
 from stat import S_IFDIR, S_IFLNK, S_IFMT, S_IMODE
 
+from ztierfs.handles import FileHandleSnapshot
 from ztierfs.pathing import normalize_path
 
 from .helpers import adapted, make_fs, rows, user_dir_entry_rows, user_inode_rows
@@ -143,6 +144,29 @@ def test_ztierfs_uses_lightweight_inode_lookup_for_open_handle_io(
         assert fs("getattr", "/before.txt", fh)["st_size"] == 8
         fs("write", "/before.txt", b"!", 8, fh)
         assert fs("read", "/before.txt", 9, 0, fh) == b"contents!"
+
+
+def test_ztierfs_uses_handle_snapshot_for_open_handle_permissions(
+    tmp_path, monkeypatch
+):
+    fs_impl = make_fs(tmp_path)
+    original_require_access = fs_impl._require_access
+    used_snapshots: list[bool] = []
+
+    def observed_require_access(node, mask):
+        used_snapshots.append(isinstance(node, FileHandleSnapshot))
+        return original_require_access(node, mask)
+
+    monkeypatch.setattr(fs_impl, "_require_access", observed_require_access)
+
+    with adapted(fs_impl) as fs:
+        fh = fs("create", "/cached.txt", 0o644)
+        fs("write", "/cached.txt", b"abc", 0, fh)
+
+        used_snapshots.clear()
+        fs("write", "/cached.txt", b"d", 3, fh)
+        assert fs("read", "/cached.txt", 4, 0, fh) == b"abcd"
+        assert used_snapshots == [True, True]
 
 
 def test_ztierfs_keeps_unlinked_open_file_until_release(tmp_path):
