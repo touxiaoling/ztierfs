@@ -8,6 +8,7 @@ import errno
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import Enum
 from time import time_ns
 from typing import Any
 
@@ -53,6 +54,14 @@ class PreparedFileWrite:
     chunks: list[tuple[int, PreparedBlock]]
 
 
+class FileWriteChunkKind(str, Enum):
+    """Classification of write work needed for one logical chunk."""
+
+    FULL_CHUNK_REPLACE = "full_chunk_replace"
+    PARTIAL_EXISTING_REPLACE = "partial_existing_replace"
+    SPARSE_EXTEND_PARTIAL = "sparse_extend_partial"
+
+
 @dataclass(frozen=True)
 class FileWriteChunkPlan:
     """One touched chunk for a write plan, with old metadata captured in read transaction."""
@@ -64,6 +73,7 @@ class FileWriteChunkPlan:
     write_stop: int
     source_start: int
     row: Any | None
+    kind: FileWriteChunkKind
 
 
 @dataclass(frozen=True)
@@ -268,6 +278,12 @@ class FileContentService:
                     write_stop=write_stop,
                     source_start=source_start,
                     row=block_rows.get(chunk_index),
+                    kind=self._write_chunk_kind(
+                        chunk_len=chunk_len,
+                        existing_len=existing_len,
+                        write_start=write_start,
+                        write_stop=write_stop,
+                    ),
                 )
             )
 
@@ -299,7 +315,7 @@ class FileContentService:
         for chunk in plan.chunks:
             take = chunk.write_stop - chunk.write_start
             source = plan.data[chunk.source_start : chunk.source_start + take]
-            if chunk.write_start == 0 and take == chunk.chunk_len:
+            if chunk.kind is FileWriteChunkKind.FULL_CHUNK_REPLACE:
                 pending_chunks.append((chunk.chunk_index, source))
                 continue
             old_chunk = bytearray(self.read_planned_chunk(chunk))
@@ -320,6 +336,15 @@ class FileContentService:
             plan.new_size,
             self.block_store.prepare_blocks(pending_chunks, plan.compress),
         )
+
+    def _write_chunk_kind(
+        self, *, chunk_len: int, existing_len: int, write_start: int, write_stop: int
+    ) -> FileWriteChunkKind:
+        if write_start == 0 and write_stop == chunk_len:
+            return FileWriteChunkKind.FULL_CHUNK_REPLACE
+        if existing_len < chunk_len:
+            return FileWriteChunkKind.SPARSE_EXTEND_PARTIAL
+        return FileWriteChunkKind.PARTIAL_EXISTING_REPLACE
 
     def commit_prepared_write(self, write: PreparedFileWrite) -> int:
         """将 ``PreparedFileWrite`` 落库：提交 chunk 替换，最后更新文件大小。"""

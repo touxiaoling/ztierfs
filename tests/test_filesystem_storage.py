@@ -4,6 +4,8 @@ import time
 
 from concurrent.futures import ThreadPoolExecutor
 
+from ztierfs.file_content import FileWriteChunkKind
+
 from .helpers import adapted, connect_sqlite, make_fs, rows
 
 
@@ -126,6 +128,30 @@ def test_ztierfs_prepares_partial_overwrite_after_read_transaction(
         assert (
             fs("read", "/partial.txt", len(data), 0, fh) == data[:10] + b"Z" + data[11:]
         )
+
+
+def test_ztierfs_write_plan_classifies_full_partial_and_sparse_chunks(tmp_path):
+    fs_impl = make_fs(tmp_path, chunk_size=8, inline_max_bytes=0)
+
+    with adapted(fs_impl) as fs:
+        fh = fs("create", "/planned.bin", 0o644)
+        fs("write", "/planned.bin", b"abcdefghij", 0, fh)
+        with fs_impl.metadata.read_transaction():
+            node = fs_impl.metadata.inode_by_id(fs_impl.handles.file_id(fh))
+            plan = fs_impl.file_content.plan_write_file(
+                node, "/planned.bin", b"XYZ" + b"12345678", 5
+            )
+            sparse_plan = fs_impl.file_content.plan_write_file(
+                node, "/planned.bin", b"tail", 18
+            )
+
+    assert [chunk.kind for chunk in plan.chunks] == [
+        FileWriteChunkKind.PARTIAL_EXISTING_REPLACE,
+        FileWriteChunkKind.FULL_CHUNK_REPLACE,
+    ]
+    assert [chunk.kind for chunk in sparse_plan.chunks] == [
+        FileWriteChunkKind.SPARSE_EXTEND_PARTIAL
+    ]
 
 
 def test_ztierfs_clonefile_copies_metadata_without_reprocessing_blocks(
