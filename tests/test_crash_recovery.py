@@ -595,6 +595,56 @@ def test_after_commit_gc_leaves_large_pending_delete_queue_for_cleanup(tmp_path)
     assert rows(fs_impl, "SELECT * FROM pending_deletions") == []
 
 
+def test_after_commit_gc_skips_cold_pending_delete_queue(tmp_path):
+    fs_impl = make_fs(tmp_path, inline_max_bytes=0)
+    _write_committed_file(fs_impl, "/victim.jpg")
+    digest = _single_block_digest(fs_impl)
+    hot_path = block_path(fs_impl.tier1, fs_impl.tier2, digest, 1)
+    cold_path = block_path(fs_impl.tier1, fs_impl.tier2, digest, 2)
+    cold_path.parent.mkdir(parents=True, exist_ok=True)
+    cold_path.write_bytes(hot_path.read_bytes())
+
+    fs = OperationsAdapter(fs_impl)
+    with connect_sqlite(fs_impl.database) as db:
+        db.execute(
+            "UPDATE blocks SET cold_present = 1 WHERE hash = ?",
+            (digest,),
+        )
+    fs("unlink", "/victim.jpg")
+
+    assert not hot_path.exists()
+    assert cold_path.exists()
+    pending = rows(
+        fs_impl,
+        "SELECT digest, tier FROM pending_deletions ORDER BY tier",
+    )
+    assert [(row["digest"], row["tier"]) for row in pending] == [(digest, 2)]
+
+
+def test_block_store_close_skips_cold_pending_deletions(tmp_path):
+    fs_impl = make_fs(tmp_path, inline_max_bytes=0)
+    _write_committed_file(fs_impl, "/victim.jpg")
+    digest = _single_block_digest(fs_impl)
+    hot_path = block_path(fs_impl.tier1, fs_impl.tier2, digest, 1)
+    cold_path = block_path(fs_impl.tier1, fs_impl.tier2, digest, 2)
+    cold_path.parent.mkdir(parents=True, exist_ok=True)
+    cold_path.write_bytes(hot_path.read_bytes())
+    fs_impl.metadata._after_commit_hooks.clear()
+    with connect_sqlite(fs_impl.database) as db:
+        db.execute(
+            "UPDATE blocks SET cold_present = 1 WHERE hash = ?",
+            (digest,),
+        )
+    OperationsAdapter(fs_impl)("unlink", "/victim.jpg")
+
+    fs_impl.close()
+
+    assert not hot_path.exists()
+    assert cold_path.exists()
+    pending = rows(fs_impl, "SELECT digest, tier FROM pending_deletions")
+    assert [(row["digest"], row["tier"]) for row in pending] == [(digest, 2)]
+
+
 def test_pending_delete_drain_batches_queue_updates(tmp_path, monkeypatch):
     fs_impl = make_fs(tmp_path, inline_max_bytes=0, chunk_size=1024)
     data = b"".join(bytes([index]) * 1024 for index in range(3))

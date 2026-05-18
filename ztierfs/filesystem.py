@@ -222,7 +222,7 @@ class ZTierFS(
         )
 
         def drain_pending_deletions() -> None:
-            self.block_store.drain_pending_deletions(max_deletions=64)
+            self.block_store.drain_pending_deletions(max_deletions=64, tier=1)
 
         def drain_requested_demotions() -> None:
             self.block_store.drain_requested_demotions(max_blocks=1)

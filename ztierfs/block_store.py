@@ -169,7 +169,7 @@ class BlockStore:
         logger.info("关闭块存储")
         self.metadata.commit()
         self.drain_requested_demotions()
-        self.drain_pending_deletions()
+        self.drain_pending_deletions(tier=1)
         executor = self._prepare_executor
         if executor is not None:
             logger.debug("关闭块准备线程池")
@@ -682,13 +682,18 @@ class BlockStore:
                 )
 
     def drain_pending_deletions(
-        self, *, batch_size: int = 256, max_deletions: int | None = None
+        self,
+        *,
+        batch_size: int = 256,
+        max_deletions: int | None = None,
+        tier: int | None = None,
     ) -> int:
         """Delete queued physical payloads after their metadata transaction has committed.
 
         ``max_deletions`` limits the number of queue rows processed by a latency-sensitive
         caller such as an after-commit hook. ``None`` keeps draining until the queue is
-        empty or the next batch cannot make progress.
+        empty or the next batch cannot make progress. ``tier`` narrows the drain to one
+        physical tier so foreground hooks can avoid cold-tier deletes.
         """
         removed = 0
         while True:
@@ -699,7 +704,7 @@ class BlockStore:
                 limit = min(limit, max_deletions - removed)
             with self.metadata.read_transaction():
                 with timed("gc.pending.read"):
-                    rows = self.metadata.pending_deletions(limit)
+                    rows = self.metadata.pending_deletions(limit, tier=tier)
             if not rows:
                 return removed
             removed_ids: list[int] = []
