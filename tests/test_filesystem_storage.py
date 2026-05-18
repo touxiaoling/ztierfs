@@ -443,10 +443,41 @@ def test_file_content_read_file_batches_access_stats_until_commit(tmp_path):
     )
 
 
-def test_ztierfs_reads_multi_chunk_plan_in_parallel(tmp_path, monkeypatch):
+def test_ztierfs_reads_small_multi_chunk_plan_synchronously(tmp_path, monkeypatch):
     fs_impl = make_fs(tmp_path, inline_max_bytes=0)
     data = bytes(range(256)) * 8
-    barrier = threading.Barrier(2)
+    lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    with adapted(fs_impl) as fs:
+        fh = fs("create", "/movie.jpg", 0o644)
+        fs("write", "/movie.jpg", data, 0, fh)
+        original = fs_impl.block_store.read_block_snapshot
+
+        def observed_read_block(row, expected_size):
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                return original(row, expected_size)
+            finally:
+                with lock:
+                    active -= 1
+
+        monkeypatch.setattr(
+            fs_impl.block_store, "read_block_snapshot", observed_read_block
+        )
+        assert fs("read", "/movie.jpg", len(data), 0, fh) == data
+
+    assert max_active == 1
+
+
+def test_ztierfs_reads_large_multi_chunk_plan_in_parallel(tmp_path, monkeypatch):
+    fs_impl = make_fs(tmp_path, chunk_size=128 * 1024, inline_max_bytes=0)
+    data = b"".join(bytes([index]) * fs_impl.chunk_size for index in range(4))
+    barrier = threading.Barrier(4)
     lock = threading.Lock()
     active = 0
     max_active = 0
@@ -473,7 +504,7 @@ def test_ztierfs_reads_multi_chunk_plan_in_parallel(tmp_path, monkeypatch):
         )
         assert fs("read", "/movie.jpg", len(data), 0, fh) == data
 
-    assert max_active == 2
+    assert max_active > 1
 
 
 def test_ztierfs_prepares_uncompressed_multi_chunk_writes_in_parallel(

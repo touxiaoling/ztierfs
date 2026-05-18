@@ -35,6 +35,9 @@ from .tier_access import (
     unlink_path,
 )
 
+PARALLEL_READ_MIN_BLOCKS = 4
+PARALLEL_READ_MIN_BYTES = 512 * 1024
+
 
 @dataclass(frozen=True)
 class TieringPolicy:
@@ -231,8 +234,8 @@ class BlockStore:
     def read_block_snapshots(
         self, requests: list[tuple[object, int]]
     ) -> list[tuple[bytes, BlockAccess]]:
-        """批量 ``read_block_snapshot``；多请求时在共享线程池中并行读盘/解码。"""
-        if len(requests) <= 1:
+        """批量 ``read_block_snapshot``；小读同步，大读在共享线程池中并行读盘/解码。"""
+        if not self._should_parallel_read(requests):
             return [
                 self.read_block_snapshot(row, expected_size)
                 for row, expected_size in requests
@@ -243,6 +246,16 @@ class BlockStore:
             for row, expected_size in requests
         ]
         return [future.result() for future in futures]
+
+    def _should_parallel_read(self, requests: list[tuple[object, int]]) -> bool:
+        if len(requests) < PARALLEL_READ_MIN_BLOCKS:
+            return False
+        if (
+            sum(expected_size for _row, expected_size in requests)
+            < PARALLEL_READ_MIN_BYTES
+        ):
+            return False
+        return True
 
     def should_copy_up_from_cold(self, row, tier: int) -> bool:
         """当本次从冷层（tier2）读取、且块 ``stored_size`` 不超过 ``hot_max_bytes`` 时建议 copy-up。"""
