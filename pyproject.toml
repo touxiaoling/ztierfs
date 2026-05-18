@@ -8,6 +8,7 @@ dependencies = [
     "loguru>=0.7.3",
     "macfusepy>=0.6.0",
     "rich>=15.0.0",
+    "typer>=0.25.1",
 ]
 classifiers = ["Operating System :: MacOS :: MacOS X"]
 
