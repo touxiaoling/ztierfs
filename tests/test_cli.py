@@ -292,6 +292,7 @@ def test_cli_cleanup_outputs_json(tmp_path, capsys):
     assert output == {
         "removed_cold_copies": 0,
         "removed_pending_deletions": 0,
+        "pending_deletion_unavailable": 0,
         "skipped_cold_copies": 0,
         "skipped_pending_deletions": 0,
     }

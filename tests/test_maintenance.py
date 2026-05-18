@@ -466,6 +466,36 @@ def test_cleanup_skips_cold_copy_when_cold_tier_unavailable(tmp_path, monkeypatc
     )
 
 
+def test_cleanup_reports_pending_deletion_unavailable(tmp_path, monkeypatch):
+    fs_impl = make_fs(tmp_path, inline_max_bytes=0)
+    with adapted(fs_impl) as fs:
+        fh = fs("create", "/victim.txt", 0o644)
+        fs("write", "/victim.txt", b"hello", 0, fh)
+
+    digest = rows(fs_impl, "SELECT hash FROM blocks")[0]["hash"]
+    hot_path = block_path(fs_impl.tier1, fs_impl.tier2, digest, 1)
+    with connect_sqlite(fs_impl.database) as db:
+        db.execute(
+            """
+            INSERT INTO pending_deletions (kind, digest, tier, enqueued_ns)
+            VALUES ('block_file', ?, 1, ?)
+            """,
+            (digest, time_ns()),
+        )
+
+    _make_path_stat_unavailable(monkeypatch, hot_path)
+
+    report = cleanup_promoted_cold_copies(
+        fs_impl.database,
+        min_age_seconds=0,
+    )
+
+    assert report.pending_removed == 0
+    assert report.pending_skipped == 1
+    assert report.pending_unavailable == 1
+    assert rows(fs_impl, "SELECT * FROM pending_deletions")
+
+
 def test_schema_rejects_invalid_metadata_rows(tmp_path):
     fs_impl = make_fs(tmp_path)
     try:

@@ -106,6 +106,8 @@ uv run python -m ztierfs mount /tmp/ztierfs-hot /tmp/ztierfs-cold /tmp/ztierfs-m
 - `--readahead-blocks`：检测到顺序读取时后台预读的后续块数，默认 `1`；设为 `0` 禁用。
 - `--readahead-workers`：后台预读线程数，默认 `1`；设为 `0` 同样禁用预读。
 
+读目录、读符号链接和读文件只会延迟合并 inode atime 与块访问统计；达到阈值、后续写事务、`flush`/`fsync`/关闭文件系统或显式维护提交时再落库。这样目录扫描和小读不会为每次访问都打开 SQLite 写事务。
+
 FUSE/内核交互：
 
 - `--iosize`：传给 macFUSE 的单次 I/O 请求大小，默认与 `--chunk-size` 一致。调大可能触发 Finder 大文件复制错误。
@@ -145,7 +147,9 @@ uv run python -m ztierfs scrub /tmp/ztierfs-metadata.sqlite3 --include-cold
 uv run python -m ztierfs stats /tmp/ztierfs-metadata.sqlite3 --json
 ```
 
-`cleanup` 删除已经提升到热层、并且超过保留时间的冷层副本。它适合定期运行，用来把 rclone 冷层的删除操作从读路径上移走。冷层临时不可访问时会跳过对应副本并保留 `blocks.cold_present` 元数据，输出中的 `skipped_cold_copies` 表示本次未处理的冷层副本数量：
+普通写事务提交后只会按小预算清理一部分 `pending_deletions`，大量 unlink、truncate 或 rename overwrite 不会在返回前同步清空所有物理 GC 队列。剩余队列是可恢复状态，由后续提交、关闭文件系统或 `cleanup` 继续处理。
+
+`cleanup` 删除已经提升到热层、并且超过保留时间的冷层副本，并完整 drain `pending_deletions`。它适合定期运行，用来把 rclone 冷层的删除操作从读路径上移走。冷层临时不可访问时会跳过对应副本并保留 `blocks.cold_present` 元数据，输出中的 `skipped_cold_copies` 表示本次未处理的冷层副本数量；待删除 payload 路径暂不可用时会保留队列项，并在 JSON 输出中通过 `pending_deletion_unavailable` 计数：
 
 ```bash
 uv run python -m ztierfs cleanup /tmp/ztierfs-metadata.sqlite3 --age 86400
@@ -202,6 +206,8 @@ SQLite 表：
 - `ztierfs/maintenance/`：`fsck`、`scrub`、`stats`、`cleanup` 共享的检查器、修复器、报告与配置加载。
 
 修改文件系统行为时，优先增加描述可观察文件系统语义的测试。当前已经覆盖的重要行为包括稀疏写、跨块覆盖、去重、`clonefile` 块引用克隆、引用计数清理、已打开后 unlink 的文件、rename 覆盖已打开目标、重新打开后的持久化，以及真实挂载下的读写闭环。涉及 SQLite 元数据和块文件同时变化的路径，还应补充故障注入测试；现有崩溃恢复测试覆盖了写入后事务回滚留下孤儿块、冷热降级中途失败后的层级修复，unlink、truncate、覆盖写和 rename 覆盖在块文件删除后事务回滚时的不可修复缺块报告，以及 hardlink、xattr、复杂目录树 rename、跨块覆盖写、copy-up、cleanup 和引用计数更新路径上的事务回滚/修复行为。
+
+性能改动应结合 `tests/test_benchmarks.py` 里的 workload 观察 small file read/write、readdir with attrs、stat many files、large sequential write、sequential block read、random read、full block overwrite、cross-block partial write、rename/unlink batch 和 cold copy-up。除总耗时外，优先关注 SQLite execute/executemany 次数、块 IO 字节数、zstd encode/decode 时间、after-commit GC 清理数量和 pending deletion 残留数量。
 
 ## 运行测试
 

@@ -411,6 +411,7 @@ def _cleanup_report_to_dict(report) -> dict[str, int]:
         "skipped_cold_copies": report.skipped,
         "removed_pending_deletions": report.pending_removed,
         "skipped_pending_deletions": report.pending_skipped,
+        "pending_deletion_unavailable": report.pending_unavailable,
     }
 
 
@@ -419,7 +420,7 @@ def _cleanup_report_to_text(report) -> str:
     return (
         f"cleanup: removed {report.removed} promoted cold copy/copies, "
         f"skipped {report.skipped}, removed {report.pending_removed} pending deletion(s), "
-        f"skipped {report.pending_skipped}"
+        f"skipped {report.pending_skipped}, unavailable {report.pending_unavailable}"
     )
 
 

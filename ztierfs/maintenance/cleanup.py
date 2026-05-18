@@ -26,6 +26,7 @@ class CleanupReport:
     skipped: int = 0
     pending_removed: int = 0
     pending_skipped: int = 0
+    pending_unavailable: int = 0
 
 
 def cleanup_promoted_cold_copies(
@@ -51,6 +52,7 @@ def cleanup_promoted_cold_copies(
     skipped = 0
     pending_removed = 0
     pending_skipped = 0
+    pending_unavailable = 0
     logger.info(
         "开始维护清理冷层副本：database={}，tier1={}，tier2={}，min_age_seconds={}",
         db_path,
@@ -61,8 +63,8 @@ def cleanup_promoted_cold_copies(
     with closing(open_database(db_path)) as db:
         db.execute("BEGIN IMMEDIATE")
         try:
-            pending_removed, pending_skipped = _drain_pending_deletions(
-                db, tier1_path, tier2_path
+            pending_removed, pending_skipped, pending_unavailable = (
+                _drain_pending_deletions(db, tier1_path, tier2_path)
             )
             rows = db.execute(
                 """
@@ -118,6 +120,7 @@ def cleanup_promoted_cold_copies(
         skipped=skipped,
         pending_removed=pending_removed,
         pending_skipped=pending_skipped,
+        pending_unavailable=pending_unavailable,
     )
 
 
@@ -125,7 +128,7 @@ def _drain_pending_deletions(
     db,
     tier1_path: Path,
     tier2_path: Path,
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
     """Best-effort drain of physical deletes that were committed before a crash."""
     try:
         rows = db.execute(
@@ -137,16 +140,25 @@ def _drain_pending_deletions(
         ).fetchall()
     except Exception as exc:
         if "no such table: pending_deletions" in str(exc):
-            return 0, 0
+            return 0, 0, 0
         raise
 
     removed = 0
     skipped = 0
+    unavailable = 0
     for row in rows:
+        path = block_path(tier1_path, tier2_path, row["digest"], row["tier"])
+        probe = probe_path(path)
+        if probe.unavailable:
+            skipped += 1
+            unavailable += 1
+            continue
         try:
-            unlink_path(block_path(tier1_path, tier2_path, row["digest"], row["tier"]))
+            if probe.present:
+                unlink_path(path)
         except PathUnavailable:
             skipped += 1
+            unavailable += 1
             continue
         except OSError:
             logger.exception("维护清理待 GC payload 失败：id={}", row["id"])
@@ -154,4 +166,4 @@ def _drain_pending_deletions(
             continue
         db.execute("DELETE FROM pending_deletions WHERE id = ?", (row["id"],))
         removed += 1
-    return removed, skipped
+    return removed, skipped, unavailable
