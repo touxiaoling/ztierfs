@@ -473,9 +473,7 @@ def test_ztierfs_updates_refcounts_when_overwriting_and_unlinking(tmp_path):
     assert block_rows[0]["refcount"] == 1
 
 
-def test_ztierfs_keeps_unreferenced_cold_block_index_for_reuse(
-    tmp_path, monkeypatch
-):
+def test_ztierfs_keeps_unreferenced_cold_block_index_for_reuse(tmp_path, monkeypatch):
     fs_impl = make_fs(tmp_path, inline_max_bytes=0)
     data = b"cold-garbage" * 64
 
@@ -756,6 +754,64 @@ def test_ztierfs_cold_copy_up_does_not_block_read(tmp_path, monkeypatch):
 
         fs("release", "/cold.jpg", cold_fh)
         fs("release", "/hot.jpg", hot_fh)
+
+
+def test_ztierfs_demote_trusts_cold_present_without_probe(tmp_path, monkeypatch):
+    fs_impl = make_fs(
+        tmp_path,
+        hot_cache_max_bytes=1,
+        hot_cache_min_bytes=0,
+        protected_prefix_chunks=0,
+        min_hot_age_seconds=0,
+        inline_max_bytes=0,
+    )
+    data = b"already-cold" * 128
+
+    import ztierfs.block_store as block_store_module
+
+    original_probe_path = block_store_module.probe_path
+
+    with adapted(fs_impl) as fs:
+        fh = fs("create", "/movie.jpg", 0o644)
+        fs("write", "/movie.jpg", data, 0, fh)
+        digest = rows(fs_impl, "SELECT hash FROM blocks")[0]["hash"]
+        hot_path = fs_impl.block_store.block_path(digest, 1)
+        cold_path = fs_impl.block_store.block_path(digest, 2)
+        with connect_sqlite(fs_impl.database) as db:
+            db.execute(
+                "UPDATE blocks SET cold_present = 1 WHERE hash = ?",
+                (digest,),
+            )
+
+        def fail_cold_probe(path):
+            if path == cold_path:
+                raise AssertionError(
+                    "demote must trust SQLite cold_present without probing cold tier"
+                )
+            return original_probe_path(path)
+
+        monkeypatch.setattr(block_store_module, "probe_path", fail_cold_probe)
+
+        def fail_copy_block(digest_arg, source_tier, target_tier):
+            raise AssertionError(
+                "demote must not copy when cold_present is already set"
+            )
+
+        monkeypatch.setattr(fs_impl.block_store, "copy_block", fail_copy_block)
+
+        fs_impl.block_store.request_demotion()
+        assert fs_impl.block_store.drain_requested_demotions(max_blocks=1) == 1
+        assert not hot_path.exists()
+        with connect_sqlite(fs_impl.database) as db:
+            row = db.execute(
+                """
+                SELECT hot_present, cold_present, preferred_tier
+                FROM block_records
+                WHERE hash = ?
+                """,
+                (digest,),
+            ).fetchone()
+        assert row == (0, 1, 2)
 
 
 def test_ztierfs_moves_least_recently_used_blocks_to_cold_tier(tmp_path):

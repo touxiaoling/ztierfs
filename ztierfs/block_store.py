@@ -833,16 +833,16 @@ class BlockStore:
                 logger.info("热层降级停止：没有可降级候选，hot_bytes={}", total)
                 return demoted
             now = time_ns()
-            cold_probe = probe_path(self.block_path(row["hash"], 2))
-            if cold_probe.unavailable:
-                logger.warning(
-                    "热层降级暂停：冷层临时不可用，hash={}，error={}",
-                    row["hash"][:12],
-                    cold_probe.error,
-                )
-                self._demotion_requested = True
-                return demoted
-            if not row["cold_present"] or cold_probe.missing:
+            if not row["cold_present"]:
+                cold_probe = probe_path(self.block_path(row["hash"], 2))
+                if cold_probe.unavailable:
+                    logger.warning(
+                        "热层降级暂停：冷层临时不可用，hash={}，error={}",
+                        row["hash"][:12],
+                        cold_probe.error,
+                    )
+                    self._demotion_requested = True
+                    return demoted
                 with timed("tier.demote.copy"):
                     self.copy_block(row["hash"], 1, 2)
             try:
