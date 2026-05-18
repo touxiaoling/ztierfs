@@ -230,6 +230,52 @@ def test_fsck_does_not_repair_missing_referenced_block_file(tmp_path):
     assert report.has_unrepaired
 
 
+def test_fsck_reports_missing_referenced_cold_present_block(tmp_path):
+    fs_impl = make_fs(tmp_path, inline_max_bytes=0)
+    digest, _data, cold_path = _make_cold_only_block(fs_impl)
+    cold_path.unlink()
+
+    report = run_fsck(fs_impl.database, repair=True)
+
+    assert [issue.code for issue in report.issues] == ["missing_block_file"]
+    assert report.issues[0].details["hash"] == digest
+    assert not report.issues[0].repaired
+    assert report.has_unrepaired
+
+
+def test_fsck_accepts_referenced_zero_cold_garbage(tmp_path):
+    fs_impl = make_fs(tmp_path, inline_max_bytes=0)
+    _digest, cold_path = _make_cold_garbage(
+        fs_impl, b"valid-cold-garbage" * 32, enqueued_ns=1
+    )
+
+    report = run_fsck(fs_impl.database, repair=True)
+
+    assert report.ok
+    assert cold_path.exists()
+    row = rows(
+        fs_impl,
+        "SELECT refcount, cold_present, cold_gc_enqueued_ns FROM blocks",
+    )[0]
+    assert (row["refcount"], row["cold_present"]) == (0, 1)
+    assert row["cold_gc_enqueued_ns"] == 1
+
+
+def test_fsck_repairs_missing_cold_garbage_metadata(tmp_path):
+    fs_impl = make_fs(tmp_path, inline_max_bytes=0)
+    digest, cold_path = _make_cold_garbage(
+        fs_impl, b"missing-cold-garbage" * 32, enqueued_ns=1
+    )
+    cold_path.unlink()
+
+    report = run_fsck(fs_impl.database, repair=True)
+
+    assert [issue.code for issue in report.issues] == ["missing_cold_garbage"]
+    assert report.issues[0].details["hash"] == digest
+    assert report.issues[0].repaired
+    assert rows(fs_impl, "SELECT * FROM blocks") == []
+
+
 def test_read_cold_block_unavailable_preserves_location_metadata(tmp_path, monkeypatch):
     fs_impl = make_fs(tmp_path, inline_max_bytes=0)
     _digest, data, cold_path = _make_cold_only_block(fs_impl)
