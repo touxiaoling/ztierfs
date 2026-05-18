@@ -112,7 +112,7 @@ def test_ztierfs_prepares_partial_overwrite_after_read_transaction(
     original_read_block_snapshot = fs_impl.block_store.read_block_snapshot
 
     def observed_read_block_snapshot(row, expected_size):
-        assert not getattr(fs_impl.metadata._local, "transaction_read_only", False)
+        assert not getattr(fs_impl.metadata._local, "readonly", False)
         return original_read_block_snapshot(row, expected_size)
 
     monkeypatch.setattr(

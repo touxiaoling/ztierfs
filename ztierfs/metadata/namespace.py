@@ -91,6 +91,16 @@ class NamespaceMixin(MetadataMixinBase):
             (node_id, node_id),
         ).fetchone()
 
+    def inode_by_id(self, node_id: int) -> sqlite3.Row | None:
+        """按 id 仅取 inode 行，不联查目录项。"""
+        return self._db.execute(
+            f"""
+            {self.NODE_SELECT}
+            WHERE id = ?
+            """,
+            (node_id,),
+        ).fetchone()
+
     def child_dir_count(self, parent_id: int) -> int:
         """统计父目录下子项中 kind 为目录的个数。"""
         return self._db.execute(

@@ -56,6 +56,13 @@ class InodeFuseMixin(InodeOperations, FileSystemMixinBase):
             raise FuseOSError(errno.ENOENT)
         return row
 
+    def _inode_by_ino(self, ino: int):
+        """按 inode 号加载轻量 inode 行；不存在则 ``FuseOSError(ENOENT)``。"""
+        row = self.metadata.inode_by_id(ino)
+        if row is None:
+            raise FuseOSError(errno.ENOENT)
+        return row
+
     def _file_node_from_ino_or_fh(self, ino: int, fh):
         """解析「当前操作针对的」文件 inode：若 ``fh`` 对应打开文件句柄则取其绑定的 ``file_id``，否则用 ``ino``。
 
@@ -64,8 +71,8 @@ class InodeFuseMixin(InodeOperations, FileSystemMixinBase):
         """
         file_id = self.handles.file_id(fh)
         if file_id is not None:
-            return self._node_by_ino(file_id)
-        return self._node_by_ino(ino)
+            return self._inode_by_ino(file_id)
+        return self._inode_by_ino(ino)
 
     def _entry_from_node(self, name: bytes, node, next_id: int) -> LowLevelEntry:
         """由子节点行构造 ``LowLevelEntry``，并缓存 inode→显示名供块路径等使用。"""
@@ -83,7 +90,9 @@ class InodeFuseMixin(InodeOperations, FileSystemMixinBase):
     def _name_for_inode(self, node) -> str:
         """返回用于日志/块操作的规范化绝对路径样式字符串（优先缓存名，否则节点字段）。"""
         names = getattr(self, "_inode_names", {})
-        name = names.get(node["id"], node["name"] or "")
+        name = names.get(node["id"])
+        if name is None:
+            name = node["name"] or ""
         return name if name.startswith("/") else f"/{name}"
 
     def init(self, conn=None, cfg=None) -> None:
@@ -274,7 +283,7 @@ class InodeFuseMixin(InodeOperations, FileSystemMixinBase):
         """``open`` 的实现体；返回 ``handles.new(ino, ...)``。"""
         self._ensure_trash_directory_for_caller()
         with self.metadata.read_transaction():
-            node = self._node_by_ino(ino)
+            node = self._inode_by_ino(ino)
             if node["kind"] != "file":
                 raise FuseOSError(errno.EISDIR)
             self._require_open_access(node, flags)
@@ -676,7 +685,7 @@ class InodeFuseMixin(InodeOperations, FileSystemMixinBase):
     def _readlink_inode(self, ino: int) -> str:
         """``readlink`` 的实现体；延迟更新 symlink atime。"""
         with self.metadata.read_transaction():
-            node = self._node_by_ino(ino)
+            node = self._inode_by_ino(ino)
             if node["kind"] != "symlink":
                 raise FuseOSError(errno.EINVAL)
             target = node["symlink_target"]

@@ -120,6 +120,31 @@ def test_ztierfs_reads_renamed_file_by_existing_handle(tmp_path):
         assert fs("read", "/before.txt", 8, 0, fh) == b"contents"
 
 
+def test_ztierfs_uses_lightweight_inode_lookup_for_open_handle_io(
+    tmp_path, monkeypatch
+):
+    fs_impl = make_fs(tmp_path)
+    original_node_by_id = fs_impl.metadata.node_by_id
+    forbidden = False
+
+    def observed_node_by_id(node_id):
+        if forbidden:
+            raise AssertionError("open handle IO should use lightweight inode lookup")
+        return original_node_by_id(node_id)
+
+    monkeypatch.setattr(fs_impl.metadata, "node_by_id", observed_node_by_id)
+
+    with adapted(fs_impl) as fs:
+        fh = fs("create", "/before.txt", 0o644)
+        fs("write", "/before.txt", b"contents", 0, fh)
+        fs("rename", "/before.txt", "/after.txt", 0)
+
+        forbidden = True
+        assert fs("getattr", "/before.txt", fh)["st_size"] == 8
+        fs("write", "/before.txt", b"!", 8, fh)
+        assert fs("read", "/before.txt", 9, 0, fh) == b"contents!"
+
+
 def test_ztierfs_keeps_unlinked_open_file_until_release(tmp_path):
     fs_impl = make_fs(tmp_path)
 

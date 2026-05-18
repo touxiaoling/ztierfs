@@ -49,7 +49,7 @@ class FileOpsMixin(FileSystemMixinBase):
         """预读工作线程执行的单次 chunk 拉取。"""
         try:
             with self.metadata.read_transaction():
-                node = self.metadata.node_by_id(file_id)
+                node = self.metadata.inode_by_id(file_id)
                 if node is None or node["kind"] != "file":
                     return
                 chunk_start = chunk_index * self.chunk_size
@@ -91,7 +91,7 @@ class FileOpsMixin(FileSystemMixinBase):
             return 0
 
         with self.metadata.read_transaction():
-            node = self.metadata.node_by_id(file_id)
+            node = self.metadata.inode_by_id(file_id)
             needs_cleanup = node is not None and node["nlink"] == 0
         if needs_cleanup:
             with self.metadata.transaction():

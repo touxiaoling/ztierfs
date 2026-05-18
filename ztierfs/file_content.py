@@ -339,7 +339,7 @@ class FileContentService:
         """
         if length < 0:
             raise FuseOSError(errno.EINVAL)
-        node = self.metadata.node_by_id(file_id)
+        node = self.metadata.inode_by_id(file_id)
         if node is None:
             raise FuseOSError(errno.ENOENT)
         old_size = node["size"]
