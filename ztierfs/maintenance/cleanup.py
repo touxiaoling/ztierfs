@@ -9,6 +9,7 @@ from loguru import logger
 
 from ztierfs.constants import DEFAULT_COLD_GC_AGE_SECONDS
 from ztierfs.metadata import open_database
+from ztierfs.pending_deletions import drain_pending_block_files
 from ztierfs.tier_access import PathUnavailable, probe_path, unlink_path
 
 from .config import resolve_maintenance_paths
@@ -199,30 +200,19 @@ def _drain_pending_deletions(
             return 0, 0, 0
         raise
 
-    removed = 0
-    skipped = 0
-    unavailable = 0
-    for row in rows:
-        path = block_path(tier1_path, tier2_path, row["digest"], row["tier"])
-        probe = probe_path(path)
-        if probe.unavailable:
-            skipped += 1
-            unavailable += 1
-            continue
-        try:
-            if probe.present:
-                unlink_path(path)
-        except PathUnavailable:
-            skipped += 1
-            unavailable += 1
-            continue
-        except OSError:
-            logger.exception("维护清理待 GC payload 失败：id={}", row["id"])
-            skipped += 1
-            continue
-        db.execute("DELETE FROM pending_deletions WHERE id = ?", (row["id"],))
-        removed += 1
-    return removed, skipped, unavailable
+    outcome = drain_pending_block_files(
+        rows,
+        lambda digest, row_tier: block_path(tier1_path, tier2_path, digest, row_tier),
+    )
+    db.executemany(
+        "DELETE FROM pending_deletions WHERE id = ?",
+        [(deletion_id,) for deletion_id in outcome.removed_ids],
+    )
+    return (
+        len(outcome.removed_ids),
+        len(outcome.deferred_ids),
+        len(outcome.unavailable_ids),
+    )
 
 
 def _cleanup_cold_garbage(

@@ -27,6 +27,7 @@ from macfusepy import FuseOSError
 from .block_layout import block_file_path
 from .metadata.blocks import BlockInsert
 from .metadata import MetadataStore
+from .pending_deletions import drain_pending_block_files
 from .perf import count, timed
 from .tier_access import (
     PathMissing,
@@ -667,41 +668,21 @@ class BlockStore:
                     rows = self.metadata.pending_deletions(limit, tier=tier)
             if not rows:
                 return removed
-            removed_ids: list[int] = []
-            deferred_ids: list[int] = []
-            for row in rows:
-                try:
-                    if row["kind"] == "block_file":
-                        with timed("gc.pending.unlink"):
-                            deleted_or_missing = not unlink_path(
-                                self.block_path(row["digest"], row["tier"])
-                            )
-                except PathUnavailable:
-                    logger.warning(
-                        "待 GC 块文件暂时不可用：id={}，hash={}，tier={}",
-                        row["id"],
-                        str(row["digest"])[:12],
-                        row["tier"],
-                    )
-                    deferred_ids.append(row["id"])
-                    continue
-                except OSError:
-                    logger.exception("待 GC payload 删除失败：id={}", row["id"])
-                    deferred_ids.append(row["id"])
-                    continue
-                removed_ids.append(row["id"])
-                if deleted_or_missing:
-                    logger.debug(
-                        "待 GC payload 已清理：id={}，kind={}", row["id"], row["kind"]
-                    )
-            if removed_ids or deferred_ids:
+            with timed("gc.pending.unlink"):
+                outcome = drain_pending_block_files(
+                    rows,
+                    lambda digest, tier: self.block_path(digest, tier),
+                )
+            for deletion_id in outcome.unavailable_ids:
+                logger.warning("待 GC 块文件暂时不可用：id={}", deletion_id)
+            if outcome.removed_ids or outcome.deferred_ids:
                 now = time_ns()
                 with timed("gc.pending.commit"):
                     with self.metadata.transaction():
-                        self.metadata.remove_pending_deletions(removed_ids)
-                        self.metadata.defer_pending_deletions(deferred_ids, now)
-                removed += len(removed_ids)
-            if max_deletions is None and not removed_ids and not deferred_ids:
+                        self.metadata.remove_pending_deletions(outcome.removed_ids)
+                        self.metadata.defer_pending_deletions(outcome.deferred_ids, now)
+                removed += len(outcome.removed_ids)
+            if not outcome.removed_ids:
                 return removed
 
     def copy_block(self, digest: str, source_tier: int, target_tier: int) -> None:

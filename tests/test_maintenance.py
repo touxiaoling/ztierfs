@@ -569,7 +569,14 @@ def test_cleanup_reports_pending_deletion_unavailable(tmp_path, monkeypatch):
             (digest, time_ns()),
         )
 
-    _make_path_stat_unavailable(monkeypatch, hot_path)
+    original_unlink = Path.unlink
+
+    def unavailable_unlink(path, *args, **kwargs):
+        if path == hot_path:
+            raise OSError(errno.EIO, "rclone hot tier unavailable")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", unavailable_unlink)
 
     report = cleanup_promoted_cold_copies(
         fs_impl.database,

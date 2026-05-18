@@ -1,6 +1,8 @@
 import errno
 import os
 
+from pathlib import Path
+
 import pytest
 from macfusepy import FuseOSError
 
@@ -701,3 +703,28 @@ def test_pending_delete_drain_batches_queue_updates(tmp_path, monkeypatch):
 
     assert write_transactions == 1
     assert rows(fs_impl, "SELECT * FROM pending_deletions") == []
+
+
+def test_pending_delete_drain_keeps_unavailable_rows(tmp_path, monkeypatch):
+    fs_impl = make_fs(tmp_path, inline_max_bytes=0)
+    data = _write_committed_file(fs_impl, "/victim.jpg")
+    assert data
+    digest = _single_block_digest(fs_impl)
+    fs_impl.metadata._after_commit_hooks.clear()
+    OperationsAdapter(fs_impl)("unlink", "/victim.jpg")
+
+    hot_path = block_path(fs_impl.tier1, fs_impl.tier2, digest, 1)
+    original_unlink = Path.unlink
+
+    def unavailable_unlink(path, *args, **kwargs):
+        if path == hot_path:
+            raise OSError(errno.EIO, "rclone hot tier unavailable")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", unavailable_unlink)
+
+    assert fs_impl.block_store.drain_pending_deletions(batch_size=1) == 0
+
+    pending = rows(fs_impl, "SELECT digest, tier FROM pending_deletions")
+    assert [(row["digest"], row["tier"]) for row in pending] == [(digest, 1)]
+    assert hot_path.exists()
