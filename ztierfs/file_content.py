@@ -350,8 +350,8 @@ class FileContentService:
         if not chunks:
             return
         replacements: dict[int, ChunkReplacement] = {}
+        self.block_store.ensure_prepared_blocks(block for _chunk_index, block in chunks)
         for chunk_index, block in chunks:
-            self.block_store.ensure_prepared_block(block)
             replacements[chunk_index] = ChunkReplacement(block.digest, block.raw_size)
         deltas = self.metadata.replace_file_chunks(file_id, replacements)
         logger.debug(

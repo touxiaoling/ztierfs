@@ -69,6 +69,41 @@ def test_ztierfs_deduplicates_equal_chunks(tmp_path):
     assert block_rows[0]["refcount"] == 2
 
 
+def test_ztierfs_batches_duplicate_prepared_chunks_within_one_write(
+    tmp_path, monkeypatch
+):
+    fs_impl = make_fs(tmp_path, inline_max_bytes=0)
+    data = b"x" * fs_impl.chunk_size
+    calls = 0
+    original_existing_block_hashes = fs_impl.metadata.existing_block_hashes
+    original_insert_blocks = fs_impl.metadata.insert_blocks
+    inserted_batch_sizes: list[int] = []
+
+    def observed_existing_block_hashes(digests):
+        nonlocal calls
+        calls += 1
+        return original_existing_block_hashes(digests)
+
+    def observed_insert_blocks(blocks, *, now):
+        inserted_batch_sizes.append(len(blocks))
+        return original_insert_blocks(blocks, now=now)
+
+    monkeypatch.setattr(
+        fs_impl.metadata, "existing_block_hashes", observed_existing_block_hashes
+    )
+    monkeypatch.setattr(fs_impl.metadata, "insert_blocks", observed_insert_blocks)
+
+    with adapted(fs_impl) as fs:
+        fh = fs("create", "/repeated.txt", 0o644)
+        fs("write", "/repeated.txt", data * 3, 0, fh)
+
+    block_rows = rows(fs_impl, "SELECT refcount FROM blocks")
+    assert len(block_rows) == 1
+    assert block_rows[0]["refcount"] == 3
+    assert calls == 1
+    assert inserted_batch_sizes == [1]
+
+
 def test_ztierfs_clonefile_copies_metadata_without_reprocessing_blocks(
     tmp_path, monkeypatch
 ):

@@ -3,11 +3,21 @@
 import sqlite3
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from time import time_ns
 from typing import TYPE_CHECKING
 
 from .base import MetadataMixinBase
 from .schema import BLOCK_RECORD_SELECT
+
+
+@dataclass(frozen=True)
+class BlockInsert:
+    digest: str
+    compressed: bool
+    raw_size: int
+    stored_size: int
+    inline_payload: bytes | None = None
 
 
 class BlockMetadataMixin(MetadataMixinBase):
@@ -27,6 +37,17 @@ class BlockMetadataMixin(MetadataMixinBase):
             ).fetchone()
             is not None
         )
+
+    def existing_block_hashes(self, digests: list[str]) -> set[str]:
+        """Return the subset of ``digests`` that already have block metadata."""
+        if not digests:
+            return set()
+        placeholders = ",".join("?" for _ in digests)
+        rows = self._db.execute(
+            f"SELECT hash FROM blocks WHERE hash IN ({placeholders})",
+            digests,
+        ).fetchall()
+        return {row["hash"] for row in rows}
 
     def block_record(self, digest: str) -> sqlite3.Row | None:
         """处理 block record。"""
@@ -94,6 +115,50 @@ class BlockMetadataMixin(MetadataMixinBase):
                 VALUES (?, ?)
                 """,
                 (digest, inline_payload),
+            )
+
+    def insert_blocks(self, blocks: list[BlockInsert], *, now: int) -> None:
+        """Insert multiple new block records and optional inline payload rows."""
+        if not blocks:
+            return
+        block_rows = []
+        payload_rows = []
+        for block in blocks:
+            digest = block.digest
+            inline_payload = block.inline_payload
+            is_inline = inline_payload is not None
+            block_rows.append(
+                (
+                    digest,
+                    "inline" if is_inline else "tiered",
+                    0 if is_inline else 1,
+                    int(block.compressed),
+                    block.raw_size,
+                    block.stored_size,
+                    now,
+                    0 if is_inline else 1,
+                    0,
+                )
+            )
+            if is_inline:
+                payload_rows.append((digest, inline_payload))
+        self._db.executemany(
+            """
+            INSERT INTO blocks (
+                hash, storage_kind, preferred_tier, compressed, raw_size, stored_size,
+                refcount, atime_ns, read_count, hot_present, cold_present
+            )
+            VALUES (?, ?, ?, ?, ?, ?, 0, ?, 0, ?, ?)
+            """,
+            block_rows,
+        )
+        if payload_rows:
+            self._db.executemany(
+                """
+                INSERT INTO block_payloads (hash, payload)
+                VALUES (?, ?)
+                """,
+                payload_rows,
             )
 
     def increment_block_refcount(self, digest: str) -> None:

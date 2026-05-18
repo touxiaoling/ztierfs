@@ -45,15 +45,15 @@ def test_write_crash_after_block_file_before_metadata_commit_is_repairable_orpha
     tmp_path, monkeypatch
 ):
     fs_impl = make_fs(tmp_path, inline_max_bytes=0)
-    original_insert_block = fs_impl.metadata.insert_block
+    original_insert_blocks = fs_impl.metadata.insert_blocks
 
-    def insert_block_then_crash(*args, **kwargs):
-        original_insert_block(*args, **kwargs)
+    def insert_blocks_then_crash(*args, **kwargs):
+        original_insert_blocks(*args, **kwargs)
         raise SimulatedCrash(
             "crash after block metadata insert before transaction commit"
         )
 
-    monkeypatch.setattr(fs_impl.metadata, "insert_block", insert_block_then_crash)
+    monkeypatch.setattr(fs_impl.metadata, "insert_blocks", insert_blocks_then_crash)
 
     with pytest.raises(SimulatedCrash):
         with adapted(fs_impl) as fs:

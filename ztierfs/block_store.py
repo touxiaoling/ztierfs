@@ -25,6 +25,7 @@ from loguru import logger
 from macfusepy import FuseOSError
 
 from .block_layout import block_file_path
+from .metadata.blocks import BlockInsert
 from .metadata import MetadataStore
 from .perf import timed
 from .tier_access import (
@@ -86,6 +87,17 @@ class PreparedBlock:
     raw_size: int
     payload: bytes
     compressed: bool
+    inline_payload: bytes | None
+
+
+@dataclass(frozen=True)
+class PreparedBlockMetadata:
+    """Metadata row for a prepared block that has been physically written if needed."""
+
+    digest: str
+    compressed: bool
+    raw_size: int
+    stored_size: int
     inline_payload: bytes | None
 
 
@@ -356,31 +368,77 @@ class BlockStore:
 
         已存在时直接返回。调用方须保证与引用计数/文件块元数据在同一元数据事务中一致提交。
         """
-        digest = block.digest
-        if self.metadata.block_exists(digest):
-            logger.debug("块已存在，跳过写入：hash={}", digest[:12])
+        self.ensure_prepared_blocks([block])
+
+    def ensure_prepared_blocks(self, blocks: Iterable[PreparedBlock]) -> None:
+        """Ensure unique prepared blocks exist, writing payloads before metadata rows."""
+        unique: dict[str, PreparedBlock] = {}
+        for block in blocks:
+            existing = unique.get(block.digest)
+            if existing is None:
+                unique[block.digest] = block
+                continue
+            self._validate_matching_prepared_blocks(existing, block)
+        if not unique:
             return
 
-        if block.inline_payload is None:
-            self.write_block_file(digest, 1, block.payload)
-            self.note_hot_write(len(block.payload))
+        existing_hashes = self.metadata.existing_block_hashes(list(unique))
+        new_blocks: list[PreparedBlockMetadata] = []
+        for digest, block in unique.items():
+            if digest in existing_hashes:
+                logger.debug("块已存在，跳过写入：hash={}", digest[:12])
+                continue
+            if block.inline_payload is None:
+                self.write_block_file(digest, 1, block.payload)
+                self.note_hot_write(len(block.payload))
+            new_blocks.append(self._prepared_block_metadata(block))
+        if not new_blocks:
+            return
+
         now = time_ns()
-        self.metadata.insert_block(
-            digest,
+        self.metadata.insert_blocks(
+            [
+                BlockInsert(
+                    digest=block.digest,
+                    compressed=block.compressed,
+                    raw_size=block.raw_size,
+                    stored_size=block.stored_size,
+                    inline_payload=block.inline_payload,
+                )
+                for block in new_blocks
+            ],
+            now=now,
+        )
+        for block in new_blocks:
+            logger.debug(
+                "记录新块：hash={}，raw_size={}，stored_size={}，compressed={}，storage={}",
+                block.digest[:12],
+                block.raw_size,
+                block.stored_size,
+                block.compressed,
+                "inline" if block.inline_payload is not None else "tiered",
+            )
+
+    def _prepared_block_metadata(self, block: PreparedBlock) -> PreparedBlockMetadata:
+        return PreparedBlockMetadata(
+            digest=block.digest,
             compressed=block.compressed,
             raw_size=block.raw_size,
             stored_size=len(block.payload),
-            now=now,
             inline_payload=block.inline_payload,
         )
-        logger.debug(
-            "记录新块：hash={}，raw_size={}，stored_size={}，compressed={}，storage={}",
-            digest[:12],
-            block.raw_size,
-            len(block.payload),
-            block.compressed,
-            "inline" if block.inline_payload is not None else "tiered",
-        )
+
+    def _validate_matching_prepared_blocks(
+        self, existing: PreparedBlock, duplicate: PreparedBlock
+    ) -> None:
+        if (
+            self._prepared_block_metadata(existing)
+            != self._prepared_block_metadata(duplicate)
+            or existing.payload != duplicate.payload
+        ):
+            raise RuntimeError(
+                f"prepared block metadata mismatch for digest {existing.digest}"
+            )
 
     def prepare_blocks(
         self, chunks: Iterable[tuple[int, bytes]], compress: bool
