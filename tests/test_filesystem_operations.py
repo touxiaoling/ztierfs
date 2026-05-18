@@ -63,6 +63,7 @@ def test_ztierfs_create_existing_file_respects_open_flags(tmp_path):
             "create", "/note.txt", 0o600, os.O_RDWR | os.O_CREAT | os.O_TRUNC
         )
         assert fs("getattr", "/note.txt")["st_size"] == 0
+        assert S_IMODE(fs("getattr", "/note.txt")["st_mode"]) == 0o644
         fs("release", "/note.txt", truncated)
 
         with pytest.raises(FuseOSError) as exc:

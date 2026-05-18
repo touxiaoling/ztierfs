@@ -420,9 +420,7 @@ class InodeFuseMixin(InodeOperations, FileSystemMixinBase):
                 self._require_open_access(existing, flags)
                 if flags & os.O_TRUNC:
                     self.file_content.remove_file_chunks(existing["id"])
-                    self.metadata.reset_file_node(
-                        existing["id"], S_IFREG | (mode & 0o7777), now
-                    )
+                    self.metadata.reset_file_node(existing["id"], now)
                 node = self._node_by_ino(existing["id"])
             else:
                 inode_id = self.metadata.insert_node(

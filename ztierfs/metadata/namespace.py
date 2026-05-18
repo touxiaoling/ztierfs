@@ -334,15 +334,15 @@ class NamespaceMixin(MetadataMixinBase):
             (now, inode_id),
         )
 
-    def reset_file_node(self, node_id: int, mode: int, now: int) -> None:
-        """将文件 inode 截断语义落到元数据：`size` 置 0、更新时间戳。"""
+    def reset_file_node(self, node_id: int, now: int) -> None:
+        """将已有文件 inode 的截断语义落到元数据：`size` 置 0、更新时间戳。"""
         self._db.execute(
             """
             UPDATE inodes
-            SET mode = ?, size = 0, mtime_ns = ?, ctime_ns = ?
+            SET size = 0, mtime_ns = ?, ctime_ns = ?
             WHERE id = ?
             """,
-            (mode, now, now, node_id),
+            (now, now, node_id),
         )
 
     def touch_node_atime(self, node_id: int, now: int) -> None:
