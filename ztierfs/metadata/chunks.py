@@ -1,4 +1,8 @@
-"""file_chunks 表：文件块索引与内容寻址块的映射，含与 blocks 联查及 refcount 配对调用约定。"""
+"""file_chunks 表：文件块索引与内容寻址块的映射。
+
+所有会改变 chunk 映射的操作都必须通过 ``replace_file_chunks()`` 表达，
+由它在同一个元数据原语中替换 ``file_chunks`` 并收敛 ``blocks.refcount``。
+"""
 
 import sqlite3
 
@@ -20,16 +24,9 @@ class ChunkReplacement:
 
 
 class ChunkMetadataMixin(MetadataMixinBase):
-    """针对 `file_chunks` 与块元数据的读写：`file_chunks` 保存 (file_id, chunk_index) → hash/size，
-
-    块的去重与冷热层信息在 `blocks`（及关联表）中；通过 hash 连接两端。
-    单独的 DELETE/UPDATE `file_chunks` 不会自动维护块的引用计数；新增引用时应使用
-    `attach_file_chunk_to_block`，移除映射后须在别处对已失效 digest 调用 `decrement_block_refcount`。
-    """
+    """针对 `file_chunks` 与块元数据的读写。"""
 
     if TYPE_CHECKING:
-
-        def increment_block_refcount(self, digest: str) -> None: ...
 
         def apply_block_refcount_deltas(
             self, deltas: Mapping[str, int], *, now: int | None = None
@@ -73,49 +70,6 @@ class ChunkMetadataMixin(MetadataMixinBase):
         ).fetchone()
         return int(row["allocated"])
 
-    def file_chunk_hash(self, file_id: int, chunk_index: int) -> sqlite3.Row | None:
-        """仅读取 `file_chunks` 一行中的 hash（无 JOIN blocks）。"""
-        return self._db.execute(
-            "SELECT hash FROM file_chunks WHERE file_id = ? AND chunk_index = ?",
-            (file_id, chunk_index),
-        ).fetchone()
-
-    def delete_file_chunk(self, file_id: int, chunk_index: int) -> None:
-        """删除单个 (file_id, chunk_index) 映射行；不修改块 refcount。"""
-        self._db.execute(
-            "DELETE FROM file_chunks WHERE file_id = ? AND chunk_index = ?",
-            (file_id, chunk_index),
-        )
-
-    def update_file_chunk_size(self, file_id: int, chunk_index: int, size: int) -> None:
-        """更新已有映射行的 size。"""
-        self._db.execute(
-            "UPDATE file_chunks SET size = ? WHERE file_id = ? AND chunk_index = ?",
-            (size, file_id, chunk_index),
-        )
-
-    def upsert_file_chunk(
-        self, file_id: int, chunk_index: int, digest: str, size: int
-    ) -> None:
-        """插入或更新 (file_id, chunk_index) 的 hash 与 size；不调整块 refcount。"""
-        self._db.execute(
-            """
-            INSERT INTO file_chunks (file_id, chunk_index, hash, size)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(file_id, chunk_index) DO UPDATE SET
-                hash = excluded.hash,
-                size = excluded.size
-            """,
-            (file_id, chunk_index, digest, size),
-        )
-
-    def attach_file_chunk_to_block(
-        self, file_id: int, chunk_index: int, digest: str, size: int
-    ) -> None:
-        """先 upsert `file_chunks`，再对该 digest 调用 `increment_block_refcount`（新增一条文件→块引用）。"""
-        self.upsert_file_chunk(file_id, chunk_index, digest, size)
-        self.increment_block_refcount(digest)
-
     def replace_file_chunks(
         self,
         file_id: int,
@@ -157,7 +111,7 @@ class ChunkMetadataMixin(MetadataMixinBase):
         ]
 
         if delete_from is not None:
-            self.delete_file_chunks_from(file_id, delete_from)
+            self._delete_file_chunks_from(file_id, delete_from)
         if delete_indexes:
             self._db.executemany(
                 "DELETE FROM file_chunks WHERE file_id = ? AND chunk_index = ?",
@@ -236,16 +190,8 @@ class ChunkMetadataMixin(MetadataMixinBase):
         ).fetchall()
         return [*rows, *extra_rows]
 
-    def file_chunk_hashes_from(self, file_id: int, first_index: int) -> list[str]:
-        """列出从 `chunk_index >= first_index` 起所有映射行的 hash 列表（顺序与查询一致）。"""
-        rows = self._db.execute(
-            "SELECT hash FROM file_chunks WHERE file_id = ? AND chunk_index >= ?",
-            (file_id, first_index),
-        ).fetchall()
-        return [row["hash"] for row in rows]
-
-    def delete_file_chunks_from(self, file_id: int, first_index: int) -> None:
-        """删除该文件中 `chunk_index >= first_index` 的所有映射行；不修改块 refcount。"""
+    def _delete_file_chunks_from(self, file_id: int, first_index: int) -> None:
+        """删除该文件中 `chunk_index >= first_index` 的映射行；仅供 `replace_file_chunks()` 内部使用。"""
         self._db.execute(
             "DELETE FROM file_chunks WHERE file_id = ? AND chunk_index >= ?",
             (file_id, first_index),
