@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from ztierfs.file_content import FileWriteChunkKind
 
-from .helpers import adapted, connect_sqlite, make_fs, rows
+from .helpers import TestOperationsAdapter, adapted, connect_sqlite, make_fs, rows
 
 
 def _wait_until(predicate, timeout: float = 2.0) -> None:
@@ -471,6 +471,71 @@ def test_ztierfs_updates_refcounts_when_overwriting_and_unlinking(tmp_path):
     assert len(block_rows) == 1
     assert block_rows[0]["raw_size"] == len(replacement)
     assert block_rows[0]["refcount"] == 1
+
+
+def test_ztierfs_keeps_unreferenced_cold_block_index_for_reuse(
+    tmp_path, monkeypatch
+):
+    fs_impl = make_fs(tmp_path, inline_max_bytes=0)
+    data = b"cold-garbage" * 64
+
+    fs = TestOperationsAdapter(fs_impl)
+    fh = fs("create", "/victim.jpg", 0o644)
+    fs("write", "/victim.jpg", data, 0, fh)
+    fs("release", "/victim.jpg", fh)
+
+    digest = rows(fs_impl, "SELECT hash FROM blocks")[0]["hash"]
+    hot_path = fs_impl.block_store.block_path(digest, 1)
+    cold_path = fs_impl.block_store.block_path(digest, 2)
+    cold_path.parent.mkdir(parents=True, exist_ok=True)
+    cold_path.write_bytes(hot_path.read_bytes())
+    with connect_sqlite(fs_impl.database) as db:
+        db.execute(
+            "UPDATE blocks SET cold_present = 1 WHERE hash = ?",
+            (digest,),
+        )
+
+    TestOperationsAdapter(fs_impl)("unlink", "/victim.jpg")
+
+    garbage = rows(
+        fs_impl,
+        f"""
+        SELECT refcount, hot_present, cold_present, preferred_tier, cold_gc_enqueued_ns
+        FROM block_records
+        WHERE hash = '{digest}'
+        """,
+    )[0]
+    assert garbage["refcount"] == 0
+    assert (garbage["hot_present"], garbage["cold_present"]) == (0, 1)
+    assert garbage["preferred_tier"] == 2
+    assert garbage["cold_gc_enqueued_ns"] is not None
+    assert cold_path.exists()
+    assert rows(fs_impl, "SELECT tier FROM pending_deletions") == []
+
+    original_write_block_file = fs_impl.block_store.write_block_file
+
+    def fail_cold_rewrite(digest_arg, tier, payload):
+        if tier == 2:
+            raise AssertionError("reuse must not rewrite an indexed cold payload")
+        return original_write_block_file(digest_arg, tier, payload)
+
+    monkeypatch.setattr(fs_impl.block_store, "write_block_file", fail_cold_rewrite)
+
+    fh = fs("create", "/again.jpg", 0o644)
+    fs("write", "/again.jpg", data, 0, fh)
+
+    reused = rows(
+        fs_impl,
+        f"""
+        SELECT refcount, cold_present, preferred_tier, cold_gc_enqueued_ns
+        FROM block_records
+        WHERE hash = '{digest}'
+        """,
+    )[0]
+    assert reused["refcount"] == 1
+    assert reused["cold_present"] == 1
+    assert reused["preferred_tier"] == 2
+    assert reused["cold_gc_enqueued_ns"] is None
 
 
 def test_ztierfs_partial_overwrite_of_deduped_chunk_keeps_other_file_intact(tmp_path):

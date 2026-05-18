@@ -23,7 +23,7 @@ from time import time_ns
 
 from .base import MetadataMixinBase
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 CONFIG_VERSION = 1
 
 FILESYSTEM_CONFIG_SELECT = """
@@ -59,6 +59,7 @@ BLOCK_RECORD_SELECT = """
         blocks.last_promoted_ns,
         blocks.last_demoted_ns,
         blocks.cold_verified_ns,
+        blocks.cold_gc_enqueued_ns,
         block_payloads.payload AS inline_payload
     FROM blocks
     LEFT JOIN block_payloads ON block_payloads.hash = blocks.hash
@@ -149,6 +150,7 @@ class SchemaMixin(MetadataMixinBase):
                 last_promoted_ns INTEGER,
                 last_demoted_ns INTEGER,
                 cold_verified_ns INTEGER,
+                cold_gc_enqueued_ns INTEGER,
                 CHECK (
                     (storage_kind = 'inline' AND preferred_tier = 0 AND hot_present = 0 AND cold_present = 0)
                     OR (storage_kind = 'tiered' AND preferred_tier IN (1, 2) AND (hot_present = 1 OR cold_present = 1))
@@ -168,6 +170,16 @@ class SchemaMixin(MetadataMixinBase):
             CREATE INDEX IF NOT EXISTS idx_blocks_promoted_cleanup
             ON blocks(preferred_tier, hot_present, cold_present, last_promoted_ns)
             WHERE storage_kind = 'tiered' AND preferred_tier = 1 AND last_promoted_ns IS NOT NULL
+            """
+        )
+        self._db.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_blocks_cold_garbage
+            ON blocks(cold_gc_enqueued_ns)
+            WHERE storage_kind = 'tiered'
+              AND refcount = 0
+              AND cold_present = 1
+              AND cold_gc_enqueued_ns IS NOT NULL
             """
         )
         self._db.execute(

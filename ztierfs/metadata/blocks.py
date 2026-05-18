@@ -164,7 +164,13 @@ class BlockMetadataMixin(MetadataMixinBase):
     def increment_block_refcount(self, digest: str) -> None:
         """将指定块的引用计数加一（有新 chunk 或链接指向该内容地址块时调用）。"""
         self._db.execute(
-            "UPDATE blocks SET refcount = refcount + 1 WHERE hash = ?", (digest,)
+            """
+            UPDATE blocks
+            SET refcount = refcount + 1,
+                cold_gc_enqueued_ns = NULL
+            WHERE hash = ?
+            """,
+            (digest,),
         )
 
     def decrement_block_refcount(self, digest: str) -> None:
@@ -190,7 +196,12 @@ class BlockMetadataMixin(MetadataMixinBase):
         ]
         if positive_updates:
             self._db.executemany(
-                "UPDATE blocks SET refcount = refcount + ? WHERE hash = ?",
+                """
+                UPDATE blocks
+                SET refcount = refcount + ?,
+                    cold_gc_enqueued_ns = NULL
+                WHERE hash = ?
+                """,
                 positive_updates,
             )
 
@@ -228,16 +239,33 @@ class BlockMetadataMixin(MetadataMixinBase):
                     (new_refcount, digest),
                 )
                 continue
-            self.delete_block(digest)
-            if row["storage"] == "tiered":
+            if row["storage"] == "tiered" and row["cold_present"]:
+                self.mark_cold_garbage(digest, deletion_time)
                 if row["hot_present"]:
                     self.enqueue_pending_block_file_deletion(digest, 1, deletion_time)
-                if row["cold_present"]:
-                    self.enqueue_pending_block_file_deletion(digest, 2, deletion_time)
+                continue
+            self.delete_block(digest)
+            if row["storage"] == "tiered" and row["hot_present"]:
+                self.enqueue_pending_block_file_deletion(digest, 1, deletion_time)
 
     def delete_block(self, digest: str) -> None:
         """删除 block 元数据。"""
         self._db.execute("DELETE FROM blocks WHERE hash = ?", (digest,))
+
+    def mark_cold_garbage(self, digest: str, now: int) -> None:
+        """Keep an unreferenced cold copy indexed for later reuse and maintenance GC."""
+        self._db.execute(
+            """
+            UPDATE blocks
+            SET refcount = 0,
+                hot_present = 0,
+                cold_present = 1,
+                preferred_tier = 2,
+                cold_gc_enqueued_ns = COALESCE(cold_gc_enqueued_ns, ?)
+            WHERE hash = ?
+            """,
+            (now, digest),
+        )
 
     def inline_block_payload(self, digest: str) -> bytes | None:
         """处理 inline block payload。"""

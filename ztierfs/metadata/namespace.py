@@ -302,7 +302,8 @@ class NamespaceMixin(MetadataMixinBase):
                 SELECT COUNT(*)
                 FROM file_chunks
                 WHERE file_id = ? AND file_chunks.hash = blocks.hash
-            )
+            ),
+                cold_gc_enqueued_ns = NULL
             WHERE hash IN (
                 SELECT hash
                 FROM file_chunks

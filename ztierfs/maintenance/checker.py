@@ -178,6 +178,12 @@ class Checker:
             cold_unavailable = cold_probe.unavailable and (
                 bool(row["cold_present"]) or not hot_exists
             )
+            is_cold_garbage = (
+                actual == 0
+                and row["storage"] == "tiered"
+                and bool(row["cold_present"])
+                and row["cold_gc_enqueued_ns"] is not None
+            )
             if row["refcount"] != actual:
                 self._issue(
                     "refcount_mismatch",
@@ -194,7 +200,44 @@ class Checker:
                     ),
                 )
 
-            if actual == 0:
+            if is_cold_garbage:
+                if bool(row["hot_present"]) != hot_exists:
+                    self._issue(
+                        "block_presence_mismatch",
+                        "cold garbage hot presence does not match block files on disk",
+                        {
+                            "hash": digest,
+                            "stored_hot": bool(row["hot_present"]),
+                            "actual_hot": hot_exists,
+                            "cold_unavailable": cold_unavailable,
+                        },
+                        repairable=True,
+                        repair=lambda digest=digest, hot=hot_exists: (
+                            self._repair_hot_presence(db, digest, hot)
+                        ),
+                    )
+                if cold_unavailable:
+                    self._issue(
+                        "block_payload_unavailable",
+                        "cold garbage payload cannot be verified right now",
+                        {
+                            "hash": digest,
+                            "tier": 2,
+                            "error": str(cold_probe.error),
+                        },
+                    )
+                elif not cold_exists:
+                    self._issue(
+                        "missing_cold_garbage",
+                        "cold garbage metadata points to a missing cold block file",
+                        {"hash": digest},
+                        repairable=True,
+                        repair=lambda digest=digest: db.execute(
+                            "DELETE FROM blocks WHERE hash = ?",
+                            (digest,),
+                        ),
+                    )
+            elif actual == 0:
                 self._issue(
                     "unreferenced_block_record",
                     "block metadata is not referenced by any file chunk",

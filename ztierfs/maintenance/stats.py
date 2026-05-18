@@ -151,6 +151,17 @@ def collect_stats(
                 """,
             ),
         }
+        oldest_cold_garbage_ns = scalar(
+            db,
+            """
+            SELECT COALESCE(MIN(cold_gc_enqueued_ns), 0)
+            FROM blocks
+            WHERE storage_kind = 'tiered'
+              AND refcount = 0
+              AND cold_present = 1
+              AND cold_gc_enqueued_ns IS NOT NULL
+            """,
+        )
         report = StatsReport(
             inodes={
                 "total": sum(inode_counts.values()),
@@ -168,7 +179,7 @@ def collect_stats(
                 ),
                 "cold_garbage": block_counts["cold_garbage"],
                 "cold_garbage_bytes": storage["cold_garbage_bytes"],
-                "oldest_cold_garbage_ns": 0,
+                "oldest_cold_garbage_ns": oldest_cold_garbage_ns,
             },
         )
     logger.info(
