@@ -1,0 +1,312 @@
+{
+  "communities": {
+    "0": [
+      "agents_behavior_priority",
+      "agents_clonefile_semantic",
+      "agents_cold_tier_unavailable",
+      "agents_dry",
+      "agents_hardlink_semantic",
+      "agents_kiss",
+      "agents_open_handle_after_rename",
+      "agents_small_steps",
+      "agents_yagni",
+      "plan_cold_tier_friendly_gc",
+      "plan_data_safety_simplify",
+      "readme_cleanup",
+      "readme_cold_tier",
+      "readme_compression",
+      "readme_content_addressed_block",
+      "readme_deduplication",
+      "readme_filesystem",
+      "readme_fsck",
+      "readme_fuse",
+      "readme_hot_cold_tiering",
+      "readme_hot_tier",
+      "readme_macfuse",
+      "readme_rclone",
+      "readme_scrub",
+      "readme_sha256",
+      "readme_stats",
+      "readme_zstd",
+      "readme_ztierfs"
+    ],
+    "1": [
+      "agents_md",
+      "claude_md",
+      "cold_tier",
+      "graphify",
+      "hot_tier",
+      "macfuse",
+      "uv",
+      "ztierfs",
+      "ztierfs_access_control",
+      "ztierfs_block_layout",
+      "ztierfs_cli",
+      "ztierfs_file_content",
+      "ztierfs_file_ops",
+      "ztierfs_filesystem",
+      "ztierfs_fs_mixins",
+      "ztierfs_handles",
+      "ztierfs_inode_fuse",
+      "ztierfs_inode_locks",
+      "ztierfs_locks",
+      "ztierfs_maintenance",
+      "ztierfs_metadata",
+      "ztierfs_metadata_ops",
+      "ztierfs_namespace_ops",
+      "ztierfs_tier_access"
+    ],
+    "2": [
+      "plan_delete_old_chunk_api",
+      "plan_extract_block_file_io",
+      "plan_prepare_parallel_threshold",
+      "plan_tiered_fallback_explicit",
+      "plan_unify_pending_deletion",
+      "readme_atomic_write",
+      "readme_block_store",
+      "readme_fsync",
+      "readme_pending_deletion",
+      "speed_safe_logic_refactor_plan_phase8_unify_maintenance_behavior",
+      "speedandcorruptionbehaviorrefactorplan_phase4_maintenance_consistent_behavior",
+      "sqlite",
+      "zstd"
+    ],
+    "3": [
+      "pre_commit_config_builtin",
+      "pre_commit_config_config",
+      "pre_commit_config_formater",
+      "pre_commit_config_graphify",
+      "pre_commit_config_graphify_update",
+      "pre_commit_config_ruff",
+      "ruff"
+    ],
+    "4": [
+      "speedandcorruptionbehaviorrefactorplan_BlockStore",
+      "speedandcorruptionbehaviorrefactorplan_FileContentService",
+      "speedandcorruptionbehaviorrefactorplan_phase1_read_path_noise_reduction",
+      "speedandcorruptionbehaviorrefactorplan_phase3_batch_chunk_refcount",
+      "speedandcorruptionbehaviorrefactorplan_read_file",
+      "speedandcorruptionbehaviorrefactorplan_record_block_access",
+      "speedandcorruptionbehaviorrefactorplan_replace_file_chunks"
+    ],
+    "5": [
+      "plan_chunk_query_opt_decision",
+      "readme_chunking",
+      "readme_file_content_service",
+      "readme_handle_table"
+    ],
+    "6": [
+      "plan_schema_simplify",
+      "readme_metadata_store",
+      "readme_reference_count",
+      "readme_sqlite"
+    ],
+    "7": [
+      "skill_audit_trail",
+      "skill_community_detection",
+      "skill_graphify",
+      "skill_knowledge_graph"
+    ],
+    "8": [
+      "speed_safe_logic_refactor_plan_BlockStore",
+      "speed_safe_logic_refactor_plan_FileContentService",
+      "speed_safe_logic_refactor_plan_read_file",
+      "speed_safe_logic_refactor_plan_record_block_access"
+    ],
+    "9": [
+      "speed_safe_logic_refactor_plan_MetadataStore",
+      "speed_safe_logic_refactor_plan_drain_pending_deletions",
+      "speed_safe_logic_refactor_plan_phase1_batch_gc_transactions",
+      "speed_safe_logic_refactor_plan_phase2a_gc_frontend_limit"
+    ],
+    "10": [
+      "speedandcorruptionbehaviorrefactorplan__read_path",
+      "speedandcorruptionbehaviorrefactorplan_cold_present",
+      "speedandcorruptionbehaviorrefactorplan_hot_present",
+      "speedandcorruptionbehaviorrefactorplan_phase2_lazy_read_path_repair"
+    ],
+    "11": [
+      "claude_settings_local_permissions",
+      "claude_settings_local_permissions_allow",
+      "settings_local_json"
+    ],
+    "12": [
+      "speed_safe_logic_refactor_plan_cold_tier",
+      "speed_safe_logic_refactor_plan_hot_tier",
+      "speed_safe_logic_refactor_plan_phase3_demote_off_frontend"
+    ],
+    "13": [
+      "speed_safe_logic_refactor_plan_phase6_query_shape_simplification",
+      "speed_safe_logic_refactor_plan_phase7_full_block_write_fast_path",
+      "speed_safe_logic_refactor_plan_replace_file_chunks"
+    ],
+    "14": [
+      "speed_safe_logic_refactor_plan_HandleTable",
+      "speed_safe_logic_refactor_plan_phase4_handle_inode_snapshot_cache"
+    ],
+    "15": [
+      "speed_safe_logic_refactor_plan__read_path",
+      "speed_safe_logic_refactor_plan_phase5_read_callback_noise_reduction"
+    ],
+    "16": [
+      "speed_safe_logic_refactor_plan_phase9_schema_simplification",
+      "speedandcorruptionbehaviorrefactorplan_phase5_schema_simplification"
+    ],
+    "17": [
+      "readme_inline_block"
+    ],
+    "18": [
+      "readme_block_file"
+    ],
+    "19": [
+      "speed_safe_logic_refactor_plan_refcount"
+    ],
+    "20": [
+      "speed_safe_logic_refactor_plan_phase0_baseline_diagnostics"
+    ],
+    "21": [
+      "pre_commit_config_yaml"
+    ],
+    "22": [
+      "init_py"
+    ]
+  },
+  "cohesion": {
+    "0": 0.07142857142857142,
+    "1": 0.15217391304347827,
+    "2": 0.15384615384615385,
+    "3": 0.2857142857142857,
+    "4": 0.38095238095238093,
+    "5": 0.5,
+    "6": 0.5,
+    "7": 0.5,
+    "8": 0.5,
+    "9": 0.5,
+    "10": 0.5,
+    "11": 0.6666666666666666,
+    "12": 0.6666666666666666,
+    "13": 0.6666666666666666,
+    "14": 1.0,
+    "15": 1.0,
+    "16": 1.0,
+    "17": 1.0,
+    "18": 1.0,
+    "19": 1.0,
+    "20": 1.0,
+    "21": 1.0,
+    "22": 1.0
+  },
+  "gods": [
+    {
+      "id": "readme_ztierfs",
+      "label": "ztierfs",
+      "degree": 26
+    },
+    {
+      "id": "ztierfs",
+      "label": "ztierfs",
+      "degree": 20
+    },
+    {
+      "id": "readme_block_store",
+      "label": "BlockStore",
+      "degree": 12
+    },
+    {
+      "id": "speedandcorruptionbehaviorrefactorplan_read_file",
+      "label": "read_file",
+      "degree": 4
+    },
+    {
+      "id": "readme_sqlite",
+      "label": "SQLite",
+      "degree": 3
+    },
+    {
+      "id": "readme_file_content_service",
+      "label": "FileContentService",
+      "degree": 3
+    },
+    {
+      "id": "readme_pending_deletion",
+      "label": "Pending Deletion",
+      "degree": 3
+    },
+    {
+      "id": "skill_graphify",
+      "label": "graphify",
+      "degree": 3
+    },
+    {
+      "id": "speedandcorruptionbehaviorrefactorplan_record_block_access",
+      "label": "record_block_access",
+      "degree": 3
+    },
+    {
+      "id": "speedandcorruptionbehaviorrefactorplan__read_path",
+      "label": "_read_path",
+      "degree": 3
+    }
+  ],
+  "surprises": [
+    {
+      "source": "Delete Old Chunk API",
+      "target": "BlockStore",
+      "source_files": [
+        "docs/current-code-speed-safety-refactor-plan.md",
+        "README.md"
+      ],
+      "confidence": "INFERRED",
+      "relation": "references",
+      "why": "inferred connection - not explicitly stated in source; connects across different repos/directories; peripheral node `Delete Old Chunk API` unexpectedly reaches hub `BlockStore`"
+    },
+    {
+      "source": "Extract BlockFileIO",
+      "target": "BlockStore",
+      "source_files": [
+        "docs/current-code-speed-safety-refactor-plan.md",
+        "README.md"
+      ],
+      "confidence": "INFERRED",
+      "relation": "references",
+      "why": "inferred connection - not explicitly stated in source; connects across different repos/directories; peripheral node `Extract BlockFileIO` unexpectedly reaches hub `BlockStore`"
+    },
+    {
+      "source": "Explicit TierReadDecision",
+      "target": "BlockStore",
+      "source_files": [
+        "docs/current-code-speed-safety-refactor-plan.md",
+        "README.md"
+      ],
+      "confidence": "INFERRED",
+      "relation": "references",
+      "why": "inferred connection - not explicitly stated in source; connects across different repos/directories; peripheral node `Explicit TierReadDecision` unexpectedly reaches hub `BlockStore`"
+    },
+    {
+      "source": "Prepare Parallel Threshold",
+      "target": "BlockStore",
+      "source_files": [
+        "docs/current-code-speed-safety-refactor-plan.md",
+        "README.md"
+      ],
+      "confidence": "INFERRED",
+      "relation": "references",
+      "why": "inferred connection - not explicitly stated in source; connects across different repos/directories; peripheral node `Prepare Parallel Threshold` unexpectedly reaches hub `BlockStore`"
+    },
+    {
+      "source": "ztierfs",
+      "target": "BlockStore",
+      "source_files": [
+        "AGENTS.md",
+        "README.md"
+      ],
+      "confidence": "INFERRED",
+      "relation": "implements",
+      "why": "inferred connection - not explicitly stated in source; connects across different repos/directories; bridges separate communities"
+    }
+  ],
+  "tokens": {
+    "input": 0,
+    "output": 0
+  }
+}

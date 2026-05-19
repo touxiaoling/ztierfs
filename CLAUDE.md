@@ -30,6 +30,16 @@
 - **行为优先:** 修改文件系统行为时，优先补充能描述可观察语义的测试，而不是只测试内部函数形状。
 - **小步改动:** 只修改完成任务所需的路径；不要顺手重构无关模块或改变磁盘格式，除非该变更直接服务当前目标。
 
+## graphify
+
+This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships.
+
+Rules:
+- For codebase questions, first run `uv run graphify query "<question>"` when graphify-out/graph.json exists. Use `uv run graphify path "<A>" "<B>"` for relationships and `uv run graphify explain "<concept>"` for focused concepts. These return a scoped subgraph, usually much smaller than GRAPH_REPORT.md or raw grep output.
+- If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.
+- Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
+- After modifying code, run `uv run graphify update .` to keep the graph current (AST-only, no API cost).
+
 ## 关键语义
 
 除非用户明确要求设计变更，否则保持这些行为：

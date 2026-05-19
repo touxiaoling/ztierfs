@@ -1,0 +1,26 @@
+# See https://pre-commit.com for more information
+# See https://pre-commit.com/hooks.html for more hooks
+repos:
+-   repo: builtin
+    hooks:
+    -   id: trailing-whitespace
+    -   id: end-of-file-fixer
+        exclude: ^graphify-out/(graph\.json|\.graphify_analysis\.json)$
+    -   id: check-yaml
+    -   id: check-added-large-files
+
+-   repo: local
+    hooks:
+    -   id: formater
+        name: formater
+        entry: uv run ruff format --force-exclude
+        language: system
+        types_or: [python, pyi, jupyter]
+        args: []
+        require_serial: true
+        additional_dependencies: []
+    -   id: graphify-update
+        name: graphify-update
+        entry: uv run graphify . --update --no-viz
+        language: system
+        pass_filenames: false

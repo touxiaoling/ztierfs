@@ -19,6 +19,8 @@ default = true
 
 [dependency-groups]
 dev = [
+    "graphifyy[all]>=0.8.13",
+    "prek>=0.4.0",
     "pytest>=9.0.3",
     "pytest-benchmark>=5.2.3",
     "pytest-cov>=7.1.0",
